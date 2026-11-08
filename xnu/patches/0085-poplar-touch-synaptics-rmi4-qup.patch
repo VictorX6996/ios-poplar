@@ -57,11 +57,12 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,475 @@
+@@ -0,0 +1,589 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
-+ * reset on TLMM GPIO 89. In-cell panel resolution: 1080x1920.
++ * reset on TLMM GPIO 89, VDDIO enable on TLMM GPIO 133.
++ * In-cell panel resolution: 1080x1920.
 + *
 + * Protocol: Synaptics RMI4 over QUP v2 FIFO I2C.
 + * Boot-args:
@@ -84,56 +85,72 @@ index 0000000..f34a5d8
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_poplar_touch_init(void);
 +
-+#define QUP5_BASE_PA            0x0c179000u
-+#define TLMM_BASE_PA            0x03400000u
-+#define SYNAPTICS_I2C_ADDR      0x2cu
++/* Hardware Base Physical Addresses */
++#define GCC_BASE_PA                     0x00100000u
++#define GCC_MAP_SIZE                    0x60000u
++#define QUP5_BASE_PA                    0x0c179000u
++#define TLMM_BASE_PA                    0x03400000u
++#define SYNAPTICS_I2C_ADDR              0x2cu
 +
-+#define TOUCH_PIN_SDA           87u
-+#define TOUCH_PIN_SCL           88u
-+#define TOUCH_PIN_RESET         89u
-+#define TOUCH_PIN_IRQ           125u
-+#define TOUCH_MAX               10u
++/* GCC Registers & Bits for BLSP1 / QUP5 */
++#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x52004u
++#define GCC_BLSP1_AHB_VOTE_BIT          (1u << 17)
++#define GCC_BLSP1_AHB_CBCR              0x17004u
++#define GCC_BLSP1_QUP5_BCR              0x21000u
++#define GCC_BLSP1_QUP5_SPI_APPS_CBCR    0x21004u
++#define GCC_BLSP1_QUP5_I2C_APPS_CBCR    0x21008u
++#define GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR 0x21020u
++#define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
++
++/* Poplar TLMM Touch Pins */
++#define TOUCH_PIN_SDA                   87u
++#define TOUCH_PIN_SCL                   88u
++#define TOUCH_PIN_RESET                 89u
++#define TOUCH_PIN_IRQ                   125u
++#define TOUCH_PIN_VDDIO                 133u
++#define TOUCH_MAX                       10u
 +
 +/* QUP v2 Registers */
-+#define QUP_CONFIG              0x000u
-+#define QUP_STATE               0x004u
-+#define QUP_IO_MODE             0x008u
-+#define QUP_SW_RESET            0x00cu
-+#define QUP_OPERATIONAL         0x018u
-+#define QUP_ERROR_FLAGS         0x01cu
-+#define QUP_MX_WR_CNT           0x100u
-+#define QUP_OUT_FIFO_CNT        0x10cu
-+#define QUP_OUT_FIFO_BASE       0x110u
-+#define QUP_MX_INPUT_CNT        0x200u
-+#define QUP_IN_FIFO_CNT         0x214u
-+#define QUP_IN_FIFO_BASE        0x218u
-+#define QUP_I2C_CLK_CTL         0x400u
-+#define QUP_I2C_STATUS          0x404u
++#define QUP_CONFIG                      0x000u
++#define QUP_STATE                       0x004u
++#define QUP_IO_MODE                     0x008u
++#define QUP_SW_RESET                    0x00cu
++#define QUP_OPERATIONAL                 0x018u
++#define QUP_ERROR_FLAGS                 0x01cu
++#define QUP_MX_WR_CNT                   0x100u
++#define QUP_OUT_FIFO_CNT                0x10cu
++#define QUP_OUT_FIFO_BASE               0x110u
++#define QUP_MX_INPUT_CNT                0x200u
++#define QUP_IN_FIFO_CNT                 0x214u
++#define QUP_IN_FIFO_BASE                0x218u
++#define QUP_I2C_CLK_CTL                 0x400u
++#define QUP_I2C_STATUS                  0x404u
 +
 +/* QUP State bits */
-+#define QUP_RESET_STATE         0u
-+#define QUP_RUN_STATE           1u
-+#define QUP_PAUSE_STATE         3u
-+#define QUP_STATE_MASK          3u
-+#define QUP_STATE_VALID         (1u << 2)
++#define QUP_RESET_STATE                 0u
++#define QUP_RUN_STATE                   1u
++#define QUP_PAUSE_STATE                 3u
++#define QUP_STATE_MASK                  3u
++#define QUP_STATE_VALID                 (1u << 2)
 +
 +/* QUP I2C Status bits */
-+#define QUP_I2C_NACK_FLAG       (1u << 3)
-+#define QUP_I2C_BUS_ACTIVE      (1u << 8)
-+#define QUP_I2C_ERR_MASK        0x038000fcu
++#define QUP_I2C_NACK_FLAG               (1u << 3)
++#define QUP_I2C_BUS_ACTIVE              (1u << 8)
++#define QUP_I2C_ERR_MASK                0x038000fcu
 +
 +/* QUP v2 Tags */
-+#define QUP_TAG2_START          0x81u
-+#define QUP_TAG2_DATA_WRITE     0x82u
-+#define QUP_TAG2_DATA_WRITE_STOP 0x83u
-+#define QUP_TAG2_DATA_READ      0x85u
-+#define QUP_TAG2_DATA_READ_STOP 0x87u
++#define QUP_TAG2_START                  0x81u
++#define QUP_TAG2_DATA_WRITE             0x82u
++#define QUP_TAG2_DATA_WRITE_STOP        0x83u
++#define QUP_TAG2_DATA_READ              0x85u
++#define QUP_TAG2_DATA_READ_STOP         0x87u
 +
 +/* TLMM GPIO */
-+#define TLMM_GPIO_CFG(pin)      ((uint32_t)(pin) * 0x1000u)
-+#define TLMM_GPIO_IO(pin)       (TLMM_GPIO_CFG(pin) + 4u)
++#define TLMM_GPIO_CFG(pin)              ((uint32_t)(pin) * 0x1000u)
++#define TLMM_GPIO_IO(pin)               (TLMM_GPIO_CFG(pin) + 4u)
 +
 +static struct {
++	vm_offset_t gcc;
 +	vm_offset_t qup;
 +	vm_offset_t gpio;
 +	bool started;
@@ -190,6 +207,78 @@ index 0000000..f34a5d8
 +	cfg &= ~0x3ffu;
 +	cfg |= (mux << 2) | (pull & 3u) | ((drive & 7u) << 6) | (out ? 0x200u : 0u);
 +	touch_wr(st.gpio, off, cfg);
++}
++
++static bool
++poplar_qup_clock_init(void)
++{
++	st.gcc = ml_io_map(GCC_BASE_PA, GCC_MAP_SIZE);
++	if (!st.gcc) {
++		printf("SWEET TOUCH: failed to map GCC (0x%08x)\n", GCC_BASE_PA);
++		return false;
++	}
++
++	/* 1. Vote for BLSP1 AHB clock */
++	uint32_t vote = touch_rd(st.gcc, GCC_APCS_CLOCK_BRANCH_ENA_VOTE);
++	touch_wr(st.gcc, GCC_APCS_CLOCK_BRANCH_ENA_VOTE, vote | GCC_BLSP1_AHB_VOTE_BIT);
++
++	/* Poll BLSP1 AHB CBCR halt bit 31 until cleared */
++	for (int i = 0; i < 50000; i++) {
++		if (!(touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR) & (1u << 31))) {
++			break;
++		}
++	}
++	uint32_t ahb_stat = touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR);
++	printf("SWEET TOUCH: BLSP1 AHB clock status=0x%08x (halt=%u)\n",
++	    ahb_stat, (ahb_stat >> 31) & 1u);
++
++	/* 2. Deassert QUP5 block reset */
++	touch_wr(st.gcc, GCC_BLSP1_QUP5_BCR,
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_BCR) & ~1u);
++
++	/* 3. Configure QUP5 I2C RCG to 19.2MHz XO (div 1) */
++	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR, 0);
++	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR,
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR) | 1u);
++	for (int i = 0; i < 50000; i++) {
++		if (!(touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR) & 1u)) {
++			break;
++		}
++	}
++
++	/* 4. Ungate QUP5 I2C and SPI CBCRs */
++	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR,
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) | 1u);
++	touch_wr(st.gcc, GCC_BLSP1_QUP5_SPI_APPS_CBCR,
++	    touch_rd(st.gcc, GCC_BLSP1_QUP5_SPI_APPS_CBCR) | 1u);
++
++	/* Poll QUP5 I2C CBCR halt bit 31 until cleared */
++	for (int i = 0; i < 50000; i++) {
++		if (!(touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) & (1u << 31))) {
++			break;
++		}
++	}
++	uint32_t qup5_stat = touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR);
++	printf("SWEET TOUCH: QUP5 I2C CBCR=0x%08x (halt=%u)\n",
++	    qup5_stat, (qup5_stat >> 31) & 1u);
++
++	/* 5. Also ungate all BLSP1 CBCRs */
++	static const uint32_t blsp1_branches[] = {
++		0x17004u, /* BLSP1 AHB */
++		0x19004u, 0x19008u, /* QUP1 */
++		0x1b004u, 0x1b008u, /* QUP2 */
++		0x1d004u, 0x1d008u, /* QUP3 */
++		0x1f004u, 0x1f008u, /* QUP4 */
++		0x21004u, 0x21008u, /* QUP5 */
++		0x23004u, 0x23008u, /* QUP6 */
++	};
++	for (unsigned i = 0; i < sizeof(blsp1_branches) / sizeof(blsp1_branches[0]); i++) {
++		touch_wr(st.gcc, blsp1_branches[i],
++		    touch_rd(st.gcc, blsp1_branches[i]) | 1u);
++	}
++
++	touch_wait(10);
++	return true;
 +}
 +
 +static bool
@@ -283,14 +372,14 @@ index 0000000..f34a5d8
 +static int
 +qup_i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 +{
-+	uint8_t tx[2] = { reg, val };
-+	return qup_i2c_write(addr, tx, 2);
++	uint8_t buf[2] = {reg, val};
++	return qup_i2c_write(addr, buf, 2);
 +}
 +
 +static int
 +qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 +{
-+	if (st.dead || len > 128) {
++	if (st.dead || len > 64) {
 +		return EINVAL;
 +	}
 +	if (!qup_set_state(QUP_RESET_STATE)) {
@@ -303,46 +392,44 @@ index 0000000..f34a5d8
 +
 +	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
 +	touch_wr(st.qup, QUP_IO_MODE, 0);
-+	touch_wr(st.qup, QUP_MX_WR_CNT, 9u);
++	touch_wr(st.qup, QUP_MX_WR_CNT, 6u);
 +	touch_wr(st.qup, QUP_MX_INPUT_CNT, len + 2u);
 +
 +	if (!qup_set_state(QUP_RUN_STATE)) {
 +		return EIO;
 +	}
 +
-+	uint8_t pkt[12];
-+	pkt[0] = QUP_TAG2_START;
-+	pkt[1] = (uint8_t)((addr << 1) | 0u);
-+	pkt[2] = QUP_TAG2_DATA_WRITE;
-+	pkt[3] = 1u;
-+	pkt[4] = reg;
-+	pkt[5] = QUP_TAG2_START;
-+	pkt[6] = (uint8_t)((addr << 1) | 1u);
-+	pkt[7] = QUP_TAG2_DATA_READ_STOP;
-+	pkt[8] = (uint8_t)len;
++	uint8_t tx_pkt[8];
++	tx_pkt[0] = QUP_TAG2_START;
++	tx_pkt[1] = (uint8_t)((addr << 1) | 0u);
++	tx_pkt[2] = reg;
++	tx_pkt[3] = QUP_TAG2_START;
++	tx_pkt[4] = (uint8_t)((addr << 1) | 1u);
++	tx_pkt[5] = QUP_TAG2_DATA_READ_STOP;
++	tx_pkt[6] = (uint8_t)len;
++	tx_pkt[7] = 0;
 +
-+	for (unsigned i = 0; i < 9; i += 4) {
-+		uint32_t w = (uint32_t)pkt[i];
-+		if (i + 1 < 9) w |= (uint32_t)pkt[i + 1] << 8;
-+		if (i + 2 < 9) w |= (uint32_t)pkt[i + 2] << 16;
-+		if (i + 3 < 9) w |= (uint32_t)pkt[i + 3] << 24;
-+		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
-+	}
++	uint32_t w0 = (uint32_t)tx_pkt[0] | ((uint32_t)tx_pkt[1] << 8) |
++	    ((uint32_t)tx_pkt[2] << 16) | ((uint32_t)tx_pkt[3] << 24);
++	uint32_t w1 = (uint32_t)tx_pkt[4] | ((uint32_t)tx_pkt[5] << 8) |
++	    ((uint32_t)tx_pkt[6] << 16) | ((uint32_t)tx_pkt[7] << 24);
++	touch_wr(st.qup, QUP_OUT_FIFO_BASE, w0);
++	touch_wr(st.qup, QUP_OUT_FIFO_BASE, w1);
 +
-+	unsigned expected_words = (len + 2u + 3u) / 4u;
 +	bool ok = false;
-+	for (int i = 0; i < 10000; i++) {
++	for (int i = 0; i < 5000; i++) {
 +		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 +		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
 +			(void)qup_set_state(QUP_RESET_STATE);
 +			return EIO;
 +		}
-+		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= expected_words) {
++		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len + 2u) {
 +			ok = true;
 +			break;
 +		}
 +		delay(10);
 +	}
++
 +	if (!ok) {
 +		(void)qup_set_state(QUP_RESET_STATE);
 +		return ETIMEDOUT;
@@ -462,6 +549,14 @@ index 0000000..f34a5d8
 +
 +	(void)PE_parse_boot_argn("poplartouchlog", &st.logging, sizeof(st.logging));
 +
++	printf("SWEET TOUCH: ungating BLSP1 / QUP5 clocks in GCC...\n");
++	if (!poplar_qup_clock_init()) {
++		printf("SWEET TOUCH: clock init failed\n");
++		st.dead = true;
++		thread_terminate(current_thread());
++		return;
++	}
++
 +	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\n",
 +	    QUP5_BASE_PA, TLMM_BASE_PA);
 +	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
@@ -480,9 +575,28 @@ index 0000000..f34a5d8
 +		touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x15u);
 +	}
 +
-+	touch_gpio(TOUCH_PIN_SDA, 1, 0, 0, false, false);
-+	touch_gpio(TOUCH_PIN_SCL, 1, 0, 0, false, false);
++	/* Read existing TLMM config */
++	uint32_t sda_cfg = touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SDA));
++	uint32_t scl_cfg = touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SCL));
++	unsigned sda_mux = ((sda_cfg >> 2) & 0xfu) ? ((sda_cfg >> 2) & 0xfu) : 1u;
++	unsigned scl_mux = ((scl_cfg >> 2) & 0xfu) ? ((scl_cfg >> 2) & 0xfu) : 1u;
++	printf("SWEET TOUCH: SDA CFG=0x%08x (mux %u), SCL CFG=0x%08x (mux %u)\n",
++	    sda_cfg, sda_mux, scl_cfg, scl_mux);
++
++	touch_gpio(TOUCH_PIN_SDA, sda_mux, 0, 0, false, false);
++	touch_gpio(TOUCH_PIN_SCL, scl_mux, 0, 0, false, false);
++
++	/* Enable VDDIO power to touch controller on GPIO 133 */
++	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 2, true, true);
++	touch_wait(10);
++
++	/* Hardware reset toggle on GPIO 89 (active low) */
++	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
++	touch_wait(10);
 +	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
++	touch_wait(20);
++
++	/* Active-low IRQ input on GPIO 125 with pull-up */
 +	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);
 +
 +	touch_wait(10);

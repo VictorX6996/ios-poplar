@@ -1,5 +1,11 @@
 #pragma once
 #include <stdint.h>
 
-/* Boot the SWEETXNU payload found in the ABL ramdisk; returns only on error. */
-const char *loader_boot(uintptr_t dtb);
+struct loader_fb {
+	uintptr_t base;
+	uint32_t stride, width, height;
+	void (*before_jump)(void);
+};
+
+int loader_has_payload(uintptr_t dtb);
+const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb);

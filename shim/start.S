@@ -7,7 +7,7 @@
 _head:
 	b	_start			/* code0 */
 	.long	0			/* code1 */
-	.quad	0			/* text_offset */
+	.quad	0x80000			/* text_offset (0x80080000 on MSM8998 xboot) */
 	.quad	_end			/* image_size (linked at 0) */
 	.quad	0xa			/* flags: LE, 4K pages, place anywhere */
 	.quad	0			/* res2 */
@@ -21,39 +21,50 @@ _head:
 _start:
 	msr	daifset, #0xf
 	mov	x19, x0			/* DTB pointer from ABL */
+	mov	x1, #(3 << 20)
+	msr	cpacr_el1, x1
 	msr	spsel, #1
 	adr	x1, _stack_top
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
-	/* zero .bss */
+	/* clean+invalidate .bss and stacks before zeroing (MMU/D-cache off) */
 	adr	x1, _bss_start
 	adr	x2, _bss_end
-1:	cmp	x1, x2
-	b.hs	2f
+0:	cmp	x1, x2
+	b.hs	1f
+	dc	civac, x1
+	add	x1, x1, #64
+	b	0b
+1:	dsb	sy
+	adr	x1, _bss_start
+	adr	x2, _bss_end
+2:	cmp	x1, x2
+	b.hs	3f
 	str	xzr, [x1], #8
-	b	1b
-2:	mov	x0, x19
+	b	2b
+3:	dsb	sy
+	mov	x0, x19
 	bl	shim_main
-3:	wfe
-	b	3b
+4:	wfe
+	b	4b
 
-/* PSCI CPU_ON target. x0 = context id = cpu index (1..7). */
+/* PSCI CPU_ON target. */
 	.globl secondary_entry
 secondary_entry:
 	msr	daifset, #0xf
+	mov	x1, #(3 << 20)
+	msr	cpacr_el1, x1
 	msr	spsel, #1
-	adr	x1, _sec_stacks
-	add	x1, x1, x0, lsl #12
-	add	x1, x1, #0x1000
+	adr	x1, _sec_stack_top
 	mov	sp, x1
 	adr	x1, vectors
 	msr	vbar_el1, x1
 	isb
 	bl	secondary_main
-4:	wfe
-	b	4b
+5:	wfe
+	b	5b
 
 /*
  * Exception vectors. Each slot stashes x29/x30, loads its slot number

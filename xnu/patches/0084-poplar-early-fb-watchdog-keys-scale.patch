@@ -1,0 +1,550 @@
+diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
+index 3ded78c59..2e3d31840 100644
+--- a/iokit/DriverKit/IORPC.h
++++ b/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,10 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/* Set by newer iig (Xcode 16+) kernel stubs, read by their Dispatch. */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+index 3ded78c59..2e3d31840 100644
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,10 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/* Set by newer iig (Xcode 16+) kernel stubs, read by their Dispatch. */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+index 5d1d92267..a36b9561d 100644
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -3209,7 +3209,7 @@ IOUserServer::server(ipc_kmsg_t requestkmsg, ipc_kmsg_t * pReply)
+ 		msgout = (typeof(msgout))ikm_header(replykmsg);
+ 	}
+ 
+-	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc };
++	IORPC rpc = { .message = msgin, .reply = msgout, .sendSize = msgin->msgh.msgh_size, .replySize = replyAlloc, .kernelContent = message };
+ 
+ 	if (object) {
+ 		kern_allocation_name_t prior;
+@@ -3355,6 +3355,7 @@ IOUserServerUEXTTrap(OSObject * object, void * p1, void * p2, void * p3, void *
+ 	mach->msgh_body.msgh_descriptor_count = ((mach_msg_size_t) refs);
+ 
+ 	rpc.message   = mach;
++	rpc.kernelContent = message;
+ 	rpc.sendSize  = mach->msgh.msgh_size;
+ 	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+ 	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index 424e1c0..f81a290 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -50,6 +50,18 @@
+ #define SWEET_VTIMER_INTID        19
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
++/*
++ * Sony Xperia XZ1 (poplar, MSM8998): splash framebuffer XBL scans out
++ * (cont_splash_mem at 0x9d400000; shim enables PP_0 autorefresh on the
++ * 1080x1920 command-mode DSI panel), 4320-byte rows.
++ * SWEET_EARLY_FB_BLOCK_PA is the 32MB L2 block (0x9c000000) holding it.
++ */
++#define SWEET_EARLY_FB_PA         0x9d400000
++#define SWEET_EARLY_FB_BLOCK_PA   0x9c000000
++#define SWEET_EARLY_FB_WIDTH      1080
++#define SWEET_EARLY_FB_HEIGHT     1920
++#define SWEET_EARLY_FB_STRIDE     4320
++
+ #define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
+ 
+ #define GICR_PE_SIZE              0x20000 // Size of each redistributor region
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb5684a..99a62073f 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,7 +1843,7 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = (tt_entry_t)SWEET_EARLY_FB_BLOCK_PA | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+@@ -2190,7 +2190,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ #if defined(SWEET)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+-	sweet_early_relocate(SWEET_EARLY_FB_VA);
++	sweet_early_relocate(SWEET_EARLY_FB_VA + (SWEET_EARLY_FB_PA - SWEET_EARLY_FB_BLOCK_PA));
+ #endif
+ 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
+ 
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f83..bfbc10387 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -323,6 +323,9 @@ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
+ 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
++	mov		x1, #(3 << 20)
++	msr		CPACR_EL1, x1
++	isb
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
+@@ -515,10 +518,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_EARLY_FB_PA + (SWEET_EARLY_FB_HEIGHT - 32) * SWEET_EARLY_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_EARLY_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -686,7 +686,7 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_EARLY_FB_BLOCK_PA
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 69289572d..c3ab94f7b 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,11 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PA;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH ((unsigned int)SWEET_EARLY_FB_WIDTH)
++#define EARLY_HEIGHT ((unsigned int)SWEET_EARLY_FB_HEIGHT)
++#define EARLY_STRIDE ((unsigned int)SWEET_EARLY_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 96c557b..6f1241a 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -82,7 +82,7 @@ SweetCPU::start(IOService *provider)
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 260");
++	cpuName = OSSymbol::withCStringNoCopy("Kryo 280");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685e9..8c0e44011 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -22,6 +22,60 @@ public:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/*
++ * poplar (MSM8998): the shim arms the APSS watchdog (qcom,wdt@17817000, ~30 s
++ * bite) and sets the PON/IMEM restart reason to bootloader, so a kernel that
++ * hangs or panics resets the phone into fastboot. Pet it while threads run.
++ * poplarwdt=0 turns it off; polarreboot=N stops petting after about N seconds,
++ * which bounds an unattended test run.
++ */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define POPLAR_WDT_PA    0x17817000
++#define POPLAR_WDT_RST   0x04
++#define POPLAR_WDT_EN    0x08
++#define POPLAR_WDT_PET_S 5
++
++static void
++poplar_wdt_thread(void *arg)
++{
++	volatile uint32_t *wdt = (volatile uint32_t *)arg;
++	int reboot_s = 0;
++	PE_parse_boot_argn("poplarreboot", &reboot_s, sizeof(reboot_s));
++	for (int t = 0; reboot_s <= 0 || t < reboot_s; t += POPLAR_WDT_PET_S) {
++		wdt[POPLAR_WDT_RST / 4] = 1;
++		IOSleep(POPLAR_WDT_PET_S * 1000);
++	}
++	IOLog("POPLAR WDT: polarreboot=%d reached, no more pets: reset follows\n", reboot_s);
++	for (;;) {
++		IOSleep(1000000);
++	}
++}
++
++static void
++poplar_wdt_start(void)
++{
++	int enabled = 1;
++	PE_parse_boot_argn("poplarwdt", &enabled, sizeof(enabled));
++	volatile uint32_t *wdt = (volatile uint32_t *)ml_io_map(POPLAR_WDT_PA, 0x1000);
++	if (wdt == NULL) {
++		IOLog("POPLAR WDT: mapping failed\n");
++		return;
++	}
++	if (!(wdt[POPLAR_WDT_EN / 4] & 1)) {
++		IOLog("POPLAR WDT: not armed by the shim\n");
++		return;
++	}
++	wdt[POPLAR_WDT_RST / 4] = 1;
++	if (!enabled) {
++		wdt[POPLAR_WDT_EN / 4] = 0;
++		IOLog("POPLAR WDT: disabled (poplarwdt=0)\n");
++		return;
++	}
++	IOCreateThread(poplar_wdt_thread, (void *)wdt);
++	IOLog("POPLAR WDT: petting every %d s\n", POPLAR_WDT_PET_S);
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
+@@ -29,6 +83,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (!IODTPlatformExpert::start(provider)) {
+ 		return false;
+ 	}
++	poplar_wdt_start();
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 	return true;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7a11f42..d84e901 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -98,6 +98,7 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScale;                   /* scale 1125x2436 -> 1080x1920 */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -168,6 +169,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	int scale = (fHeight <= 1920) ? 1 : 0;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	fScale = !native && (scale != 0) && (fLogicalW != fWidth || fLogicalH != fHeight);
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -193,8 +197,8 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u (scale=%d)\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fScale);
+ 	return true;
+ }
+ 
+@@ -349,6 +353,43 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScale && src != 0 && bpe == 4 && s->elementWidth == 1 &&
++		    s->elementHeight == 1 && s->memory != NULL) {
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			int32_t px0 = (dx * (int32_t)fWidth) / (int32_t)fLogicalW;
++			int32_t py0 = (dy * (int32_t)fHeight) / (int32_t)fLogicalH;
++			int32_t px1 = ((dx + w) * (int32_t)fWidth) / (int32_t)fLogicalW;
++			int32_t py1 = ((dy + h) * (int32_t)fHeight) / (int32_t)fLogicalH;
++			if (px0 < 0) px0 = 0;
++			if (py0 < 0) py0 = 0;
++			if (px1 > (int32_t)fWidth) px1 = (int32_t)fWidth;
++			if (py1 > (int32_t)fHeight) py1 = (int32_t)fHeight;
++			uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4;
++			if (w > 0 && h > 0 && last <= s->memory->getLength()) {
++				for (int32_t py = py0; py < py1; py++) {
++					int32_t ly = (py * (int32_t)fLogicalH) / (int32_t)fHeight - dy;
++					if (ly < 0) ly = 0;
++					if (ly >= h) ly = h - 1;
++					const uint32_t *srow = (const uint32_t *)(src + s->offset +
++					    (uint64_t)(sy + ly) * s->bytesPerRow + (uint64_t)sx * 4);
++					uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++					for (int32_t px = px0; px < px1; px++) {
++						int32_t lx = (px * (int32_t)fLogicalW) / (int32_t)fWidth - dx;
++						if (lx >= 0 && lx < w) {
++							drow[px] = srow[lx];
++						}
++					}
++				}
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 918a0c2..4c2188e 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -425,10 +425,20 @@ SweetMultitouchDriver::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	int scale = 1;
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (native || scale) {
++		/* Scaled 1125x2436 -> 1080x1920 covers [0.0..1.0] across 1080x1920. */
++		fLogicalW = 1080;
++		fLogicalH = 1920;
++		fOffX = 0;
++		fOffY = 0;
++	} else {
++		fLogicalW = 1125;
++		fLogicalH = 2436;
++		fOffX = (fLogicalW - 1080) / 2;
++		fOffY = (fLogicalH - 1920) / 2;
++	}
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a1486081b..d09142c11 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,7 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+- * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * poplar (MSM8998 + PM8998 SID 0): power (KPDPWR) on PON 0x0800,
++ * volume-down on GPIO5 (0xc400) / PON RESIN, volume-up on GPIO6 (0xc500).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -17,15 +18,19 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
+ 
+-#define KEYS_CORE_PA     0x0c440000u
+-#define KEYS_OBS_PA      0x0e600000u
+-#define KEYS_CNFG_PA     0x0c40a000u
++#define KEYS_CORE_PA     0x0800f000u
++#define KEYS_OBS_PA      0x09400000u
++#define KEYS_CNFG_PA     0x0800a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_VOLUP_BASE  0xc500u
++#define KEYS_VOLDN_BASE  0xc400u
++#define KEYS_GPIO_RT     (KEYS_VOLUP_BASE + 0x10u)
++#define KEYS_VOLDN_RT    (KEYS_VOLDN_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+-static vm_offset_t keys_core, keys_obs, keys_cnfg;
+-static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static vm_offset_t keys_core, keys_cnfg;
++static vm_offset_t keys_pon_obs, keys_gpio_obs, keys_voldn_obs;
++static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID, keys_voldn_apid = KEYS_NO_APID;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -38,13 +43,14 @@ keys_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
+-/* v5 can map one PPID more than once; prefer the apps-owned entry. */
++/* v3 (0x800) / v5 (0x900) APID table; prefer the apps-owned entry. */
+ static uint16_t
+ keys_find_apid(uint16_t ppid, uint32_t count)
+ {
+ 	uint16_t found = KEYS_NO_APID;
++	uint32_t map_base = (keys_version >= 0x50000000u) ? 0x900u : 0x800u;
+ 	for (uint32_t i = 0; i < count; ++i) {
+-		uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++		uint32_t map = keys_rd(keys_core, map_base + 4u * i);
+ 		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
+ 			continue;
+ 		}
+@@ -56,24 +62,33 @@ keys_find_apid(uint16_t ppid, uint32_t count)
+ 	return found;
+ }
+ 
++static vm_offset_t
++keys_map_obs(uint16_t apid)
++{
++	if (apid == KEYS_NO_APID) {
++		return 0;
++	}
++	uint32_t stride = (keys_version >= 0x50000000u) ? 0x80u : 0x8000u;
++	return ml_io_map(KEYS_OBS_PA + stride * (uint32_t)apid, 0x1000);
++}
++
+ static bool
+-keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
++keys_read(vm_offset_t obs_ch, uint16_t apid, uint16_t addr, uint8_t *out)
+ {
+-	if (apid == KEYS_NO_APID) {
++	if (apid == KEYS_NO_APID || obs_ch == 0) {
+ 		return false;
+ 	}
+-	uint32_t off = 0x80u * apid; /* obs + EE(0)*0x10000 */
+ 	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(keys_obs + off) = cmd; /* EXT_READL, one byte */
++	*(volatile uint32_t *)obs_ch = cmd; /* EXT_READL, one byte */
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ 	for (unsigned i = 0; i < 1000; ++i) {
+-		keys_last_status = keys_rd(keys_obs, off + 0x08u);
++		keys_last_status = keys_rd(obs_ch, 0x08u);
+ 		if (keys_last_status & 1u) {
+ 			if (keys_last_status & 0x0eu) {
+ 				return false;
+ 			}
+-			*out = (uint8_t)keys_rd(keys_obs, off + 0x18u);
++			*out = (uint8_t)keys_rd(obs_ch, 0x18u);
+ 			return true;
+ 		}
+ 		delay(1);
+@@ -98,10 +113,12 @@ keys_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
+-		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
++		uint8_t pon = 0, gpio = 0, voldn = 1;
++		bool pok = keys_read(keys_pon_obs, keys_pon_apid, KEYS_PON_RT, &pon);
++		bool gok = keys_read(keys_gpio_obs, keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		bool dok = keys_read(keys_voldn_obs, keys_voldn_apid, KEYS_VOLDN_RT, &voldn);
++		int now[3] = {!!(pon & 1u), !(gpio & 1u),
++		    (dok && !(voldn & 1u)) || (pok && !!(pon & 2u))};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+@@ -111,10 +128,11 @@ keys_thread(void *arg, wait_result_t result)
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			bool ok = (k == 0) ? pok : (k == 1 ? gok : (dok || pok));
++			if (ok && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio6=%#x gpio5=%#x\n",
++				    k, state[k], pon, gpio, voldn);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
+@@ -137,36 +155,41 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+-	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+-	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+-	if (!keys_core || !keys_cnfg || !keys_obs) {
++	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x3000);
++	if (!keys_core || !keys_cnfg) {
+ 		printf("SWEET KEYS: MMIO mapping failed\n");
+ 		return;
+ 	}
+ 	keys_version = keys_rd(keys_core, 0);
+ 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
+-	    count == 0 || count > 512) {
++	if (count == 0 || count > 512) {
++		count = 512;
++	}
++	if (keys_version < 0x20000000u || keys_version >= 0x70000000u) {
+ 		printf("SWEET KEYS: unsupported arbiter version=%#x apids=%u\n",
+ 		    keys_version, count);
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid(KEYS_VOLUP_BASE >> 8, count);
++	keys_voldn_apid = keys_find_apid(KEYS_VOLDN_BASE >> 8, count);
++	keys_pon_obs = keys_map_obs(keys_pon_apid);
++	keys_gpio_obs = keys_map_obs(keys_gpio_apid);
++	keys_voldn_obs = keys_map_obs(keys_voldn_apid);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+-	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	bool pok = keys_read(keys_pon_obs, keys_pon_apid, KEYS_PON_RT, &pon);
++	bool gok = keys_read(keys_gpio_obs, keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++	bool mok = keys_read(keys_gpio_obs, keys_gpio_apid, KEYS_VOLUP_BASE + 0x40u, &mode);
++	bool eok = keys_read(keys_gpio_obs, keys_gpio_apid, KEYS_VOLUP_BASE + 0x46u, &en);
++	bool sok = keys_read(keys_gpio_obs, keys_gpio_apid, KEYS_VOLUP_BASE + 0x05u, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio6-apid=%u gpio5-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, keys_gpio_apid, keys_voldn_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO6 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 40044c8..8153b29 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -662,15 +662,15 @@ sweet_ufs_init(void)
+ 	 * They still poke SM7150 MMIO (SPMI, GENI SE7, DWC3 at 0xa600000); on
+ 	 * topaz that faults or hangs, so they only run with sweethw=1 until
+ 	 * they are ported.
+ 	 */
+ 	int hw = 0;
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
++	sweet_keys_init();
+ 	if (hw == 1) {
+-		sweet_keys_init();
+ 		sweet_touch_init();
+ 		sweet_usb_probe();
+ 	} else {
+-		printf("SWEET UFS: keys/touch/USB skipped (topaz, sweethw=0)\n");
++		printf("SWEET UFS: touch/USB skipped (poplar, sweethw=0)\n");
+ 	}
+ 	return 0;
+ }

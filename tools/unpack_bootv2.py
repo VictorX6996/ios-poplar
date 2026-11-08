@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""Unpack an Android boot image header v0-v2 into kernel/ramdisk/second/dtb + header.txt."""
-import struct, sys, os
+"""Unpack an Android boot image header v0-v2 into kernel/ramdisk/second/dtb + header.txt.
+If the kernel is Image.gz-dtb (v0/v1 with DTB blobs appended after the gzip
+stream, as on Sony MSM8998), also split the appended DTB(s) into out/dtb.
+"""
+import os, struct, sys, zlib
+
 src, out = sys.argv[1], sys.argv[2]
 os.makedirs(out, exist_ok=True)
 b = open(src, 'rb').read()
@@ -15,15 +19,35 @@ off = ps
 parts = [('kernel', ks), ('ramdisk', rs), ('second', ss)]
 if ver >= 1:
     rds, rdo, hs = struct.unpack_from('<IQI', b, 1632)
-    parts.append(('recovery_dtbo', rds)); info['header_size'] = hs
+    parts.append(('recovery_dtbo', rds))
+    info['header_size'] = hs
 if ver >= 2:
     ds, da = struct.unpack_from('<IQ', b, 1648)
-    parts.append(('dtb', ds)); info['dtb_addr'] = hex(da)
+    parts.append(('dtb', ds))
+    info['dtb_addr'] = hex(da)
 for name, sz in parts:
     if sz:
         open(f'{out}/{name}', 'wb').write(b[off:off+sz])
     info[name + '_offset'] = off
     off += rnd(sz)
+
+kblob = b[ps:ps+ks]
+if kblob[:3] == b'\x1f\x8b\x08' and not os.path.exists(f'{out}/dtb'):
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        d.decompress(kblob)
+        tail = d.unused_data
+        idx = tail.find(b'\xd0\x0d\xfe\xed')
+        if idx >= 0:
+            open(f'{out}/dtb', 'wb').write(tail[idx:])
+            info['kernel_format'] = f'Image.gz-dtb (appended dtb {len(tail) - idx} bytes)'
+        else:
+            info['kernel_format'] = 'Image.gz'
+    except Exception:
+        info['kernel_format'] = 'gzip-unknown'
+elif kblob[0x38:0x3c] == b'ARM\x64':
+    info['kernel_format'] = 'Image (raw)'
+
 with open(f'{out}/header.txt', 'w') as f:
     for k, v in info.items():
         f.write(f'{k}: {v}\n')

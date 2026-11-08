@@ -1,36 +1,81 @@
 #!/bin/bash
-# Build the shim and wrap it in a boot.img v2 that mirrors the stock PixelOS header.
+# Build the poplar (Xperia XZ1, MSM8998) shim and wrap it in a boot.img.
+#
+#   shim/build.sh [PAYLOAD] [OUT]
+#
+# Uses stock/header.txt + stock/dtb (unpacked from your backup/boot.img by
+# `python3 tools/unpack_bootv2.py backup/boot.img stock`) so the boot image
+# version, page size, offsets and DTB attachment match what Sony's XBL
+# expects on your phone.
+#
+# Environment knobs:
+#   KERNEL_FMT=gz-dtb|gz|raw   (default: gz-dtb if stock/dtb exists, else gz)
+#   EMBED_PAYLOAD=1            append PAYLOAD after _end in the kernel Image
+#                              (like ios-topaz) in addition to the ramdisk
 set -euo pipefail
 cd "$(dirname "$0")"
-CC=aarch64-linux-gnu-gcc
-OBJCOPY=aarch64-linux-gnu-objcopy
-CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+ROOT=$(cd .. && pwd)
+
+if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+	CC=aarch64-linux-gnu-gcc
+	LD=aarch64-linux-gnu-ld
+	OBJCOPY=aarch64-linux-gnu-objcopy
+	READELF=aarch64-linux-gnu-readelf
+	NM=aarch64-linux-gnu-nm
+else
+	LLVM=${LLVM:-/opt/homebrew/opt/llvm/bin}
+	CC="$LLVM/clang --target=aarch64-none-elf"
+	LD="${LLD:-/opt/homebrew/opt/lld/bin}/ld.lld"
+	OBJCOPY="$LLVM/llvm-objcopy"
+	READELF="$LLVM/llvm-readelf"
+	NM="$LLVM/llvm-nm"
+fi
+
+CFLAGS="-O2 -ffreestanding -nostdlib -fno-builtin -fno-pic -fno-pie -mgeneral-regs-only -mstrict-align \
+	-fno-stack-protector -fno-asynchronous-unwind-tables -Wall -Wextra ${SHIM_CFLAGS:-}"
+SRCS="start.S shim.c console.c log.c util.c mmu.c fdt.c loader.c ufs.c spmi.c sde.c showlog.c ramlog.c"
 mkdir -p out
-for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
-	$CC $CFLAGS -c $f -o out/${f%.*}.o
+objs=
+for f in $SRCS; do
+	$CC $CFLAGS -c "$f" -o "out/${f%.*}.o"
+	objs="$objs out/${f%.*}.o"
 done
-# The image runs wherever ABL puts it with no relocation pass: only the
-# header's image_size (start.o, linked at 0) may be an absolute address.
-abs=$(aarch64-linux-gnu-readelf -r out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o | grep -c ABS64 || true)
+
+abs=$($READELF -r $(echo "$objs" | sed 's|out/start.o||') | grep -cE 'R_AARCH64_ABS64|ABS64' || true)
 [ "$abs" = 0 ] || { echo "error: $abs absolute relocations in C objects" >&2; exit 1; }
-$CC $CFLAGS -static -T shim.ld -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-N \
-	out/start.o out/shim.o out/console.o out/mmu.o out/fdt.o out/loader.o out/ufs.o -o out/shim.elf
+
+$LD -static -nostdlib -T shim.ld --build-id=none -N $objs -o out/shim.elf
 $OBJCOPY -O binary out/shim.elf out/Image
-# ABL copies the file; pad to image_size so .bss/stacks exist as zeroed bytes.
-size=$(aarch64-linux-gnu-nm out/shim.elf | awk '$3=="_end"{print strtonum("0x"$1)}')
+size=$((16#$($NM out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
-# Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
-# newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
-if [ -n "${1:-}" ]; then
+
+if [ -n "${1:-}" ] && [ "${EMBED_PAYLOAD:-1}" = 1 ]; then
+	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
+	cat "$1" >> out/Image
+	python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
+fi
+
+gzip -n -9 -f -c out/Image > out/Image.gz
+if [ -f "$ROOT/stock/dtb" ]; then
+	cat out/Image.gz "$ROOT/stock/dtb" > out/Image.gz-dtb
+	FMT=${KERNEL_FMT:-gz-dtb}
+else
+	FMT=${KERNEL_FMT:-gz}
+fi
+case "$FMT" in
+gz-dtb) KIMG=out/Image.gz-dtb ;;
+gz)     KIMG=out/Image.gz ;;
+raw)    KIMG=out/Image ;;
+*)      echo "unknown KERNEL_FMT=$FMT" >&2; exit 2 ;;
+esac
+
+if [ -n "${1:-}" ] && [ "${EMBED_PAYLOAD:-1}" = 0 ]; then
 	cp "$1" out/ramdisk.bin
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
-	--cmdline "console=null" -o out/shim-boot.img
-# Host render of the console layout.
-gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
-ls -l out/Image out/shim-boot.img
+
+OUT=${2:-out/shim-boot.img}
+python3 "$ROOT/tools/pack_bootimg.py" --kernel "$KIMG" --ramdisk out/ramdisk.bin \
+	--header "$ROOT/stock/header.txt" -o "$OUT"
+ls -lh out/Image "$KIMG" "$OUT"

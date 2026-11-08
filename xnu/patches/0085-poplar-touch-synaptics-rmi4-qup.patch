@@ -2,7 +2,8 @@ diff --git a/bsd/conf/files b/bsd/conf/files
 index 6630131..7741235 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+@@ -110,7 +110,8 @@
+ bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
@@ -56,7 +57,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,475 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -373,7 +374,7 @@ index 0000000..f34a5d8
 +
 +	st.f01_data_base = 0;
 +	st.f12_data_base = 0;
-
++
 +	for (int addr = 0x00e9; addr >= 0x0005; addr -= 6) {
 +		uint8_t desc[6] = {0};
 +		err = qup_i2c_read(SYNAPTICS_I2C_ADDR, (uint8_t)addr, desc, 6);

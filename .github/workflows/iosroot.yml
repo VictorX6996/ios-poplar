@@ -8,9 +8,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Free runner disk space
+      - name: Free runner disk space and setup work directories
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo mkdir -p /mnt/ipsw /mnt/out
+          sudo chown -R "$USER:$USER" /mnt
+          sudo chmod 777 /mnt
           df -h
 
       - name: Checkout repository
@@ -42,7 +45,7 @@ jobs:
             /mnt/ipsw/087-86593-047.dmg \
             /mnt/ipsw/087-86715-047.dmg \
             /mnt/ios16-root.img 16G
-          rm -rf /mnt/ipsw
+          sudo rm -rf /mnt/ipsw
           sudo fsck.hfsplus -fy /mnt/ios16-root.img || true
           sudo mkdir -p /mnt/iosroot
           sudo mount -t hfsplus -o loop,force /mnt/ios16-root.img /mnt/iosroot
@@ -54,12 +57,12 @@ jobs:
       - name: Convert to sparse image and compress
         run: |
           img2simg /mnt/ios16-root.img /mnt/ios16-root.simg
-          rm -f /mnt/ios16-root.img
+          sudo rm -f /mnt/ios16-root.img
           mkdir -p /mnt/out
           zstd -T0 -3 /mnt/ios16-root.simg -o /mnt/out/ios16-root.simg.zst
-          rm -f /mnt/ios16-root.simg
+          sudo rm -f /mnt/ios16-root.simg
           split -b 1900M -d /mnt/out/ios16-root.simg.zst /mnt/out/ios16-root.simg.zst.part-
-          rm -f /mnt/out/ios16-root.simg.zst
+          sudo rm -f /mnt/out/ios16-root.simg.zst
           ls -lh /mnt/out
 
       - name: Upload ios16-root.simg.zst parts

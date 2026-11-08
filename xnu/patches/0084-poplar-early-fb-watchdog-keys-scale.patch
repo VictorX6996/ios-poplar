@@ -483,9 +483,10 @@ index a1486081b..d09142c11 100644
  		return;
  	}
  	keys_version = keys_rd(keys_core, 0);
- 	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
+-	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
 -	if (keys_version < 0x50000000u || keys_version >= 0x70000000u ||
 -	    count == 0 || count > 512) {
++	uint32_t count = (keys_version >= 0x50000000u) ? (keys_rd(keys_core, 4) & 0x7ffu) : 512u;
 +	if (count == 0 || count > 512) {
 +		count = 512;
 +	}

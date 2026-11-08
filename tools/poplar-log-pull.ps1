@@ -73,4 +73,9 @@ if ($What -eq 'shim') {
     Get-Content $Out
 } else {
     & python (Join-Path $PSScriptRoot 'sweet-log.py') $raw $Out
+    if (Test-Path $raw) { Remove-Item $raw }
+    if (Test-Path $Out) {
+        Get-Content $Out -Tail 80
+        Write-Host "`nSaved full XNU log to $Out"
+    }
 }

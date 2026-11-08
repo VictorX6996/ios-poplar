@@ -13,4 +13,6 @@ build/
 __pycache__/
 *.img
 *.dtb
+*.bin
+kernel.development.*
 

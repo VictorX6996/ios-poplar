@@ -1,0 +1,71 @@
+name: iOS 16 Root Image (poplar)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-root:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies and build apfs-fuse
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y hfsprogs android-sdk-libsparse-utils fuse3 libfuse3-dev bzip2 libbz2-dev cmake g++ git zlib1g-dev libattr1-dev zstd
+          git clone --recurse-submodules https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          cmake -B /tmp/apfs-fuse/build -S /tmp/apfs-fuse -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/apfs-fuse/build -j"$(nproc)"
+          sudo install -m 0755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+
+      - name: Download iPhone X 16.7.16 (20H392) DMGs from Apple CDN
+        run: |
+          IPSW_URL="https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+          mkdir -p /mnt/ipsw
+          python3 tools/remotezip.py "$IPSW_URL" 087-86698-044.dmg /mnt/ipsw
+          python3 tools/remotezip.py "$IPSW_URL" 087-86593-047.dmg /mnt/ipsw
+          python3 tools/remotezip.py "$IPSW_URL" 087-86715-047.dmg /mnt/ipsw
+          ls -lh /mnt/ipsw
+
+      - name: Build HFS+ iOS 16 root image and apply tweaks
+        run: |
+          chmod +x tools/mkiosroot.sh
+          ./tools/mkiosroot.sh \
+            /mnt/ipsw/087-86698-044.dmg \
+            /mnt/ipsw/087-86593-047.dmg \
+            /mnt/ipsw/087-86715-047.dmg \
+            /mnt/ios16-root.img 16G
+          rm -rf /mnt/ipsw
+          sudo fsck.hfsplus -fy /mnt/ios16-root.img || true
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force /mnt/ios16-root.img /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          sudo umount /mnt/iosroot
+          sudo fsck.hfsplus -fy /mnt/ios16-root.img | grep -v 'Illegal name' || true
+          sudo fsck.hfsplus -fn /mnt/ios16-root.img
+
+      - name: Convert to sparse image and compress
+        run: |
+          img2simg /mnt/ios16-root.img /mnt/ios16-root.simg
+          rm -f /mnt/ios16-root.img
+          mkdir -p /mnt/out
+          zstd -T0 -3 /mnt/ios16-root.simg -o /mnt/out/ios16-root.simg.zst
+          rm -f /mnt/ios16-root.simg
+          split -b 1900M -d /mnt/out/ios16-root.simg.zst /mnt/out/ios16-root.simg.zst.part-
+          rm -f /mnt/out/ios16-root.simg.zst
+          ls -lh /mnt/out
+
+      - name: Upload ios16-root.simg.zst parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-root-simg
+          path: /mnt/out/ios16-root.simg.zst.part-*
+          compression-level: 0
+          retention-days: 7

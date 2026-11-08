@@ -167,7 +167,7 @@ diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPl
 index 0631685e9..8c0e44011 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-@@ -22,6 +22,60 @@ public:
+@@ -22,6 +22,63 @@ public:
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
  
@@ -196,6 +196,9 @@ index 0631685e9..8c0e44011 100644
 +		IOSleep(POPLAR_WDT_PET_S * 1000);
 +	}
 +	IOLog("POPLAR WDT: polarreboot=%d reached, no more pets: reset follows\n", reboot_s);
++	wdt[0x10 / 4] = 32765;
++	wdt[0x14 / 4] = 65530;
++	wdt[POPLAR_WDT_RST / 4] = 1;
 +	for (;;) {
 +		IOSleep(1000000);
 +	}

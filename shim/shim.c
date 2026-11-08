@@ -389,7 +389,7 @@ void secondary_main(uint64_t idx)
 
 void shim_main(uintptr_t dtb)
 {
-	log_printf("POPLARSHIM probe v8 t=%lu\n", ticks_now());
+	log_printf("POPLARSHIM probe v9 t=%lu\n", ticks_now());
 	log_cpu("boot", dtb);
 
 	/* Display first, so every later step is visible. */
@@ -398,7 +398,7 @@ void shim_main(uintptr_t dtb)
 	uintptr_t fb = splash_fb(&stride);
 	con_init(fb, stride);
 	con_clear(0xff203040);
-	con_str("POPLAR", "Xperia XZ1 shim probe v8");
+	con_str("POPLAR", "Xperia XZ1 shim probe v9");
 	con_hex2("BOOT", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
 	con_hex2("MMFR0", "lo=", (uint32_t)rsr("id_aa64mmfr0_el1"),
 		 "tg16=", (uint32_t)((rsr("id_aa64mmfr0_el1") >> 20) & 0xf));

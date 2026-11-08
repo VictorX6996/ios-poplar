@@ -77,38 +77,40 @@ typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
 int loader_has_payload(uintptr_t dtb)
 {
+	uint64_t rd_start, rd_end;
+	if (fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+	    fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) && rd_end > rd_start) {
+		for (uintptr_t a = rd_start; a + 8 <= rd_end && a < rd_start + 0x40000; a++) {
+			if (magic_ok((const char *)a))
+				return 1;
+		}
+	}
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
-	if (magic_ok((const char *)emb))
-		return 1;
-	uint64_t rd_start;
-	return fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
-	       magic_ok(((const struct payload *)rd_start)->magic);
+	return magic_ok((const char *)emb);
 }
 
 const char *loader_boot(uintptr_t dtb, const struct loader_fb *fb)
 {
 	uint64_t rd_start, rd_end;
 	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
-
-	if (magic_ok((const char *)emb)) {
-		rd_start = emb;
-		rd_end = emb + 0x8000000;
-		log_printf("loader: embedded payload @%lx\n", (uint64_t)emb);
-	} else {
-		if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-		    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-			return "no initrd in /chosen";
-		log_printf("loader: initrd %lx-%lx\n", rd_start, rd_end);
-	}
-
 	uintptr_t hit = 0;
-	for (uintptr_t a = rd_start; a + 8 <= rd_end; a++)
-		if (magic_ok((const char *)a)) {
-			hit = a;
-			break;
+
+	if (fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+	    fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) && rd_end > rd_start) {
+		for (uintptr_t a = rd_start; a + 8 <= rd_end; a++) {
+			if (magic_ok((const char *)a)) {
+				hit = a;
+				log_printf("loader: initrd payload @%lx\n", (uint64_t)hit);
+				break;
+			}
 		}
+	}
+	if (!hit && magic_ok((const char *)emb)) {
+		hit = emb;
+		log_printf("loader: embedded payload @%lx\n", (uint64_t)emb);
+	}
 	if (!hit)
-		return "no SWEETXNU payload";
+		return "no valid SWEETXNU payload found";
 	if (hit != rd_start) {
 		uintptr_t dst = (rd_start + 7) & ~7UL;
 		volatile uint8_t *d = (volatile uint8_t *)dst;

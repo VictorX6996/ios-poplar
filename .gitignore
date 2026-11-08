@@ -14,5 +14,9 @@ __pycache__/
 *.img
 *.dtb
 *.bin
+*.simg
+*.zip
+.zig-cache/
+ios16-root-simg/
 kernel.development.*
 

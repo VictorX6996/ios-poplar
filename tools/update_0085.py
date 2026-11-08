@@ -457,7 +457,14 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 static bool
 synaptics_scan_pdt(void)
 {
-	int err = qup_i2c_write_reg(SYNAPTICS_I2C_ADDR, 0xffu, 0x00u);
+	int err = -1;
+	for (int retry = 0; retry < 5; retry++) {
+		err = qup_i2c_write_reg(SYNAPTICS_I2C_ADDR, 0xffu, 0x00u);
+		if (!err) {
+			break;
+		}
+		touch_wait(20);
+	}
 	if (err) {
 		printf("SWEET TOUCH: page 0 select failed: %d\\n", err);
 		return false;
@@ -564,7 +571,7 @@ touch_thread(void *arg, wait_result_t result)
 	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\\n",
 	    QUP5_BASE_PA, TLMM_BASE_PA);
 	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-	st.gpio = ml_io_map(TLMM_BASE_PA, 0x80000);
+	st.gpio = ml_io_map(TLMM_BASE_PA, 0x100000);
 	if (!st.qup || !st.gpio) {
 		printf("SWEET TOUCH: MMIO mapping failed\\n");
 		st.dead = true;
@@ -598,7 +605,7 @@ touch_thread(void *arg, wait_result_t result)
 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
 	touch_wait(10);
 	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
-	touch_wait(20);
+	touch_wait(250);
 
 	/* Active-low IRQ input on GPIO 125 with pull-up */
 	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);

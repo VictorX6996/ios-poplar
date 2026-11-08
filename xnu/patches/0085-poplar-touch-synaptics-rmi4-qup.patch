@@ -57,7 +57,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,596 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -453,7 +453,14 @@ index 0000000..f34a5d8
 +static bool
 +synaptics_scan_pdt(void)
 +{
-+	int err = qup_i2c_write_reg(SYNAPTICS_I2C_ADDR, 0xffu, 0x00u);
++	int err = -1;
++	for (int retry = 0; retry < 5; retry++) {
++		err = qup_i2c_write_reg(SYNAPTICS_I2C_ADDR, 0xffu, 0x00u);
++		if (!err) {
++			break;
++		}
++		touch_wait(20);
++	}
 +	if (err) {
 +		printf("SWEET TOUCH: page 0 select failed: %d\n", err);
 +		return false;
@@ -560,7 +567,7 @@ index 0000000..f34a5d8
 +	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\n",
 +	    QUP5_BASE_PA, TLMM_BASE_PA);
 +	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-+	st.gpio = ml_io_map(TLMM_BASE_PA, 0x80000);
++	st.gpio = ml_io_map(TLMM_BASE_PA, 0x100000);
 +	if (!st.qup || !st.gpio) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		st.dead = true;
@@ -594,7 +601,7 @@ index 0000000..f34a5d8
 +	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
 +	touch_wait(10);
 +	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
-+	touch_wait(20);
++	touch_wait(250);
 +
 +	/* Active-low IRQ input on GPIO 125 with pull-up */
 +	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);

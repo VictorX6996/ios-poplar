@@ -86,8 +86,10 @@ C_SOURCE = """/*
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/errno.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 
@@ -95,10 +97,6 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 void sweet_poplar_touch_init(void);
-
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
 
 /*
  * =========================================================================
@@ -211,9 +209,9 @@ static bool
 rpm_send_open(void)
 {
 	static const char name[] = "rpm_requests";
-	uint32_t w[2 + 4] = {CMD_OPEN | (RPM_LCID << 16), sizeof(name)};
+	uint32_t w[2 + 4] = {CMD_OPEN | (RPM_LCID << 16), (uint32_t)sizeof(name)};
 	memcpy(&w[2], name, sizeof(name));
-	return rpm_send(w, 8u + ((sizeof(name) + 3u) & ~3u));
+	return rpm_send(w, 8u + (((uint32_t)sizeof(name) + 3u) & ~3u));
 }
 
 static bool
@@ -246,7 +244,9 @@ rpm_rx_one(void)
 		if (avail < len) {
 			return false;
 		}
-		rpm_fifo_peek(8, name, MIN(p2 + 3u, 31u) & ~3u);
+		uint32_t copy_len = p2 + 3u;
+		if (copy_len > 31u) copy_len = 31u;
+		rpm_fifo_peek(8, name, copy_len & ~3u);
 		rpm_fifo_advance(len);
 		if (strncmp((const char *)name, "rpm_requests", 12) == 0) {
 			rpm.rcid = p1;
@@ -283,7 +283,8 @@ rpm_rx_one(void)
 		if (cmd == CMD_TX_DATA) {
 			rpm.resp_len = 0;
 		}
-		uint32_t take = MIN(chunk, sizeof(rpm.resp) - rpm.resp_len) & ~3u;
+		uint32_t max_take = (uint32_t)sizeof(rpm.resp) - rpm.resp_len;
+		uint32_t take = (chunk < max_take ? chunk : max_take) & ~3u;
 		rpm_fifo_peek(16, (uint32_t *)((uint8_t *)rpm.resp + rpm.resp_len), take);
 		rpm.resp_len += take;
 		rpm_fifo_advance((16u + chunk + 7u) & ~7u);
@@ -304,18 +305,6 @@ rpm_rx_one(void)
 	return true;
 }
 
-#define RPM_POLL(ms, cond) ({                                   \\
-	unsigned _i;                                            \\
-	for (_i = 0; _i < (ms) && !(cond); _i++) {              \\
-		while (rpm_rx_one()) {                          \\
-		}                                               \\
-		if (!(cond)) {                                  \\
-			delay(1000);                            \\
-		}                                               \\
-	}                                                       \\
-	(cond);                                                 \\
-})
-
 static bool
 poplar_rpm_open(void)
 {
@@ -326,8 +315,8 @@ poplar_rpm_open(void)
 		vm_offset_t ram = ml_io_map(RPM_MSGRAM_PA, RPM_MSGRAM_SIZE);
 		vm_offset_t ipc_page = ml_io_map(RPM_IPC_PAGE, 0x1000);
 		if (!ram || !ipc_page) {
-			printf("SWEET RPM: MMIO mapping failed (ram=0x%lx ipc=0x%lx)\\n",
-			    (unsigned long)ram, (unsigned long)ipc_page);
+			printf("SWEET RPM: MMIO mapping failed (ram=%p ipc=%p)\\n",
+			    (void *)ram, (void *)ipc_page);
 			return false;
 		}
 		rpm.ipc = ipc_page + RPM_IPC_OFFSET;
@@ -339,7 +328,7 @@ poplar_rpm_open(void)
 		}
 		for (uint32_t i = 0; i < count; i++) {
 			uint32_t id = toc[2 + 3 * i], off = toc[3 + 3 * i], size = toc[4 + 3 * i];
-			struct rpm_fifo *f = id == RPM_FIFO_AP2R ? &rpm.tx : id == RPM_FIFO_R2AP ? &rpm.rx : NULL;
+			struct rpm_fifo *f = (id == RPM_FIFO_AP2R) ? &rpm.tx : (id == RPM_FIFO_R2AP) ? &rpm.rx : NULL;
 			if (f == NULL || off + size > RPM_MSGRAM_SIZE || (size & 3u)) {
 				continue;
 			}
@@ -360,7 +349,17 @@ poplar_rpm_open(void)
 	*rpm.tx.head = 0;
 	*rpm.rx.tail = 0;
 	(void)rpm_send_cmd(CMD_VERSION, 1, 0);
-	bool ok = RPM_POLL(1000u, rpm.up && rpm.remote_open && rpm.open_acked);
+
+	for (unsigned i = 0; i < 1000; i++) {
+		while (rpm_rx_one()) {
+		}
+		if (rpm.up && rpm.remote_open && rpm.open_acked) {
+			break;
+		}
+		delay(1000);
+	}
+
+	bool ok = (rpm.up && rpm.remote_open && rpm.open_acked);
 	printf("SWEET RPM: link %s (version %d, remote open %d rcid %u, open ack %d)\\n",
 	    ok ? "up" : "FAILED", rpm.up, rpm.remote_open, rpm.rcid, rpm.open_acked);
 	return ok;
@@ -385,19 +384,33 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 	if (!rpm_send(w, sizeof(w))) {
 		return false;
 	}
-	if (!RPM_POLL(1000u, rpm.resp_ready)) {
+
+	for (unsigned i = 0; i < 1000; i++) {
+		while (rpm_rx_one()) {
+		}
+		if (rpm.resp_ready) {
+			break;
+		}
+		delay(1000);
+	}
+
+	if (!rpm.resp_ready) {
 		printf("SWEET RPM: L%u: no answer\\n", ldo);
 		return false;
 	}
 	bool acked = false, err = false;
-	uint32_t words = MIN(rpm.resp_len / 4, 2u + rpm.resp[1] / 4), i = 2;
+	uint32_t max_words = 2u + rpm.resp[1] / 4;
+	uint32_t words = (rpm.resp_len / 4 < max_words ? rpm.resp_len / 4 : max_words);
+	uint32_t i = 2;
 	while (i + 2 <= words) {
 		uint32_t type = rpm.resp[i], len = rpm.resp[i + 1];
 		if (type == 0x2367736du && rpm.resp[i + 2] == id) {
 			acked = true;
 		} else if (type == 0x00727265u) {
 			char text[32] = {0};
-			memcpy(text, &rpm.resp[i + 2], MIN(len, sizeof(text) - 1));
+			uint32_t max_text = (uint32_t)sizeof(text) - 1;
+			uint32_t copy_text = len < max_text ? len : max_text;
+			memcpy(text, &rpm.resp[i + 2], copy_text);
 			printf("SWEET RPM: L%u: error '%s'\\n", ldo, text);
 			err = true;
 		}

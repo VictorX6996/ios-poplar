@@ -93,8 +93,8 @@ void sweet_poplar_touch_init(void);
 #define GCC_BASE_PA                     0x00100000u
 #define GCC_MAP_SIZE                    0x60000u
 #define QUP5_BASE_PA                    0x0c179000u
-/* TLMM North Tile: base 0x03400000 + 0x00500000 (NORTH) = 0x03900000 */
-#define TLMM_NORTH_BASE_PA              0x03900000u
+/* TLMM East Tile: base 0x03400000 + 0x00900000 (EAST) = 0x03d00000 */
+#define TLMM_EAST_BASE_PA               0x03d00000u
 #define TLMM_MAP_SIZE                   0x100000u
 
 /* GCC Registers & Bits for BLSP1 / QUP5 */
@@ -582,10 +582,10 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM NORTH (0x%08x)\\n",
-	    QUP5_BASE_PA, TLMM_NORTH_BASE_PA);
+	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM EAST (0x%08x)\\n",
+	    QUP5_BASE_PA, TLMM_EAST_BASE_PA);
 	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-	st.gpio = ml_io_map(TLMM_NORTH_BASE_PA, TLMM_MAP_SIZE);
+	st.gpio = ml_io_map(TLMM_EAST_BASE_PA, TLMM_MAP_SIZE);
 	if (!st.qup || !st.gpio) {
 		printf("SWEET TOUCH: MMIO mapping failed\\n");
 		st.dead = true;

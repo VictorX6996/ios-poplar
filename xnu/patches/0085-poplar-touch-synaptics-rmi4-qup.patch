@@ -89,8 +89,8 @@ index 0000000..f34a5d8
 +#define GCC_BASE_PA                     0x00100000u
 +#define GCC_MAP_SIZE                    0x60000u
 +#define QUP5_BASE_PA                    0x0c179000u
-+/* TLMM East Tile: base 0x03400000 + 0x00900000 (EAST) = 0x03d00000 */
-+#define TLMM_EAST_BASE_PA               0x03d00000u
++/* TLMM West Tile: base 0x03400000 + 0x00100000 (WEST) = 0x03500000 */
++#define TLMM_WEST_BASE_PA               0x03500000u
 +#define TLMM_MAP_SIZE                   0x100000u
 +
 +/* GCC Registers & Bits for BLSP1 / QUP5 */
@@ -578,10 +578,10 @@ index 0000000..f34a5d8
 +		return;
 +	}
 +
-+	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM EAST (0x%08x)\n",
-+	    QUP5_BASE_PA, TLMM_EAST_BASE_PA);
++	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM WEST (0x%08x)\n",
++	    QUP5_BASE_PA, TLMM_WEST_BASE_PA);
 +	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-+	st.gpio = ml_io_map(TLMM_EAST_BASE_PA, TLMM_MAP_SIZE);
++	st.gpio = ml_io_map(TLMM_WEST_BASE_PA, TLMM_MAP_SIZE);
 +	if (!st.qup || !st.gpio) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		st.dead = true;

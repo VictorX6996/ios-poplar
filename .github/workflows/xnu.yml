@@ -93,6 +93,18 @@ jobs:
           restore-keys: |
             ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
 
+      - name: Install KDK 13.5
+        run: |
+          KDK_DMG="/tmp/KDK.dmg"
+          KDK_URL="https://github.com/dortania/KdkSupportPkg/releases/download/22G74/Kernel_Debug_Kit_13.5_build_22G74.dmg"
+          echo "Downloading KDK 13.5 from $KDK_URL..."
+          curl --retry 3 --connect-timeout 60 -L -o "$KDK_DMG" "$KDK_URL"
+          hdiutil attach "$KDK_DMG" -nobrowse -mountpoint /Volumes/KDK
+          sudo installer -pkg /Volumes/KDK/*.pkg -target /
+          hdiutil detach /Volumes/KDK
+          rm -f "$KDK_DMG"
+          ls -la /Library/Developer/KDKs/
+
       - name: Build
         working-directory: dxb
         env:

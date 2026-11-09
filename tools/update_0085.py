@@ -94,7 +94,6 @@ void sweet_poplar_touch_init(void);
 #define GCC_MAP_SIZE                    0x60000u
 #define QUP5_BASE_PA                    0x0c179000u
 #define TLMM_BASE_PA                    0x03400000u
-#define SYNAPTICS_I2C_ADDR              0x2cu
 
 /* GCC Registers & Bits for BLSP1 / QUP5 */
 #define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x52004u
@@ -160,6 +159,7 @@ static struct {
 	bool started;
 	bool dead;
 	int logging;
+	uint8_t i2c_addr;
 	uint8_t f01_data_base;
 	uint8_t f01_cmd_base;
 	uint8_t f01_ctrl_base;
@@ -337,7 +337,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		return EIO;
 	}
 
-	uint8_t pkt[72];
+	uint8_t pkt[72] = {0};
 	pkt[0] = QUP_TAG2_START;
 	pkt[1] = (uint8_t)((addr << 1) | 0u);
 	pkt[2] = QUP_TAG2_DATA_WRITE_STOP;
@@ -396,29 +396,31 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 
 	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
 	touch_wr(st.qup, QUP_IO_MODE, 0);
-	touch_wr(st.qup, QUP_MX_WR_CNT, 6u);
+	touch_wr(st.qup, QUP_MX_WR_CNT, 9u);
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, len + 2u);
 
 	if (!qup_set_state(QUP_RUN_STATE)) {
 		return EIO;
 	}
 
-	uint8_t tx_pkt[8];
-	tx_pkt[0] = QUP_TAG2_START;
-	tx_pkt[1] = (uint8_t)((addr << 1) | 0u);
-	tx_pkt[2] = reg;
-	tx_pkt[3] = QUP_TAG2_START;
-	tx_pkt[4] = (uint8_t)((addr << 1) | 1u);
-	tx_pkt[5] = QUP_TAG2_DATA_READ_STOP;
-	tx_pkt[6] = (uint8_t)len;
-	tx_pkt[7] = 0;
+	uint8_t tx_pkt[12] = {0};
+	tx_pkt[0] = QUP_TAG2_START;              /* 0x81 */
+	tx_pkt[1] = (uint8_t)((addr << 1) | 0u); /* Write slave address */
+	tx_pkt[2] = QUP_TAG2_DATA_WRITE;         /* 0x82 (data write, NO stop) */
+	tx_pkt[3] = 1u;                          /* 1 byte payload */
+	tx_pkt[4] = reg;                         /* register offset */
+	tx_pkt[5] = QUP_TAG2_START;              /* 0x81 (Repeated START) */
+	tx_pkt[6] = (uint8_t)((addr << 1) | 1u); /* Read slave address */
+	tx_pkt[7] = QUP_TAG2_DATA_READ_STOP;     /* 0x87 (data read with STOP) */
+	tx_pkt[8] = (uint8_t)len;                /* number of bytes to read */
 
-	uint32_t w0 = (uint32_t)tx_pkt[0] | ((uint32_t)tx_pkt[1] << 8) |
-	    ((uint32_t)tx_pkt[2] << 16) | ((uint32_t)tx_pkt[3] << 24);
-	uint32_t w1 = (uint32_t)tx_pkt[4] | ((uint32_t)tx_pkt[5] << 8) |
-	    ((uint32_t)tx_pkt[6] << 16) | ((uint32_t)tx_pkt[7] << 24);
-	touch_wr(st.qup, QUP_OUT_FIFO_BASE, w0);
-	touch_wr(st.qup, QUP_OUT_FIFO_BASE, w1);
+	for (unsigned i = 0; i < 12; i += 4) {
+		uint32_t w = (uint32_t)tx_pkt[i] |
+		    ((uint32_t)tx_pkt[i + 1] << 8) |
+		    ((uint32_t)tx_pkt[i + 2] << 16) |
+		    ((uint32_t)tx_pkt[i + 3] << 24);
+		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
+	}
 
 	bool ok = false;
 	for (int i = 0; i < 5000; i++) {
@@ -458,12 +460,21 @@ static bool
 synaptics_scan_pdt(void)
 {
 	int err = -1;
-	for (int retry = 0; retry < 5; retry++) {
-		err = qup_i2c_write_reg(SYNAPTICS_I2C_ADDR, 0xffu, 0x00u);
+	static const uint8_t probe_addrs[] = { 0x2cu, 0x20u };
+	for (unsigned a = 0; a < sizeof(probe_addrs) / sizeof(probe_addrs[0]); a++) {
+		uint8_t addr = probe_addrs[a];
+		for (int retry = 0; retry < 5; retry++) {
+			err = qup_i2c_write_reg(addr, 0xffu, 0x00u);
+			if (!err) {
+				st.i2c_addr = addr;
+				printf("SWEET TOUCH: Synaptics responding at I2C addr 0x%02x\\n", addr);
+				break;
+			}
+			touch_wait(20);
+		}
 		if (!err) {
 			break;
 		}
-		touch_wait(20);
 	}
 	if (err) {
 		printf("SWEET TOUCH: page 0 select failed: %d\\n", err);
@@ -475,7 +486,7 @@ synaptics_scan_pdt(void)
 
 	for (int addr = 0x00e9; addr >= 0x0005; addr -= 6) {
 		uint8_t desc[6] = {0};
-		err = qup_i2c_read(SYNAPTICS_I2C_ADDR, (uint8_t)addr, desc, 6);
+		err = qup_i2c_read(st.i2c_addr, (uint8_t)addr, desc, 6);
 		if (err) {
 			printf("SWEET TOUCH: PDT read @0x%02x failed: %d\\n", addr, err);
 			break;
@@ -513,14 +524,14 @@ static void
 synaptics_poll_touch(void)
 {
 	uint8_t report[80];
-	int err = qup_i2c_read(SYNAPTICS_I2C_ADDR, st.f12_data_base, report, sizeof(report));
+	int err = qup_i2c_read(st.i2c_addr, st.f12_data_base, report, sizeof(report));
 	if (err) {
 		return;
 	}
 
 	if (st.f01_data_base) {
 		uint8_t istat = 0;
-		(void)qup_i2c_read(SYNAPTICS_I2C_ADDR, st.f01_data_base + 1, &istat, 1);
+		(void)qup_i2c_read(st.i2c_addr, st.f01_data_base + 1, &istat, 1);
 	}
 
 	for (int i = 0; i < TOUCH_MAX; i++) {
@@ -579,38 +590,36 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	uint32_t clk_ctl = touch_rd(st.qup, QUP_I2C_CLK_CTL);
-	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x\\n",
-	    clk_ctl, touch_rd(st.qup, QUP_I2C_STATUS));
-	if ((clk_ctl & 0xffu) == 0) {
-		touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x15u);
-	}
+	/* 1. Enable VDDIO power to touch controller on GPIO 133 */
+	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
+	touch_wait(20);
 
-	/* Read existing TLMM config */
-	uint32_t sda_cfg = touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SDA));
-	uint32_t scl_cfg = touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SCL));
-	unsigned sda_mux = ((sda_cfg >> 2) & 0xfu) ? ((sda_cfg >> 2) & 0xfu) : 1u;
-	unsigned scl_mux = ((scl_cfg >> 2) & 0xfu) ? ((scl_cfg >> 2) & 0xfu) : 1u;
-	printf("SWEET TOUCH: SDA CFG=0x%08x (mux %u), SCL CFG=0x%08x (mux %u)\\n",
-	    sda_cfg, sda_mux, scl_cfg, scl_mux);
-
-	touch_gpio(TOUCH_PIN_SDA, sda_mux, 0, 0, false, false);
-	touch_gpio(TOUCH_PIN_SCL, scl_mux, 0, 0, false, false);
-
-	/* Enable VDDIO power to touch controller on GPIO 133 */
-	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 2, true, true);
-	touch_wait(10);
-
-	/* Hardware reset toggle on GPIO 89 (active low) */
-	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, false);
-	touch_wait(10);
-	touch_gpio(TOUCH_PIN_RESET, 0, 3, 3, true, true);
+	/* 2. Hardware reset toggle on GPIO 89 (active low) */
+	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, false);
+	touch_wait(20);
+	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, true);
 	touch_wait(250);
 
-	/* Active-low IRQ input on GPIO 125 with pull-up */
-	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 3, false, false);
+	/* 3. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5) */
+	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
+	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
+	touch_wait(20);
 
+	/* 4. Active-low IRQ input on GPIO 125 with pull-up */
+	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);
 	touch_wait(10);
+
+	printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x\\n",
+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SDA)),
+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SCL)),
+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_RESET)),
+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_VDDIO)));
+
+	/* 5. Program QUP I2C CLK_CTL for 100 kHz standard mode (fs_div=93=0x5d, hs_div=3) */
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
+	__asm__ volatile("dsb osh" ::: "memory");
+	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x\\n",
+	    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS));
 
 	if (!synaptics_scan_pdt()) {
 		printf("SWEET TOUCH: Synaptics probe failed\\n");

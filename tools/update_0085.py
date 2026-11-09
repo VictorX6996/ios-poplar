@@ -93,11 +93,10 @@ void sweet_poplar_touch_init(void);
 #define GCC_BASE_PA                     0x00100000u
 #define GCC_MAP_SIZE                    0x60000u
 #define QUP5_BASE_PA                    0x0c179000u
-/* TLMM West Tile: base 0x03400000 + 0x00100000 (WEST) = 0x03500000 */
-#define TLMM_WEST_BASE_PA               0x03500000u
+#define TLMM_BASE_PA                    0x03400000u
 #define TLMM_MAP_SIZE                   0x100000u
 
-/* GCC Registers & Bits for BLSP1 / QUP5 */
+/* GCC Registers & Bits for BLSP1 / QUP5 and TLMM */
 #define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x52004u
 #define GCC_BLSP1_AHB_VOTE_BIT          (1u << 17)
 #define GCC_BLSP1_AHB_CBCR              0x17004u
@@ -106,6 +105,8 @@ void sweet_poplar_touch_init(void);
 #define GCC_BLSP1_QUP5_I2C_APPS_CBCR    0x21008u
 #define GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR 0x21020u
 #define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
+#define GCC_TLMM_AHB_CBCR               0x3e004u
+#define GCC_TLMM_CLK_CBCR               0x3e008u
 
 /* Poplar TLMM Touch Pins */
 #define TOUCH_PIN_SDA                   87u
@@ -209,10 +210,13 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, 
 		uint32_t io = touch_rd(st.gpio, io_off);
 		touch_wr(st.gpio, io_off, (io & ~2u) | (high ? 2u : 0u));
 	}
-	uint32_t cfg = touch_rd(st.gpio, off);
-	cfg &= ~0x3ffu;
+	uint32_t old_cfg = touch_rd(st.gpio, off);
+	uint32_t cfg = old_cfg & ~0x3ffu;
 	cfg |= (mux << 2) | (pull & 3u) | ((drive & 7u) << 6) | (out ? 0x200u : 0u);
 	touch_wr(st.gpio, off, cfg);
+	uint32_t new_cfg = touch_rd(st.gpio, off);
+	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x\\n",
+	    pin, old_cfg, cfg, new_cfg);
 }
 
 static bool
@@ -282,6 +286,24 @@ poplar_qup_clock_init(void)
 		touch_wr(st.gcc, blsp1_branches[i],
 		    touch_rd(st.gcc, blsp1_branches[i]) | 1u);
 	}
+
+	/* 6. Ungate TLMM AHB and CLK CBCRs in GCC for GPIO register access */
+	uint32_t tlmm_ahb = touch_rd(st.gcc, GCC_TLMM_AHB_CBCR);
+	uint32_t tlmm_clk = touch_rd(st.gcc, GCC_TLMM_CLK_CBCR);
+	printf("SWEET TOUCH: initial TLMM CBCR ahb=0x%08x (halt=%u) clk=0x%08x (halt=%u)\\n",
+	    tlmm_ahb, (tlmm_ahb >> 31) & 1u, tlmm_clk, (tlmm_clk >> 31) & 1u);
+	touch_wr(st.gcc, GCC_TLMM_AHB_CBCR, tlmm_ahb | 1u);
+	touch_wr(st.gcc, GCC_TLMM_CLK_CBCR, tlmm_clk | 1u);
+	for (int i = 0; i < 50000; i++) {
+		if (!(touch_rd(st.gcc, GCC_TLMM_AHB_CBCR) & (1u << 31))) {
+			break;
+		}
+	}
+	uint32_t tlmm_ahb_after = touch_rd(st.gcc, GCC_TLMM_AHB_CBCR);
+	uint32_t tlmm_clk_after = touch_rd(st.gcc, GCC_TLMM_CLK_CBCR);
+	printf("SWEET TOUCH: active TLMM CBCR ahb=0x%08x (halt=%u) clk=0x%08x (halt=%u)\\n",
+	    tlmm_ahb_after, (tlmm_ahb_after >> 31) & 1u,
+	    tlmm_clk_after, (tlmm_clk_after >> 31) & 1u);
 
 	touch_wait(10);
 	return true;
@@ -473,6 +495,14 @@ synaptics_scan_pdt(void)
 				printf("SWEET TOUCH: Synaptics responding at I2C addr 0x%02x\\n", addr);
 				break;
 			}
+			uint8_t test_val = 0;
+			int rerr = qup_i2c_read(addr, 0x00u, &test_val, 1);
+			if (!rerr) {
+				st.i2c_addr = addr;
+				printf("SWEET TOUCH: Synaptics responded to read @0x00: 0x%02x\\n", test_val);
+				err = 0;
+				break;
+			}
 			touch_wait(20);
 		}
 		if (!err) {
@@ -582,10 +612,10 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM WEST (0x%08x)\\n",
-	    QUP5_BASE_PA, TLMM_WEST_BASE_PA);
+	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\\n",
+	    QUP5_BASE_PA, TLMM_BASE_PA);
 	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-	st.gpio = ml_io_map(TLMM_WEST_BASE_PA, TLMM_MAP_SIZE);
+	st.gpio = ml_io_map(TLMM_BASE_PA, TLMM_MAP_SIZE);
 	if (!st.qup || !st.gpio) {
 		printf("SWEET TOUCH: MMIO mapping failed\\n");
 		st.dead = true;

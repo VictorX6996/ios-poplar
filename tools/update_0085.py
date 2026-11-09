@@ -93,7 +93,9 @@ void sweet_poplar_touch_init(void);
 #define GCC_BASE_PA                     0x00100000u
 #define GCC_MAP_SIZE                    0x60000u
 #define QUP5_BASE_PA                    0x0c179000u
-#define TLMM_BASE_PA                    0x03400000u
+/* TLMM North Tile: base 0x03400000 + 0x00500000 (NORTH) = 0x03900000 */
+#define TLMM_NORTH_BASE_PA              0x03900000u
+#define TLMM_MAP_SIZE                   0x100000u
 
 /* GCC Registers & Bits for BLSP1 / QUP5 */
 #define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x52004u
@@ -111,7 +113,7 @@ void sweet_poplar_touch_init(void);
 #define TOUCH_PIN_RESET                 89u
 #define TOUCH_PIN_IRQ                   125u
 #define TOUCH_PIN_VDDIO                 133u
-#define TOUCH_MAX                       10u
+#define TOUCH_MAX                       5u
 
 /* QUP v2 Registers */
 #define QUP_CONFIG                      0x000u
@@ -464,6 +466,7 @@ synaptics_scan_pdt(void)
 	for (unsigned a = 0; a < sizeof(probe_addrs) / sizeof(probe_addrs[0]); a++) {
 		uint8_t addr = probe_addrs[a];
 		for (int retry = 0; retry < 5; retry++) {
+			printf("SWEET TOUCH: probing I2C addr 0x%02x (attempt %d)...\\n", addr, retry + 1);
 			err = qup_i2c_write_reg(addr, 0xffu, 0x00u);
 			if (!err) {
 				st.i2c_addr = addr;
@@ -523,7 +526,7 @@ synaptics_scan_pdt(void)
 static void
 synaptics_poll_touch(void)
 {
-	uint8_t report[80];
+	uint8_t report[TOUCH_MAX * 8];
 	int err = qup_i2c_read(st.i2c_addr, st.f12_data_base, report, sizeof(report));
 	if (err) {
 		return;
@@ -579,10 +582,10 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\\n",
-	    QUP5_BASE_PA, TLMM_BASE_PA);
+	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM NORTH (0x%08x)\\n",
+	    QUP5_BASE_PA, TLMM_NORTH_BASE_PA);
 	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-	st.gpio = ml_io_map(TLMM_BASE_PA, 0x100000);
+	st.gpio = ml_io_map(TLMM_NORTH_BASE_PA, TLMM_MAP_SIZE);
 	if (!st.qup || !st.gpio) {
 		printf("SWEET TOUCH: MMIO mapping failed\\n");
 		st.dead = true;
@@ -590,20 +593,20 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	/* 1. Enable VDDIO power to touch controller on GPIO 133 */
+	/* 1. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5) */
+	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
+	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
+	touch_wait(10);
+
+	/* 2. Enable VDDIO power to touch controller on GPIO 133 */
 	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 	touch_wait(20);
 
-	/* 2. Hardware reset toggle on GPIO 89 (active low) */
+	/* 3. Hardware reset toggle on GPIO 89 (active low) */
 	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, false);
 	touch_wait(20);
 	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, true);
 	touch_wait(250);
-
-	/* 3. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5) */
-	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
-	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
-	touch_wait(20);
 
 	/* 4. Active-low IRQ input on GPIO 125 with pull-up */
 	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);

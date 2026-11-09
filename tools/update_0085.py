@@ -465,6 +465,12 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define QUP_IN_FIFO_BASE                0x218u
 #define QUP_I2C_CLK_CTL                 0x400u
 #define QUP_I2C_STATUS                  0x404u
+#define QUP_I2C_MASTER_GEN              0x408u
+#define QUP_V2_TAGS_EN                  1u
+
+#define QUP_UNPACK_EN                   (1u << 14)
+#define QUP_PACK_EN                     (1u << 15)
+#define QUP_REPACK_EN                   (QUP_UNPACK_EN | QUP_PACK_EN)
 
 /* QUP State bits */
 #define QUP_RESET_STATE                 0u
@@ -655,6 +661,16 @@ qup_set_state(uint32_t state)
 	if ((cur & QUP_STATE_MASK) == state) {
 		return true;
 	}
+	/* 1. First attempt: preserve upper control bits (cur & ~QUP_STATE_MASK) */
+	touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
+	for (int i = 0; i < 50000; i++) {
+		uint32_t s = touch_rd(st.qup, QUP_STATE);
+		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
+			return true;
+		}
+		delay(2);
+	}
+	/* 2. Second attempt: direct state write (as in Linux i2c-qup.c) */
 	touch_wr(st.qup, QUP_STATE, state);
 	for (int i = 0; i < 50000; i++) {
 		uint32_t s = touch_rd(st.qup, QUP_STATE);
@@ -663,9 +679,10 @@ qup_set_state(uint32_t state)
 		}
 		delay(2);
 	}
-	/* If transitioning from RESET directly to RUN failed, try PAUSE first then RUN */
+	/* 3. Fallback: try PAUSE first then RUN */
 	if (state == QUP_RUN_STATE && (touch_rd(st.qup, QUP_STATE) & QUP_STATE_MASK) == QUP_RESET_STATE) {
-		touch_wr(st.qup, QUP_STATE, QUP_PAUSE_STATE);
+		cur = touch_rd(st.qup, QUP_STATE);
+		touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | QUP_PAUSE_STATE);
 		for (int i = 0; i < 50000; i++) {
 			uint32_t s = touch_rd(st.qup, QUP_STATE);
 			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_PAUSE_STATE)) {
@@ -673,7 +690,8 @@ qup_set_state(uint32_t state)
 			}
 			delay(2);
 		}
-		touch_wr(st.qup, QUP_STATE, QUP_RUN_STATE);
+		cur = touch_rd(st.qup, QUP_STATE);
+		touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | QUP_RUN_STATE);
 		for (int i = 0; i < 50000; i++) {
 			uint32_t s = touch_rd(st.qup, QUP_STATE);
 			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
@@ -712,7 +730,8 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
 	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
-	touch_wr(st.qup, QUP_IO_MODE, 0);
+	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
+	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_WR_CNT, 4u + len);
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);
 
@@ -742,6 +761,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
+			printf("SWEET TOUCH: write nack/err status=0x%08x\\n", status);
 			(void)qup_reset();
 			return -4;
 		}
@@ -753,6 +773,8 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		delay(5);
 	}
 
+	printf("SWEET TOUCH: write timed out status=0x%08x out_fifo=%u\\n",
+	    touch_rd(st.qup, QUP_I2C_STATUS), touch_rd(st.qup, QUP_OUT_FIFO_CNT));
 	(void)qup_reset();
 	return -5;
 }
@@ -775,7 +797,8 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
 	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
-	touch_wr(st.qup, QUP_IO_MODE, 0);
+	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
+	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_WR_CNT, 9u);
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, len + 2u);
 
@@ -804,6 +827,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
+			printf("SWEET TOUCH: read nack/err status=0x%08x\\n", status);
 			(void)qup_reset();
 			return -4;
 		}
@@ -815,6 +839,8 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	if (!done) {
+		printf("SWEET TOUCH: read timed out in_fifo=%u status=0x%08x\\n",
+		    touch_rd(st.qup, QUP_IN_FIFO_CNT), touch_rd(st.qup, QUP_I2C_STATUS));
 		(void)qup_reset();
 		return -5;
 	}
@@ -1016,9 +1042,11 @@ touch_thread(void *arg, wait_result_t result)
 
 	/* 8. Program QUP I2C CLK_CTL for 100 kHz standard mode (fs_div=93=0x5d, hs_div=3) */
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
+	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 	__asm__ volatile("dsb osh" ::: "memory");
-	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x\\n",
-	    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS));
+	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x MGEN=0x%08x\\n",
+	    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS),
+	    touch_rd(st.qup, QUP_I2C_MASTER_GEN));
 
 	if (!synaptics_scan_pdt()) {
 		printf("SWEET TOUCH: Synaptics probe failed\\n");

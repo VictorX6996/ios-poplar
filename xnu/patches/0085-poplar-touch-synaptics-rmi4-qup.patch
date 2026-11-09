@@ -41,14 +41,20 @@ diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.c
 index 4c2188e..5d321ba 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -471,8 +471,8 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+@@ -471,8 +471,14 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
  		return;
  	}
  	if (!was && down) {
 -		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
 -		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
-+		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > (fLogicalW - 1) - SWEET_TOUCH_EDGE_PX ||
-+		    y < SWEET_TOUCH_EDGE_PX || y > (fLogicalH - 1) - SWEET_TOUCH_EDGE_PX;
++		static int edge_px = 80;
++		static bool edge_inited = false;
++		if (!edge_inited) {
++			(void)PE_parse_boot_argn("sweettouch_edge", &edge_px, sizeof(edge_px));
++			edge_inited = true;
++		}
++		fEdge[finger] = x < edge_px || x > (fLogicalW - 1) - edge_px ||
++		    y < edge_px || y > (fLogicalH - 1) - edge_px;
  	}
  
  	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
@@ -57,7 +63,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,638 @@
+@@ -0,0 +1,618 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -92,7 +98,7 @@ index 0000000..f34a5d8
 +#define TLMM_BASE_PA                    0x03400000u
 +#define TLMM_MAP_SIZE                   0x100000u
 +
-+/* GCC Registers & Bits for BLSP1 / QUP5 and TLMM */
++/* GCC Registers & Bits for BLSP1 / QUP5 */
 +#define GCC_APCS_CLOCK_BRANCH_ENA_VOTE  0x52004u
 +#define GCC_BLSP1_AHB_VOTE_BIT          (1u << 17)
 +#define GCC_BLSP1_AHB_CBCR              0x17004u
@@ -101,8 +107,6 @@ index 0000000..f34a5d8
 +#define GCC_BLSP1_QUP5_I2C_APPS_CBCR    0x21008u
 +#define GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR 0x21020u
 +#define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
-+#define GCC_TLMM_AHB_CBCR               0x3e004u
-+#define GCC_TLMM_CLK_CBCR               0x3e008u
 +
 +/* Poplar TLMM Touch Pins */
 +#define TOUCH_PIN_SDA                   87u
@@ -282,24 +286,6 @@ index 0000000..f34a5d8
 +		touch_wr(st.gcc, blsp1_branches[i],
 +		    touch_rd(st.gcc, blsp1_branches[i]) | 1u);
 +	}
-+
-+	/* 6. Ungate TLMM AHB and CLK CBCRs in GCC for GPIO register access */
-+	uint32_t tlmm_ahb = touch_rd(st.gcc, GCC_TLMM_AHB_CBCR);
-+	uint32_t tlmm_clk = touch_rd(st.gcc, GCC_TLMM_CLK_CBCR);
-+	printf("SWEET TOUCH: initial TLMM CBCR ahb=0x%08x (halt=%u) clk=0x%08x (halt=%u)\n",
-+	    tlmm_ahb, (tlmm_ahb >> 31) & 1u, tlmm_clk, (tlmm_clk >> 31) & 1u);
-+	touch_wr(st.gcc, GCC_TLMM_AHB_CBCR, tlmm_ahb | 1u);
-+	touch_wr(st.gcc, GCC_TLMM_CLK_CBCR, tlmm_clk | 1u);
-+	for (int i = 0; i < 50000; i++) {
-+		if (!(touch_rd(st.gcc, GCC_TLMM_AHB_CBCR) & (1u << 31))) {
-+			break;
-+		}
-+	}
-+	uint32_t tlmm_ahb_after = touch_rd(st.gcc, GCC_TLMM_AHB_CBCR);
-+	uint32_t tlmm_clk_after = touch_rd(st.gcc, GCC_TLMM_CLK_CBCR);
-+	printf("SWEET TOUCH: active TLMM CBCR ahb=0x%08x (halt=%u) clk=0x%08x (halt=%u)\n",
-+	    tlmm_ahb_after, (tlmm_ahb_after >> 31) & 1u,
-+	    tlmm_clk_after, (tlmm_clk_after >> 31) & 1u);
 +
 +	touch_wait(10);
 +	return true;

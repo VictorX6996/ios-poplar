@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,971 @@
+@@ -0,0 +1,972 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -77,6 +77,7 @@ index 0000000..f34a5d8
 + *   poplartouchdelay=N  delays startup by N seconds (default 0)
 + *   poplartouchlog=1    logs touch events to console
 + *   sweetrpm=0          skips RPM LDO28 power rail vote
++ * Driver build: v3 (QUP state write fix)
 + */
 +
 +#if defined(ARM64_BOARD_CONFIG_SWEET)

@@ -81,6 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
+ * Driver build: v3 (QUP state write fix)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)

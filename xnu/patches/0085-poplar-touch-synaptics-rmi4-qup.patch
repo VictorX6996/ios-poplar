@@ -63,11 +63,12 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,934 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
 + * reset on TLMM GPIO 89, VDDIO enable on TLMM GPIO 133.
++ * Analog AVDD power rail: PM8998 LDO 28 (3.0 V) via RPM GLINK.
 + * In-cell panel resolution: 1080x1920.
 + *
 + * Protocol: Synaptics RMI4 over QUP v2 FIFO I2C.
@@ -75,14 +76,14 @@ index 0000000..f34a5d8
 + *   poplartouch=0       disables touch driver
 + *   poplartouchdelay=N  delays startup by N seconds (default 0)
 + *   poplartouchlog=1    logs touch events to console
++ *   sweetrpm=0          skips RPM LDO28 power rail vote
 + */
++
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
-+#include <sys/errno.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
-+#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
@@ -91,11 +92,327 @@ index 0000000..f34a5d8
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +void sweet_poplar_touch_init(void);
 +
-+/* Hardware Base Physical Addresses */
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++
++/*
++ * =========================================================================
++ * 1. RPM GLINK (MSM8998 Resource Power Manager)
++ * Used to turn on PM8998 LDO 28 (3.0 V) for touch analog power (AVDD).
++ * Message RAM: 0x00778000 (28 KiB). Doorbell: 0x17911008 bit 0.
++ * =========================================================================
++ */
++#define RPM_MSGRAM_PA   0x00778000u
++#define RPM_MSGRAM_SIZE 0x7000u
++#define RPM_IPC_PAGE    0x17911000u
++#define RPM_IPC_OFFSET  0x08u
++#define RPM_TOC_MAGIC   0x67727430u     /* "grt0" */
++#define RPM_FIFO_AP2R   0x61703272u     /* "ap2r" */
++#define RPM_FIFO_R2AP   0x72326170u     /* "r2ap" */
++#define RPM_LCID        1u
++
++#define CMD_VERSION       0u
++#define CMD_VERSION_ACK   1u
++#define CMD_OPEN          2u
++#define CMD_CLOSE         3u
++#define CMD_OPEN_ACK      4u
++#define CMD_TX_DATA       9u
++#define CMD_CLOSE_ACK     11u
++#define CMD_TX_DATA_CONT  12u
++#define CMD_READ_NOTIF    13u
++
++struct rpm_fifo {
++	volatile uint32_t *tail, *head, *data;
++	uint32_t len;
++};
++
++static struct {
++	struct rpm_fifo tx, rx;
++	vm_offset_t ipc;
++	bool mapped, up, remote_open, open_acked;
++	uint32_t rcid, msg_id;
++	uint32_t resp[64];
++	uint32_t resp_len;
++	bool resp_ready;
++} rpm;
++
++static uint32_t
++rpm_fifo_avail_rx(void)
++{
++	uint32_t head = *rpm.rx.head, tail = *rpm.rx.tail;
++	return head >= tail ? head - tail : rpm.rx.len - tail + head;
++}
++
++static void
++rpm_fifo_peek(uint32_t off, uint32_t *buf, uint32_t n)
++{
++	uint32_t pos = (*rpm.rx.tail + off) % rpm.rx.len;
++	for (uint32_t i = 0; i < n / 4; i++) {
++		buf[i] = rpm.rx.data[pos / 4];
++		pos = (pos + 4) % rpm.rx.len;
++	}
++}
++
++static void
++rpm_fifo_advance(uint32_t n)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*rpm.rx.tail = (*rpm.rx.tail + n) % rpm.rx.len;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++rpm_kick(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)rpm.ipc = 1u;
++}
++
++static bool
++rpm_send(const uint32_t *w, uint32_t n)
++{
++	uint32_t total = (n + 7u) & ~7u;
++	for (unsigned tries = 0;; tries++) {
++		uint32_t head = *rpm.tx.head, tail = *rpm.tx.tail;
++		uint32_t avail = tail <= head ? rpm.tx.len - head + tail : tail - head;
++		if (avail > total) {
++			break;
++		}
++		if (tries == 100) {
++			printf("SWEET RPM: tx fifo full (head %u tail %u)\n", head, tail);
++			return false;
++		}
++		delay(1000);
++	}
++	uint32_t pos = *rpm.tx.head;
++	for (uint32_t i = 0; i < total / 4; i++) {
++		rpm.tx.data[pos / 4] = i < n / 4 ? w[i] : 0u;
++		pos = (pos + 4) % rpm.tx.len;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	*rpm.tx.head = pos;
++	rpm_kick();
++	return true;
++}
++
++static bool
++rpm_send_cmd(uint32_t cmd, uint32_t param1, uint32_t param2)
++{
++	uint32_t w[2] = {cmd | (param1 << 16), param2};
++	return rpm_send(w, sizeof(w));
++}
++
++static bool
++rpm_send_open(void)
++{
++	static const char name[] = "rpm_requests";
++	uint32_t w[2 + 4] = {CMD_OPEN | (RPM_LCID << 16), sizeof(name)};
++	memcpy(&w[2], name, sizeof(name));
++	return rpm_send(w, 8u + ((sizeof(name) + 3u) & ~3u));
++}
++
++static bool
++rpm_rx_one(void)
++{
++	uint32_t avail = rpm_fifo_avail_rx(), h[4];
++	if (avail < 8) {
++		return false;
++	}
++	rpm_fifo_peek(0, h, 8);
++	uint32_t cmd = h[0] & 0xffffu, p1 = h[0] >> 16, p2 = h[1];
++	switch (cmd) {
++	case CMD_VERSION:
++		rpm_fifo_advance(8);
++		(void)rpm_send_cmd(CMD_VERSION_ACK, 1, 0);
++		break;
++	case CMD_VERSION_ACK:
++		rpm_fifo_advance(8);
++		if (p1 != 1) {
++			printf("SWEET RPM: version ack %u features %#x\n", p1, p2);
++		} else if (p2 != 0) {
++			(void)rpm_send_cmd(CMD_VERSION, 1, 0);
++		} else if (!rpm.up) {
++			rpm.up = true;
++			(void)rpm_send_open();
++		}
++		break;
++	case CMD_OPEN: {
++		uint32_t len = 8u + ((p2 + 7u) & ~7u), name[8] = {0};
++		if (avail < len) {
++			return false;
++		}
++		rpm_fifo_peek(8, name, MIN(p2 + 3u, 31u) & ~3u);
++		rpm_fifo_advance(len);
++		if (strncmp((const char *)name, "rpm_requests", 12) == 0) {
++			rpm.rcid = p1;
++			rpm.remote_open = true;
++			(void)rpm_send_cmd(CMD_OPEN_ACK, p1, 0);
++		} else {
++			printf("SWEET RPM: ignoring remote open of '%.24s'\n", (const char *)name);
++		}
++		break;
++	}
++	case CMD_OPEN_ACK:
++		rpm_fifo_advance(8);
++		if (p1 == RPM_LCID) {
++			rpm.open_acked = true;
++		}
++		break;
++	case CMD_CLOSE:
++		rpm_fifo_advance(8);
++		(void)rpm_send_cmd(CMD_CLOSE_ACK, p1, 0);
++		if (p1 == rpm.rcid) {
++			rpm.remote_open = false;
++		}
++		break;
++	case CMD_TX_DATA:
++	case CMD_TX_DATA_CONT: {
++		if (avail < 16) {
++			return false;
++		}
++		rpm_fifo_peek(0, h, 16);
++		uint32_t chunk = h[2], left = h[3];
++		if (avail < 16 + chunk) {
++			return false;
++		}
++		if (cmd == CMD_TX_DATA) {
++			rpm.resp_len = 0;
++		}
++		uint32_t take = MIN(chunk, sizeof(rpm.resp) - rpm.resp_len) & ~3u;
++		rpm_fifo_peek(16, (uint32_t *)((uint8_t *)rpm.resp + rpm.resp_len), take);
++		rpm.resp_len += take;
++		rpm_fifo_advance((16u + chunk + 7u) & ~7u);
++		if (left == 0) {
++			rpm.resp_ready = true;
++		}
++		break;
++	}
++	case CMD_READ_NOTIF:
++		rpm_fifo_advance(8);
++		rpm_kick();
++		break;
++	default:
++		printf("SWEET RPM: rx cmd %u p1 %u p2 %#x dropped\n", cmd, p1, p2);
++		rpm_fifo_advance(8);
++		break;
++	}
++	return true;
++}
++
++#define RPM_POLL(ms, cond) ({                                   \
++	unsigned _i;                                            \
++	for (_i = 0; _i < (ms) && !(cond); _i++) {              \
++		while (rpm_rx_one()) {                          \
++		}                                               \
++		if (!(cond)) {                                  \
++			delay(1000);                            \
++		}                                               \
++	}                                                       \
++	(cond);                                                 \
++})
++
++static bool
++poplar_rpm_open(void)
++{
++	if (rpm.up && rpm.remote_open && rpm.open_acked) {
++		return true;
++	}
++	if (!rpm.mapped) {
++		vm_offset_t ram = ml_io_map(RPM_MSGRAM_PA, RPM_MSGRAM_SIZE);
++		vm_offset_t ipc_page = ml_io_map(RPM_IPC_PAGE, 0x1000);
++		if (!ram || !ipc_page) {
++			printf("SWEET RPM: MMIO mapping failed (ram=0x%lx ipc=0x%lx)\n",
++			    (unsigned long)ram, (unsigned long)ipc_page);
++			return false;
++		}
++		rpm.ipc = ipc_page + RPM_IPC_OFFSET;
++		volatile uint32_t *toc = (volatile uint32_t *)(ram + RPM_MSGRAM_SIZE - 256);
++		uint32_t count = toc[1];
++		if (toc[0] != RPM_TOC_MAGIC || count > 20) {
++			printf("SWEET RPM: bad TOC magic %#x count %u\n", toc[0], count);
++			return false;
++		}
++		for (uint32_t i = 0; i < count; i++) {
++			uint32_t id = toc[2 + 3 * i], off = toc[3 + 3 * i], size = toc[4 + 3 * i];
++			struct rpm_fifo *f = id == RPM_FIFO_AP2R ? &rpm.tx : id == RPM_FIFO_R2AP ? &rpm.rx : NULL;
++			if (f == NULL || off + size > RPM_MSGRAM_SIZE || (size & 3u)) {
++				continue;
++			}
++			f->tail = (volatile uint32_t *)(ram + off);
++			f->head = f->tail + 1;
++			f->data = f->tail + 2;
++			f->len = size;
++		}
++		if (!rpm.tx.data || !rpm.rx.data) {
++			printf("SWEET RPM: TOC has no ap2r/r2ap fifo\n");
++			return false;
++		}
++		printf("SWEET RPM: tx len %u head %u tail %u, rx len %u head %u tail %u\n",
++		    rpm.tx.len, *rpm.tx.head, *rpm.tx.tail, rpm.rx.len, *rpm.rx.head, *rpm.rx.tail);
++		rpm.mapped = true;
++	}
++	rpm.up = rpm.remote_open = rpm.open_acked = false;
++	*rpm.tx.head = 0;
++	*rpm.rx.tail = 0;
++	(void)rpm_send_cmd(CMD_VERSION, 1, 0);
++	bool ok = RPM_POLL(1000u, rpm.up && rpm.remote_open && rpm.open_acked);
++	printf("SWEET RPM: link %s (version %d, remote open %d rcid %u, open ack %d)\n",
++	    ok ? "up" : "FAILED", rpm.up, rpm.remote_open, rpm.rcid, rpm.open_acked);
++	return ok;
++}
++
++static bool
++poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
++{
++	if (!poplar_rpm_open()) {
++		return false;
++	}
++	uint32_t id = ++rpm.msg_id;
++	uint32_t w[] = {
++		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
++		0x00716572u, 20u + 24u,                         /* "req", length */
++		id, 0u, 0x616f646cu, ldo, 24u,                  /* active set (0), "ldoa", ldo, len 24 */
++		0x6e657773u, 4u, 1u,                            /* swen = 1 */
++		0x00007675u, 4u, uv,                            /* uv */
++	};
++	w[2] = sizeof(w) - 16u;
++	rpm.resp_ready = false;
++	if (!rpm_send(w, sizeof(w))) {
++		return false;
++	}
++	if (!RPM_POLL(1000u, rpm.resp_ready)) {
++		printf("SWEET RPM: L%u: no answer\n", ldo);
++		return false;
++	}
++	bool acked = false, err = false;
++	uint32_t words = MIN(rpm.resp_len / 4, 2u + rpm.resp[1] / 4), i = 2;
++	while (i + 2 <= words) {
++		uint32_t type = rpm.resp[i], len = rpm.resp[i + 1];
++		if (type == 0x2367736du && rpm.resp[i + 2] == id) {
++			acked = true;
++		} else if (type == 0x00727265u) {
++			char text[32] = {0};
++			memcpy(text, &rpm.resp[i + 2], MIN(len, sizeof(text) - 1));
++			printf("SWEET RPM: L%u: error '%s'\n", ldo, text);
++			err = true;
++		}
++		i += 2 + (len + 3) / 4;
++	}
++	printf("SWEET RPM: L%u %u uV: %s\n", ldo, uv, acked && !err ? "ok" : "FAILED");
++	return acked && !err;
++}
++
++/*
++ * =========================================================================
++ * 2. Hardware Registers & Pins for poplar (MSM8998)
++ * =========================================================================
++ */
 +#define GCC_BASE_PA                     0x00100000u
 +#define GCC_MAP_SIZE                    0x60000u
 +#define QUP5_BASE_PA                    0x0c179000u
-+#define TLMM_BASE_PA                    0x03400000u
++#define TLMM_EAST_PA                    0x03d00000u     /* GPIO 87, 88, 89, 125 */
++#define TLMM_WEST_PA                    0x03500000u     /* GPIO 133 */
 +#define TLMM_MAP_SIZE                   0x100000u
 +
 +/* GCC Registers & Bits for BLSP1 / QUP5 */
@@ -109,12 +426,11 @@ index 0000000..f34a5d8
 +#define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
 +
 +/* Poplar TLMM Touch Pins */
-+#define TOUCH_PIN_SDA                   87u
-+#define TOUCH_PIN_SCL                   88u
-+#define TOUCH_PIN_RESET                 89u
-+#define TOUCH_PIN_IRQ                   125u
-+#define TOUCH_PIN_VDDIO                 133u
-+#define TOUCH_MAX                       5u
++#define TOUCH_PIN_SDA                   87u  /* EAST tile, mux 3 (blsp_i2c5) */
++#define TOUCH_PIN_SCL                   88u  /* EAST tile, mux 3 (blsp_i2c5) */
++#define TOUCH_PIN_RESET                 89u  /* EAST tile, mux 0 (gpio out, active-low) */
++#define TOUCH_PIN_IRQ                   125u /* EAST tile, mux 0 (gpio in, active-low, pull-up) */
++#define TOUCH_PIN_VDDIO                 133u /* WEST tile, mux 0 (gpio out, high) */
 +
 +/* QUP v2 Registers */
 +#define QUP_CONFIG                      0x000u
@@ -151,23 +467,21 @@ index 0000000..f34a5d8
 +#define QUP_TAG2_DATA_READ              0x85u
 +#define QUP_TAG2_DATA_READ_STOP         0x87u
 +
-+/* TLMM GPIO */
-+#define TLMM_GPIO_CFG(pin)              ((uint32_t)(pin) * 0x1000u)
-+#define TLMM_GPIO_IO(pin)               (TLMM_GPIO_CFG(pin) + 4u)
++#define TOUCH_MAX                       5u
 +
-+static struct {
++struct poplar_touch_state {
 +	vm_offset_t gcc;
 +	vm_offset_t qup;
-+	vm_offset_t gpio;
-+	bool started;
-+	bool dead;
-+	int logging;
++	vm_offset_t gpio_east;
++	vm_offset_t gpio_west;
 +	uint8_t i2c_addr;
-+	uint8_t f01_data_base;
 +	uint8_t f01_cmd_base;
 +	uint8_t f01_ctrl_base;
-+	uint8_t f12_data_base;
++	uint8_t f01_data_base;
 +	uint8_t f12_ctrl_base;
++	uint8_t f12_data_base;
++	bool dead;
++	int logging;
 +	bool down[TOUCH_MAX];
 +	int x[TOUCH_MAX];
 +	int y[TOUCH_MAX];
@@ -203,18 +517,19 @@ index 0000000..f34a5d8
 +static void
 +touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
 +{
-+	uint32_t off = TLMM_GPIO_CFG(pin);
-+	uint32_t io_off = TLMM_GPIO_IO(pin);
++	vm_offset_t base = (pin == TOUCH_PIN_VDDIO) ? st.gpio_west : st.gpio_east;
++	uint32_t off = (uint32_t)pin * 0x1000u;
++	uint32_t io_off = off + 4u;
 +
 +	if (out) {
-+		uint32_t io = touch_rd(st.gpio, io_off);
-+		touch_wr(st.gpio, io_off, (io & ~2u) | (high ? 2u : 0u));
++		uint32_t io = touch_rd(base, io_off);
++		touch_wr(base, io_off, (io & ~2u) | (high ? 2u : 0u));
 +	}
-+	uint32_t old_cfg = touch_rd(st.gpio, off);
++	uint32_t old_cfg = touch_rd(base, off);
 +	uint32_t cfg = old_cfg & ~0x3ffu;
 +	cfg |= (mux << 2) | (pull & 3u) | ((drive & 7u) << 6) | (out ? 0x200u : 0u);
-+	touch_wr(st.gpio, off, cfg);
-+	uint32_t new_cfg = touch_rd(st.gpio, off);
++	touch_wr(base, off, cfg);
++	uint32_t new_cfg = touch_rd(base, off);
 +	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x\n",
 +	    pin, old_cfg, cfg, new_cfg);
 +}
@@ -323,142 +638,131 @@ index 0000000..f34a5d8
 +static int
 +qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 +{
-+	if (st.dead || len > 64) {
-+		return EINVAL;
-+	}
 +	if (!qup_set_state(QUP_RESET_STATE)) {
-+		return EIO;
++		return -1;
 +	}
 +
 +	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 +	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
-+
 +	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
 +	touch_wr(st.qup, QUP_IO_MODE, 0);
 +	touch_wr(st.qup, QUP_MX_WR_CNT, 4u + len);
 +	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);
 +
 +	if (!qup_set_state(QUP_RUN_STATE)) {
-+		return EIO;
++		return -2;
 +	}
 +
-+	uint8_t pkt[72] = {0};
++	uint8_t pkt[4 + 16];
++	if (len > 16) {
++		(void)qup_set_state(QUP_RESET_STATE);
++		return -3;
++	}
++
 +	pkt[0] = QUP_TAG2_START;
-+	pkt[1] = (uint8_t)((addr << 1) | 0u);
++	pkt[1] = (uint8_t)(addr << 1);
 +	pkt[2] = QUP_TAG2_DATA_WRITE_STOP;
 +	pkt[3] = (uint8_t)len;
-+	for (unsigned i = 0; i < len; i++) {
-+		pkt[4 + i] = tx[i];
-+	}
++	memcpy(&pkt[4], tx, len);
++
 +	unsigned total = 4u + len;
 +	for (unsigned i = 0; i < total; i += 4) {
-+		uint32_t w = (uint32_t)pkt[i];
-+		if (i + 1 < total) w |= (uint32_t)pkt[i + 1] << 8;
-+		if (i + 2 < total) w |= (uint32_t)pkt[i + 2] << 16;
-+		if (i + 3 < total) w |= (uint32_t)pkt[i + 3] << 24;
++		uint32_t w = 0;
++		memcpy(&w, &pkt[i], (total - i >= 4) ? 4 : (total - i));
 +		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
 +	}
 +
-+	bool ok = false;
-+	for (int i = 0; i < 5000; i++) {
++	for (int timeout = 0; timeout < 10000; timeout++) {
 +		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 +		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
 +			(void)qup_set_state(QUP_RESET_STATE);
-+			return EIO;
++			return -4;
 +		}
 +		if (!(status & QUP_I2C_BUS_ACTIVE) &&
 +		    (touch_rd(st.qup, QUP_OUT_FIFO_CNT) == 0)) {
-+			ok = true;
-+			break;
++			(void)qup_set_state(QUP_RESET_STATE);
++			return 0;
 +		}
-+		delay(10);
++		delay(5);
 +	}
 +
 +	(void)qup_set_state(QUP_RESET_STATE);
-+	return ok ? 0 : ETIMEDOUT;
++	return -5;
 +}
 +
 +static int
 +qup_i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 +{
-+	uint8_t buf[2] = {reg, val};
++	uint8_t buf[2] = { reg, val };
 +	return qup_i2c_write(addr, buf, 2);
 +}
 +
 +static int
 +qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 +{
-+	if (st.dead || len > 64) {
-+		return EINVAL;
-+	}
 +	if (!qup_set_state(QUP_RESET_STATE)) {
-+		return EIO;
++		return -1;
 +	}
 +
 +	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 +	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
-+
 +	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
 +	touch_wr(st.qup, QUP_IO_MODE, 0);
 +	touch_wr(st.qup, QUP_MX_WR_CNT, 9u);
 +	touch_wr(st.qup, QUP_MX_INPUT_CNT, len + 2u);
 +
 +	if (!qup_set_state(QUP_RUN_STATE)) {
-+		return EIO;
++		return -2;
 +	}
 +
 +	uint8_t tx_pkt[12] = {0};
 +	tx_pkt[0] = QUP_TAG2_START;              /* 0x81 */
-+	tx_pkt[1] = (uint8_t)((addr << 1) | 0u); /* Write slave address */
++	tx_pkt[1] = (uint8_t)(addr << 1);        /* write */
 +	tx_pkt[2] = QUP_TAG2_DATA_WRITE;         /* 0x82 (data write, NO stop) */
-+	tx_pkt[3] = 1u;                          /* 1 byte payload */
-+	tx_pkt[4] = reg;                         /* register offset */
++	tx_pkt[3] = 1u;                          /* 1 byte to write (the register address) */
++	tx_pkt[4] = reg;                         /* register to read from */
 +	tx_pkt[5] = QUP_TAG2_START;              /* 0x81 (Repeated START) */
-+	tx_pkt[6] = (uint8_t)((addr << 1) | 1u); /* Read slave address */
++	tx_pkt[6] = (uint8_t)((addr << 1) | 1u); /* read */
 +	tx_pkt[7] = QUP_TAG2_DATA_READ_STOP;     /* 0x87 (data read with STOP) */
 +	tx_pkt[8] = (uint8_t)len;                /* number of bytes to read */
 +
 +	for (unsigned i = 0; i < 12; i += 4) {
-+		uint32_t w = (uint32_t)tx_pkt[i] |
-+		    ((uint32_t)tx_pkt[i + 1] << 8) |
-+		    ((uint32_t)tx_pkt[i + 2] << 16) |
-+		    ((uint32_t)tx_pkt[i + 3] << 24);
++		uint32_t w = 0;
++		memcpy(&w, &tx_pkt[i], 4);
 +		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
 +	}
 +
-+	bool ok = false;
-+	for (int i = 0; i < 5000; i++) {
++	bool done = false;
++	for (int timeout = 0; timeout < 10000; timeout++) {
 +		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 +		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
 +			(void)qup_set_state(QUP_RESET_STATE);
-+			return EIO;
++			return -4;
 +		}
 +		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len + 2u) {
-+			ok = true;
++			done = true;
 +			break;
 +		}
-+		delay(10);
++		delay(5);
 +	}
 +
-+	if (!ok) {
++	if (!done) {
 +		(void)qup_set_state(QUP_RESET_STATE);
-+		return ETIMEDOUT;
++		return -5;
 +	}
 +
-+	unsigned pos = 0;
-+	while (pos < len + 2u) {
++	uint8_t in_buf[64] = {0};
++	unsigned words = (len + 2u + 3u) / 4;
++	if (words > 16) words = 16;
++	for (unsigned i = 0; i < words; i++) {
 +		uint32_t w = touch_rd(st.qup, QUP_IN_FIFO_BASE);
-+		for (int b = 0; b < 4 && pos < len + 2u; b++, pos++) {
-+			uint8_t byte = (uint8_t)((w >> (b * 8)) & 0xffu);
-+			if (pos >= 2u) {
-+				rx[pos - 2u] = byte;
-+			}
-+		}
++		memcpy(&in_buf[i * 4], &w, 4);
 +	}
 +
 +	(void)qup_set_state(QUP_RESET_STATE);
++	memcpy(rx, &in_buf[2], len);
 +	return 0;
 +}
 +
@@ -586,6 +890,16 @@ index 0000000..f34a5d8
 +
 +	(void)PE_parse_boot_argn("poplartouchlog", &st.logging, sizeof(st.logging));
 +
++	/* 1. Vote for PM8998 LDO 28 (3.0 V) via RPM GLINK for Synaptics analog power (AVDD) */
++	int rpm_enable = 1;
++	(void)PE_parse_boot_argn("sweetrpm", &rpm_enable, sizeof(rpm_enable));
++	if (rpm_enable) {
++		printf("SWEET TOUCH: voting PM8998 LDO28 (3.0V) via RPM GLINK...\n");
++		(void)poplar_rpm_ldoa(28, 3000000u);
++		touch_wait(20);
++	}
++
++	/* 2. Ungate BLSP1 and QUP5 clocks in GCC */
 +	printf("SWEET TOUCH: ungating BLSP1 / QUP5 clocks in GCC...\n");
 +	if (!poplar_qup_clock_init()) {
 +		printf("SWEET TOUCH: clock init failed\n");
@@ -594,43 +908,45 @@ index 0000000..f34a5d8
 +		return;
 +	}
 +
-+	printf("SWEET TOUCH: mapping QUP5 (0x%08x) and TLMM (0x%08x)\n",
-+	    QUP5_BASE_PA, TLMM_BASE_PA);
++	/* 3. Map QUP5 and TLMM EAST and WEST tiles */
++	printf("SWEET TOUCH: mapping QUP5 (0x%08x), TLMM EAST (0x%08x), TLMM WEST (0x%08x)\n",
++	    QUP5_BASE_PA, TLMM_EAST_PA, TLMM_WEST_PA);
 +	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-+	st.gpio = ml_io_map(TLMM_BASE_PA, TLMM_MAP_SIZE);
-+	if (!st.qup || !st.gpio) {
++	st.gpio_east = ml_io_map(TLMM_EAST_PA, TLMM_MAP_SIZE);
++	st.gpio_west = ml_io_map(TLMM_WEST_PA, TLMM_MAP_SIZE);
++	if (!st.qup || !st.gpio_east || !st.gpio_west) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		st.dead = true;
 +		thread_terminate(current_thread());
 +		return;
 +	}
 +
-+	/* 1. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5) */
-+	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
-+	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
++	/* 4. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 3 (blsp_i2c5) on EAST tile */
++	touch_gpio(TOUCH_PIN_SDA, 3u, 0, 0, false, false);
++	touch_gpio(TOUCH_PIN_SCL, 3u, 0, 0, false, false);
 +	touch_wait(10);
 +
-+	/* 2. Enable VDDIO power to touch controller on GPIO 133 */
++	/* 5. Enable VDDIO power to touch controller on GPIO 133 (WEST tile) */
 +	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 +	touch_wait(20);
 +
-+	/* 3. Hardware reset toggle on GPIO 89 (active low) */
++	/* 6. Hardware reset toggle on GPIO 89 (EAST tile, active low) */
 +	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, false);
 +	touch_wait(20);
 +	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, true);
 +	touch_wait(250);
 +
-+	/* 4. Active-low IRQ input on GPIO 125 with pull-up */
++	/* 7. Active-low IRQ input on GPIO 125 (EAST tile) with pull-up */
 +	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);
 +	touch_wait(10);
 +
 +	printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x\n",
-+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SDA)),
-+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_SCL)),
-+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_RESET)),
-+	    touch_rd(st.gpio, TLMM_GPIO_CFG(TOUCH_PIN_VDDIO)));
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
++	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u));
 +
-+	/* 5. Program QUP I2C CLK_CTL for 100 kHz standard mode (fs_div=93=0x5d, hs_div=3) */
++	/* 8. Program QUP I2C CLK_CTL for 100 kHz standard mode (fs_div=93=0x5d, hs_div=3) */
 +	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
 +	__asm__ volatile("dsb osh" ::: "memory");
 +	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x\n",
@@ -644,7 +960,7 @@ index 0000000..f34a5d8
 +
 +	unsigned ticks = 0;
 +	while (!st.dead) {
-+		uint32_t pin_in = touch_rd(st.gpio, TLMM_GPIO_IO(TOUCH_PIN_IRQ)) & 1u;
++		uint32_t pin_in = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u;
 +		bool any_down = false;
 +		for (int i = 0; i < TOUCH_MAX; i++) {
 +			if (st.down[i]) {

@@ -626,7 +626,7 @@ poplar_qup_clock_init(void)
 static bool
 qup_wait_state_valid(void)
 {
-	for (int i = 0; i < 5000; i++) {
+	for (int i = 0; i < 50000; i++) {
 		if (touch_rd(st.qup, QUP_STATE) & QUP_STATE_VALID) {
 			return true;
 		}
@@ -639,23 +639,45 @@ static bool
 qup_set_state(uint32_t state)
 {
 	if (!qup_wait_state_valid()) {
+		printf("SWEET TOUCH: qup_set_state(%u): wait valid timed out (state=0x%08x)\\n",
+		    state, touch_rd(st.qup, QUP_STATE));
 		return false;
 	}
 	uint32_t cur = touch_rd(st.qup, QUP_STATE);
 	if ((cur & QUP_STATE_MASK) == state) {
 		return true;
 	}
-	touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | state);
-	if (!qup_wait_state_valid()) {
-		return false;
+	touch_wr(st.qup, QUP_STATE, state);
+	for (int i = 0; i < 50000; i++) {
+		uint32_t s = touch_rd(st.qup, QUP_STATE);
+		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
+			return true;
+		}
+		delay(2);
 	}
-	return (touch_rd(st.qup, QUP_STATE) & QUP_STATE_MASK) == state;
+	printf("SWEET TOUCH: qup_set_state(%u) failed: cur=0x%08x target=%u\\n",
+	    state, touch_rd(st.qup, QUP_STATE), state);
+	return false;
+}
+
+static bool
+qup_reset(void)
+{
+	touch_wr(st.qup, QUP_SW_RESET, 1u);
+	for (int i = 0; i < 50000; i++) {
+		uint32_t s = touch_rd(st.qup, QUP_STATE);
+		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_RESET_STATE)) {
+			return true;
+		}
+		delay(2);
+	}
+	return qup_set_state(QUP_RESET_STATE);
 }
 
 static int
 qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 {
-	if (!qup_set_state(QUP_RESET_STATE)) {
+	if (!qup_reset()) {
 		return -1;
 	}
 
@@ -673,7 +695,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 
 	uint8_t pkt[4 + 16];
 	if (len > 16) {
-		(void)qup_set_state(QUP_RESET_STATE);
+		(void)qup_reset();
 		return -3;
 	}
 
@@ -693,18 +715,18 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-			(void)qup_set_state(QUP_RESET_STATE);
+			(void)qup_reset();
 			return -4;
 		}
 		if (!(status & QUP_I2C_BUS_ACTIVE) &&
 		    (touch_rd(st.qup, QUP_OUT_FIFO_CNT) == 0)) {
-			(void)qup_set_state(QUP_RESET_STATE);
+			(void)qup_reset();
 			return 0;
 		}
 		delay(5);
 	}
 
-	(void)qup_set_state(QUP_RESET_STATE);
+	(void)qup_reset();
 	return -5;
 }
 
@@ -718,7 +740,7 @@ qup_i2c_write_reg(uint8_t addr, uint8_t reg, uint8_t val)
 static int
 qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 {
-	if (!qup_set_state(QUP_RESET_STATE)) {
+	if (!qup_reset()) {
 		return -1;
 	}
 
@@ -755,7 +777,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-			(void)qup_set_state(QUP_RESET_STATE);
+			(void)qup_reset();
 			return -4;
 		}
 		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len + 2u) {
@@ -766,7 +788,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	if (!done) {
-		(void)qup_set_state(QUP_RESET_STATE);
+		(void)qup_reset();
 		return -5;
 	}
 
@@ -778,7 +800,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		memcpy(&in_buf[i * 4], &w, 4);
 	}
 
-	(void)qup_set_state(QUP_RESET_STATE);
+	(void)qup_reset();
 	memcpy(rx, &in_buf[2], len);
 	return 0;
 }
@@ -806,6 +828,8 @@ synaptics_scan_pdt(void)
 				err = 0;
 				break;
 			}
+			printf("SWEET TOUCH: I2C addr 0x%02x retry %d failed: wr=%d rd=%d\\n",
+			    addr, retry + 1, err, rerr);
 			touch_wait(20);
 		}
 		if (!err) {

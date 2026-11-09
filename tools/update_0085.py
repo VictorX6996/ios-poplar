@@ -579,15 +579,22 @@ poplar_qup_clock_init(void)
 	touch_wr(st.gcc, GCC_BLSP1_QUP5_BCR,
 	    touch_rd(st.gcc, GCC_BLSP1_QUP5_BCR) & ~1u);
 
-	/* 3. Configure QUP5 I2C RCG to 19.2MHz XO (div 1) */
-	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR, 0);
-	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR,
-	    touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR) | 1u);
+	/* 3. Configure QUP5 I2C RCG to 19.2MHz XO (div 1) and enable root */
+	uint32_t old_cmd = touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR);
+	uint32_t old_cfg = touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR);
+	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR, 1u); /* div 1, src 0 (XO) */
+	/* CMD_ROOT_EN = 2u, CMD_UPDATE = 1u */
+	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR, (old_cmd & ~1u) | 2u | 1u);
 	for (int i = 0; i < 50000; i++) {
 		if (!(touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR) & 1u)) {
 			break;
 		}
+		delay(1);
 	}
+	uint32_t new_cmd = touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR);
+	uint32_t new_cfg = touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR);
+	printf("SWEET TOUCH: QUP5 I2C RCG: cmd 0x%08x -> 0x%08x (root_off=%u), cfg 0x%08x -> 0x%08x\\n",
+	    old_cmd, new_cmd, (new_cmd >> 31) & 1u, old_cfg, new_cfg);
 
 	/* 4. Ungate QUP5 I2C and SPI CBCRs */
 	touch_wr(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR,
@@ -655,6 +662,25 @@ qup_set_state(uint32_t state)
 			return true;
 		}
 		delay(2);
+	}
+	/* If transitioning from RESET directly to RUN failed, try PAUSE first then RUN */
+	if (state == QUP_RUN_STATE && (touch_rd(st.qup, QUP_STATE) & QUP_STATE_MASK) == QUP_RESET_STATE) {
+		touch_wr(st.qup, QUP_STATE, QUP_PAUSE_STATE);
+		for (int i = 0; i < 50000; i++) {
+			uint32_t s = touch_rd(st.qup, QUP_STATE);
+			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_PAUSE_STATE)) {
+				break;
+			}
+			delay(2);
+		}
+		touch_wr(st.qup, QUP_STATE, QUP_RUN_STATE);
+		for (int i = 0; i < 50000; i++) {
+			uint32_t s = touch_rd(st.qup, QUP_STATE);
+			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
+				return true;
+			}
+			delay(2);
+		}
 	}
 	printf("SWEET TOUCH: qup_set_state(%u) failed: cur=0x%08x target=%u\\n",
 	    state, touch_rd(st.qup, QUP_STATE), state);

@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,1054 @@
+@@ -0,0 +1,1082 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -478,8 +478,9 @@ index 0000000..f34a5d8
 +
 +/* QUP I2C Status bits */
 +#define QUP_I2C_NACK_FLAG               (1u << 3)
++#define QUP_I2C_ARB_LOST                (1u << 4)
++#define QUP_I2C_BUS_ERROR               (1u << 5)
 +#define QUP_I2C_BUS_ACTIVE              (1u << 8)
-+#define QUP_I2C_ERR_MASK                0x038000fcu
 +
 +/* QUP v2 Tags */
 +#define QUP_TAG2_START                  0x81u
@@ -689,15 +690,17 @@ index 0000000..f34a5d8
 +	for (int i = 0; i < 50000; i++) {
 +		uint32_t s = touch_rd(st.qup, QUP_STATE);
 +		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_RESET_STATE)) {
-+			touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
++			touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
 +			touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
++			touch_wr(st.qup, QUP_OPERATIONAL, 0xffffffffu);
 +			return true;
 +		}
 +		delay(2);
 +	}
 +	bool ok = qup_set_state(QUP_RESET_STATE);
-+	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
++	touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
++	touch_wr(st.qup, QUP_OPERATIONAL, 0xffffffffu);
 +	return ok;
 +}
 +
@@ -710,7 +713,7 @@ index 0000000..f34a5d8
 +
 +	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
 +	__asm__ volatile("dsb osh" ::: "memory");
-+	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
++	touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
 +	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u | QUP_NO_INPUT);
@@ -751,21 +754,32 @@ index 0000000..f34a5d8
 +		return -2;
 +	}
 +
-+	for (int timeout = 0; timeout < 10000; timeout++) {
++	delay(50);
++
++	for (int timeout = 0; timeout < 5000; timeout++) {
 +		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
-+		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-+			printf("SWEET TOUCH: write nack/err status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\n",
-+			    status, touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
-+			    touch_rd(st.qup, QUP_STATE), touch_rd(st.qup, QUP_OUT_FIFO_CNT), touch_rd(st.qup, QUP_IN_FIFO_CNT));
++		uint32_t oper = touch_rd(st.qup, QUP_OPERATIONAL);
++		uint32_t err = touch_rd(st.qup, QUP_ERROR_FLAGS);
++
++		if (err & 0x7fu) {
++			printf("SWEET TOUCH: write core err=0x%08x status=0x%08x oper=0x%08x\n",
++			    err, status, oper);
 +			(void)qup_reset();
 +			return -4;
 +		}
-+		if (!(status & QUP_I2C_BUS_ACTIVE) &&
-+		    (touch_rd(st.qup, QUP_OUT_FIFO_CNT) == 0)) {
++		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ARB_LOST | QUP_I2C_BUS_ERROR)) {
++			if (!(status & QUP_I2C_NACK_FLAG)) {
++				printf("SWEET TOUCH: write bus err status=0x%08x oper=0x%08x\n",
++				    status, oper);
++			}
++			(void)qup_reset();
++			return -4;
++		}
++		if ((oper & (1u << 7)) && !(status & QUP_I2C_BUS_ACTIVE)) {
 +			(void)qup_reset();
 +			return 0;
 +		}
-+		delay(5);
++		delay(10);
 +	}
 +
 +	printf("SWEET TOUCH: write timed out status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\n",
@@ -791,7 +805,7 @@ index 0000000..f34a5d8
 +
 +	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
 +	__asm__ volatile("dsb osh" ::: "memory");
-+	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
++	touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 +	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
 +	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
@@ -831,22 +845,36 @@ index 0000000..f34a5d8
 +		return -2;
 +	}
 +
++	delay(50);
++
++	uint32_t needed_words = (len + 3u) / 4u;
 +	bool done = false;
-+	for (int timeout = 0; timeout < 10000; timeout++) {
++
++	for (int timeout = 0; timeout < 5000; timeout++) {
 +		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
-+		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-+			printf("SWEET TOUCH: read nack/err status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\n",
-+			    status, touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
-+			    touch_rd(st.qup, QUP_STATE), touch_rd(st.qup, QUP_OUT_FIFO_CNT), touch_rd(st.qup, QUP_IN_FIFO_CNT));
++		uint32_t oper = touch_rd(st.qup, QUP_OPERATIONAL);
++		uint32_t err = touch_rd(st.qup, QUP_ERROR_FLAGS);
++
++		if (err & 0x7fu) {
++			printf("SWEET TOUCH: read core err=0x%08x status=0x%08x oper=0x%08x\n",
++			    err, status, oper);
++			(void)qup_reset();
++			return -4;
++		}
++		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ARB_LOST | QUP_I2C_BUS_ERROR)) {
++			if (!(status & QUP_I2C_NACK_FLAG)) {
++				printf("SWEET TOUCH: read bus err status=0x%08x oper=0x%08x\n",
++				    status, oper);
++			}
 +			(void)qup_reset();
 +			return -4;
 +		}
 +		if (!(status & QUP_I2C_BUS_ACTIVE) &&
-+		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len)) {
++		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= needed_words)) {
 +			done = true;
 +			break;
 +		}
-+		delay(5);
++		delay(10);
 +	}
 +
 +	if (!done) {
@@ -859,7 +887,7 @@ index 0000000..f34a5d8
 +	}
 +
 +	uint8_t in_buf[64] = {0};
-+	unsigned words = (len + 3u) / 4u;
++	unsigned words = needed_words;
 +	if (words > 16) words = 16;
 +	for (unsigned i = 0; i < words; i++) {
 +		uint32_t w = touch_rd(st.qup, QUP_IN_FIFO_BASE);

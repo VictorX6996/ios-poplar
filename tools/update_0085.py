@@ -555,7 +555,7 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, 
 	touch_wr(base, off, cfg);
 	uint32_t new_cfg = touch_rd(base, off);
 	uint32_t io_val = touch_rd(base, io_off);
-	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x\n",
+	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x\\n",
 	    pin, old_cfg, cfg, new_cfg, io_val);
 }
 
@@ -994,7 +994,7 @@ synaptics_poll_touch(void)
 			st.x[i] = x;
 			st.y[i] = y;
 			if (st.logging) {
-				printf("SWEET TOUCH: finger %d %s at %d,%d (hid %d,%d)\n", i, down ? "down" : "up", x, y, x, y_hid);
+				printf("SWEET TOUCH: finger %d %s at %d,%d (hid %d,%d)\\n", i, down ? "down" : "up", x, y, x, y_hid);
 			}
 			sweet_hid_touch(i, down ? 1 : 0, x, y_hid);
 		}

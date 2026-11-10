@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,1060 @@
+@@ -0,0 +1,1058 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -551,8 +551,7 @@ index 0000000..f34a5d8
 +	touch_wr(base, off, cfg);
 +	uint32_t new_cfg = touch_rd(base, off);
 +	uint32_t io_val = touch_rd(base, io_off);
-+	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x
-+",
++	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x\n",
 +	    pin, old_cfg, cfg, new_cfg, io_val);
 +}
 +
@@ -991,8 +990,7 @@ index 0000000..f34a5d8
 +			st.x[i] = x;
 +			st.y[i] = y;
 +			if (st.logging) {
-+				printf("SWEET TOUCH: finger %d %s at %d,%d (hid %d,%d)
-+", i, down ? "down" : "up", x, y, x, y_hid);
++				printf("SWEET TOUCH: finger %d %s at %d,%d (hid %d,%d)\n", i, down ? "down" : "up", x, y, x, y_hid);
 +			}
 +			sweet_hid_touch(i, down ? 1 : 0, x, y_hid);
 +		}

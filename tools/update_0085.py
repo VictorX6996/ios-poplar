@@ -81,7 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
- * Driver build: v7 (restore EAST/WEST TLMM tiles, mux=4, QUP RESET->RUN(clk)->PAUSE(load)->RUN)
+ * Driver build: v8 (mux=3 blsp_i2c5, QUP v2 RX tags len+2, page verify check, LDO checks, reset masks)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -444,8 +444,8 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
 
 /* Poplar TLMM Touch Pins */
-#define TOUCH_PIN_SDA                   87u  /* EAST tile, mux 4 (blsp_i2c5) */
-#define TOUCH_PIN_SCL                   88u  /* EAST tile, mux 4 (blsp_i2c5) */
+#define TOUCH_PIN_SDA                   87u  /* EAST tile, mux 3 (blsp_i2c5) */
+#define TOUCH_PIN_SCL                   88u  /* EAST tile, mux 3 (blsp_i2c5) */
 #define TOUCH_PIN_RESET                 89u  /* EAST tile, mux 0 (gpio out, active-low) */
 #define TOUCH_PIN_IRQ                   125u /* EAST tile, mux 0 (gpio in, active-low, pull-up) */
 #define TOUCH_PIN_VDDIO                 133u /* WEST tile, mux 0 (gpio out, high) */
@@ -474,6 +474,11 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define QUP_UNPACK_EN                   (1u << 14)
 #define QUP_PACK_EN                     (1u << 15)
 #define QUP_REPACK_EN                   (QUP_UNPACK_EN | QUP_PACK_EN)
+
+/* QUP Reset Clear Masks */
+#define QUP_OPERATIONAL_RESET           0x000ff0u
+#define QUP_I2C_STATUS_RESET            0xfffffcu
+#define QUP_ERROR_FLAGS_RESET           0x00007fu
 
 /* QUP State bits */
 #define QUP_RESET_STATE                 0u
@@ -508,6 +513,7 @@ struct poplar_touch_state {
 	uint8_t f01_data_base;
 	uint8_t f12_ctrl_base;
 	uint8_t f12_data_base;
+	bool f12_found;
 	bool dead;
 	int logging;
 	unsigned diag_xfer;
@@ -719,17 +725,17 @@ qup_reset(void)
 	for (int i = 0; i < 50000; i++) {
 		uint32_t s = touch_rd(st.qup, QUP_STATE);
 		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_RESET_STATE)) {
-			touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
-			touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
-			touch_wr(st.qup, QUP_OPERATIONAL, 0xffffffffu);
+			touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_STATUS_RESET);
+			touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERROR_FLAGS_RESET);
+			touch_wr(st.qup, QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
 			return true;
 		}
 		delay(2);
 	}
 	bool ok = qup_set_state(QUP_RESET_STATE);
-	touch_wr(st.qup, QUP_I2C_STATUS, 0xffffffffu);
-	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
-	touch_wr(st.qup, QUP_OPERATIONAL, 0xffffffffu);
+	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_STATUS_RESET);
+	touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERROR_FLAGS_RESET);
+	touch_wr(st.qup, QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
 	return ok;
 }
 
@@ -854,13 +860,15 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		return -1;
 	}
 
+	uint32_t total_rx = len + 2u; /* QUP v2 prepends 2 RX tag bytes in FIFO mode */
+
 	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
 	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_OUTPUT_CNT, 0);     /* FIFO mode: 0 */
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);      /* FIFO mode: 0 */
 	touch_wr(st.qup, QUP_MX_WRITE_CNT, 9u);     /* FIFO mode write count (tag/addr/reg) */
-	touch_wr(st.qup, QUP_MX_READ_CNT, len);     /* FIFO mode read count */
+	touch_wr(st.qup, QUP_MX_READ_CNT, total_rx);/* FIFO mode read count (2 tags + payload) */
 	__asm__ volatile("dsb osh" ::: "memory");
 
 	qup_dump_diag("configured", "RD", addr, len);
@@ -908,7 +916,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 
 	delay(50);
 
-	uint32_t needed_words = (len + 3u) / 4u;
+	uint32_t needed_words = (total_rx + 3u) / 4u;
 	bool done = false;
 
 	for (int timeout = 0; timeout < 5000; timeout++) {
@@ -961,7 +969,8 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	(void)qup_reset();
-	memcpy(rx, in_buf, len);
+	/* Bytes 0 and 1 in in_buf are QUP v2 RX tags; payload data begins at index 2 */
+	memcpy(rx, &in_buf[2], len);
 	return 0;
 }
 
@@ -984,25 +993,29 @@ synaptics_scan_pdt(void)
 					st.i2c_addr = addr;
 					printf("SWEET TOUCH: Synaptics verified at I2C addr 0x%02x (page readback 0x%02x)\\n",
 					    addr, page_rb);
+					err = 0;
 					break;
-				} else if (!rerr) {
-					st.i2c_addr = addr;
-					printf("SWEET TOUCH: I2C addr 0x%02x wrote page 0, read back 0x%02x\\n",
-					    addr, page_rb);
-					break;
+				} else {
+					printf("SWEET TOUCH: I2C addr 0x%02x wrote page 0, readback verify failed: rerr=%d val=0x%02x\\n",
+					    addr, rerr, page_rb);
+					err = -1;
 				}
 			}
-			/* Fallback: try reading register 0x00 */
-			uint8_t test_val = 0;
-			int rerr = qup_i2c_read(addr, 0x00u, &test_val, 1);
-			if (!rerr) {
-				st.i2c_addr = addr;
-				printf("SWEET TOUCH: Synaptics responded to read @0x00: 0x%02x\\n", test_val);
-				err = 0;
-				break;
+			/* Fallback: try reading register 0x00 if write succeeded or failed */
+			if (err) {
+				uint8_t test_val = 0;
+				int rerr = qup_i2c_read(addr, 0x00u, &test_val, 1);
+				if (!rerr) {
+					st.i2c_addr = addr;
+					printf("SWEET TOUCH: Synaptics responded to read @0x00: 0x%02x\\n", test_val);
+					err = 0;
+					break;
+				} else {
+					err = -1;
+				}
 			}
-			printf("SWEET TOUCH: I2C addr 0x%02x retry %d failed: wr=%d rd=%d\\n",
-			    addr, retry + 1, err, rerr);
+			printf("SWEET TOUCH: I2C addr 0x%02x retry %d failed: err=%d\\n",
+			    addr, retry + 1, err);
 			touch_wait(50);
 		}
 		if (!err) {
@@ -1016,6 +1029,7 @@ synaptics_scan_pdt(void)
 
 	st.f01_data_base = 0;
 	st.f12_data_base = 0;
+	st.f12_found = false;
 
 	for (int addr = 0x00e9; addr >= 0x0005; addr -= 6) {
 		uint8_t desc[6] = {0};
@@ -1044,10 +1058,11 @@ synaptics_scan_pdt(void)
 		} else if (fn == 0x12) {
 			st.f12_data_base = dbase;
 			st.f12_ctrl_base = ctrlbase;
+			st.f12_found = true;
 		}
 	}
 
-	if (!st.f12_data_base) {
+	if (!st.f12_found || !st.f12_data_base) {
 		printf("SWEET TOUCH: F12 2D touch function not found in PDT!\\n");
 		return false;
 	}
@@ -1119,8 +1134,14 @@ touch_thread(void *arg, wait_result_t result)
 	(void)PE_parse_boot_argn("sweetrpm", &rpm_enable, sizeof(rpm_enable));
 	if (rpm_enable) {
 		printf("SWEET TOUCH: voting PM8998 LDO28 (3.0V) and LDO14 (1.8V) via RPM GLINK...\\n");
-		(void)poplar_rpm_ldoa(28, 3000000u);
-		(void)poplar_rpm_ldoa(14, 1800000u);
+		bool ok28 = poplar_rpm_ldoa(28, 3000000u);
+		bool ok14 = poplar_rpm_ldoa(14, 1800000u);
+		if (!ok28) {
+			printf("SWEET TOUCH: PM8998 LDO28 vote failed!\\n");
+		}
+		if (!ok14) {
+			printf("SWEET TOUCH: PM8998 LDO14 vote failed!\\n");
+		}
 		touch_wait(20);
 	}
 
@@ -1150,9 +1171,9 @@ touch_thread(void *arg, wait_result_t result)
 	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 	touch_wait(20);
 
-	/* 5. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5) on EAST tile */
-	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
-	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
+	/* 5. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 3 (blsp_i2c5) on EAST tile */
+	touch_gpio(TOUCH_PIN_SDA, 3u, 0, 0, false, false);
+	touch_gpio(TOUCH_PIN_SCL, 3u, 0, 0, false, false);
 	touch_wait(10);
 
 	/* 6. Active-low IRQ input on GPIO 125 (EAST tile) with pull-up */

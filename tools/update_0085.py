@@ -81,7 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
- * Driver build: v5 (stage FIFO in PAUSE state, QUP_NO_INPUT, full diagnostics)
+ * Driver build: v6 (fix MSM8998 TLMM base 0x03400000, I2C pinmux=4, QUP write completion)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -429,8 +429,7 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define GCC_BASE_PA                     0x00100000u
 #define GCC_MAP_SIZE                    0x60000u
 #define QUP5_BASE_PA                    0x0c179000u
-#define TLMM_EAST_PA                    0x03d00000u     /* GPIO 87, 88, 89, 125 */
-#define TLMM_WEST_PA                    0x03500000u     /* GPIO 133 */
+#define TLMM_BASE_PA                    0x03400000u     /* MSM8998 flat TLMM array (150 GPIOs) */
 #define TLMM_MAP_SIZE                   0x100000u
 
 /* GCC Registers & Bits for BLSP1 / QUP5 */
@@ -444,11 +443,11 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR 0x21024u
 
 /* Poplar TLMM Touch Pins */
-#define TOUCH_PIN_SDA                   87u  /* EAST tile, mux 3 (blsp_i2c5) */
-#define TOUCH_PIN_SCL                   88u  /* EAST tile, mux 3 (blsp_i2c5) */
-#define TOUCH_PIN_RESET                 89u  /* EAST tile, mux 0 (gpio out, active-low) */
-#define TOUCH_PIN_IRQ                   125u /* EAST tile, mux 0 (gpio in, active-low, pull-up) */
-#define TOUCH_PIN_VDDIO                 133u /* WEST tile, mux 0 (gpio out, high) */
+#define TOUCH_PIN_SDA                   87u  /* TLMM, mux 4 (blsp_i2c5/7) */
+#define TOUCH_PIN_SCL                   88u  /* TLMM, mux 4 (blsp_i2c5/7) */
+#define TOUCH_PIN_RESET                 89u  /* TLMM, mux 0 (gpio out, active-low) */
+#define TOUCH_PIN_IRQ                   125u /* TLMM, mux 0 (gpio in, active-low, pull-up) */
+#define TOUCH_PIN_VDDIO                 133u /* TLMM, mux 0 (gpio out, high) */
 
 /* QUP v2 Registers */
 #define QUP_CONFIG                      0x000u
@@ -498,8 +497,7 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 struct poplar_touch_state {
 	vm_offset_t gcc;
 	vm_offset_t qup;
-	vm_offset_t gpio_east;
-	vm_offset_t gpio_west;
+	vm_offset_t tlmm;
 	uint8_t i2c_addr;
 	uint8_t f01_cmd_base;
 	uint8_t f01_ctrl_base;
@@ -543,7 +541,7 @@ touch_wait(unsigned ms)
 static void
 touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
 {
-	vm_offset_t base = (pin == TOUCH_PIN_VDDIO) ? st.gpio_west : st.gpio_east;
+	vm_offset_t base = st.tlmm;
 	uint32_t off = (uint32_t)pin * 0x1000u;
 	uint32_t io_off = off + 4u;
 
@@ -779,7 +777,9 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 			(void)qup_reset();
 			return -4;
 		}
-		if ((oper & (1u << 7)) && !(status & QUP_I2C_BUS_ACTIVE)) {
+		bool out_done = (oper & (1u << 10)) ||
+		    (touch_rd(st.qup, QUP_OUT_FIFO_CNT) == 0 && !(oper & (1u << 4)));
+		if (out_done && !(status & QUP_I2C_BUS_ACTIVE)) {
 			(void)qup_reset();
 			return 0;
 		}
@@ -873,8 +873,8 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 			(void)qup_reset();
 			return -4;
 		}
-		if (!(status & QUP_I2C_BUS_ACTIVE) &&
-		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= needed_words)) {
+		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= needed_words &&
+		    (!(status & QUP_I2C_BUS_ACTIVE) || (oper & (1u << 11)))) {
 			done = true;
 			break;
 		}
@@ -1056,43 +1056,43 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	/* 3. Map QUP5 and TLMM EAST and WEST tiles */
-	printf("SWEET TOUCH: mapping QUP5 (0x%08x), TLMM EAST (0x%08x), TLMM WEST (0x%08x)\\n",
-	    QUP5_BASE_PA, TLMM_EAST_PA, TLMM_WEST_PA);
+	/* 3. Map QUP5 and TLMM */
+	printf("SWEET TOUCH: mapping QUP5 (0x%08x), TLMM (0x%08x)\\n",
+	    QUP5_BASE_PA, TLMM_BASE_PA);
 	st.qup = ml_io_map(QUP5_BASE_PA, 0x1000);
-	st.gpio_east = ml_io_map(TLMM_EAST_PA, TLMM_MAP_SIZE);
-	st.gpio_west = ml_io_map(TLMM_WEST_PA, TLMM_MAP_SIZE);
-	if (!st.qup || !st.gpio_east || !st.gpio_west) {
+	st.tlmm = ml_io_map(TLMM_BASE_PA, TLMM_MAP_SIZE);
+	if (!st.qup || !st.tlmm) {
 		printf("SWEET TOUCH: MMIO mapping failed\\n");
 		st.dead = true;
 		thread_terminate(current_thread());
 		return;
 	}
 
-	/* 4. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 3 (blsp_i2c5) on EAST tile */
-	touch_gpio(TOUCH_PIN_SDA, 3u, 0, 0, false, false);
-	touch_gpio(TOUCH_PIN_SCL, 3u, 0, 0, false, false);
-	touch_wait(10);
-
-	/* 5. Enable VDDIO power to touch controller on GPIO 133 (WEST tile) */
+	/* 4. Enable VDDIO power to touch controller on GPIO 133 */
 	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 	touch_wait(20);
 
-	/* 6. Hardware reset toggle on GPIO 89 (EAST tile, active low) */
+	/* 5. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 4 (blsp_i2c5/7) */
+	touch_gpio(TOUCH_PIN_SDA, 4u, 0, 0, false, false);
+	touch_gpio(TOUCH_PIN_SCL, 4u, 0, 0, false, false);
+	touch_wait(10);
+
+	/* 6. Active-low IRQ input on GPIO 125 with pull-up */
+	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);
+	touch_wait(10);
+
+	/* 7. Hardware reset toggle on GPIO 89 (active low) */
 	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, false);
 	touch_wait(20);
 	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, true);
 	touch_wait(250);
 
-	/* 7. Active-low IRQ input on GPIO 125 (EAST tile) with pull-up */
-	touch_gpio(TOUCH_PIN_IRQ, 0, 3, 0, false, false);
-	touch_wait(10);
-
-	printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x\\n",
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
-	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u));
+	printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x, IRQ=%u\\n",
+	    touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
+	    touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
+	    touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
+	    touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u),
+	    touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u);
 
 	/* 8. Program QUP I2C CLK_CTL for 100 kHz standard mode (fs_div=93=0x5d, hs_div=3) */
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
@@ -1112,7 +1112,7 @@ touch_thread(void *arg, wait_result_t result)
 
 	unsigned ticks = 0;
 	while (!st.dead) {
-		uint32_t pin_in = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u;
+		uint32_t pin_in = touch_rd(st.tlmm, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u;
 		bool any_down = false;
 		for (int i = 0; i < TOUCH_MAX; i++) {
 			if (st.down[i]) {

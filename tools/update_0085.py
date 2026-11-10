@@ -81,7 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
- * Driver build: v3 (QUP state write fix)
+ * Driver build: v4 (QUP direct RESET->RUN transition)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -662,7 +662,16 @@ qup_set_state(uint32_t state)
 	if ((cur & QUP_STATE_MASK) == state) {
 		return true;
 	}
-	/* 1. First attempt: preserve upper control bits (cur & ~QUP_STATE_MASK) */
+	/* 1. Direct state write (standard Qualcomm QUP method) */
+	touch_wr(st.qup, QUP_STATE, state & QUP_STATE_MASK);
+	for (int i = 0; i < 50000; i++) {
+		uint32_t s = touch_rd(st.qup, QUP_STATE);
+		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
+			return true;
+		}
+		delay(2);
+	}
+	/* 2. Try with preserved upper bits */
 	touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
 	for (int i = 0; i < 50000; i++) {
 		uint32_t s = touch_rd(st.qup, QUP_STATE);
@@ -670,36 +679,6 @@ qup_set_state(uint32_t state)
 			return true;
 		}
 		delay(2);
-	}
-	/* 2. Second attempt: direct state write (as in Linux i2c-qup.c) */
-	touch_wr(st.qup, QUP_STATE, state);
-	for (int i = 0; i < 50000; i++) {
-		uint32_t s = touch_rd(st.qup, QUP_STATE);
-		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
-			return true;
-		}
-		delay(2);
-	}
-	/* 3. Fallback: try PAUSE first then RUN */
-	if (state == QUP_RUN_STATE && (touch_rd(st.qup, QUP_STATE) & QUP_STATE_MASK) == QUP_RESET_STATE) {
-		cur = touch_rd(st.qup, QUP_STATE);
-		touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | QUP_PAUSE_STATE);
-		for (int i = 0; i < 50000; i++) {
-			uint32_t s = touch_rd(st.qup, QUP_STATE);
-			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_PAUSE_STATE)) {
-				break;
-			}
-			delay(2);
-		}
-		cur = touch_rd(st.qup, QUP_STATE);
-		touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | QUP_RUN_STATE);
-		for (int i = 0; i < 50000; i++) {
-			uint32_t s = touch_rd(st.qup, QUP_STATE);
-			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
-				return true;
-			}
-			delay(2);
-		}
 	}
 	printf("SWEET TOUCH: qup_set_state(%u) failed: cur=0x%08x target=%u\\n",
 	    state, touch_rd(st.qup, QUP_STATE), state);
@@ -743,7 +722,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);
 	__asm__ volatile("dsb osh" ::: "memory");
 
-	if (!qup_set_state(QUP_PAUSE_STATE)) {
+	if (!qup_set_state(QUP_RUN_STATE)) {
 		(void)qup_reset();
 		return -2;
 	}
@@ -765,11 +744,6 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		uint32_t w = 0;
 		memcpy(&w, &pkt[i], (total - i >= 4) ? 4 : (total - i));
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
-	}
-
-	if (!qup_set_state(QUP_RUN_STATE)) {
-		(void)qup_reset();
-		return -2;
 	}
 
 	for (int timeout = 0; timeout < 10000; timeout++) {
@@ -818,7 +792,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, len);
 	__asm__ volatile("dsb osh" ::: "memory");
 
-	if (!qup_set_state(QUP_PAUSE_STATE)) {
+	if (!qup_set_state(QUP_RUN_STATE)) {
 		(void)qup_reset();
 		return -2;
 	}
@@ -834,15 +808,11 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	tx_pkt[7] = QUP_TAG2_DATA_READ_STOP;     /* 0x87 (data read with STOP) */
 	tx_pkt[8] = (uint8_t)len;                /* number of bytes to read */
 
-	for (unsigned i = 0; i < 12; i += 4) {
+	unsigned total = 9u;
+	for (unsigned i = 0; i < total; i += 4) {
 		uint32_t w = 0;
-		memcpy(&w, &tx_pkt[i], 4);
+		memcpy(&w, &tx_pkt[i], (total - i >= 4) ? 4 : (total - i));
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
-	}
-
-	if (!qup_set_state(QUP_RUN_STATE)) {
-		(void)qup_reset();
-		return -2;
 	}
 
 	bool done = false;
@@ -1082,6 +1052,8 @@ touch_thread(void *arg, wait_result_t result)
 
 	if (!synaptics_scan_pdt()) {
 		printf("SWEET TOUCH: Synaptics probe failed\\n");
+		thread_terminate(current_thread());
+		return;
 	} else {
 		printf("SWEET TOUCH: Synaptics ClearPad S332U initialized\\n");
 	}

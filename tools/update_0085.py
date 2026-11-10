@@ -81,7 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
- * Driver build: v4 (QUP direct RESET->RUN transition)
+ * Driver build: v5 (stage FIFO in PAUSE state, QUP_NO_INPUT, full diagnostics)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -468,6 +468,7 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define QUP_I2C_MASTER_GEN              0x408u
 #define QUP_V2_TAGS_EN                  1u
 
+#define QUP_NO_INPUT                    (1u << 7)
 #define QUP_UNPACK_EN                   (1u << 14)
 #define QUP_PACK_EN                     (1u << 15)
 #define QUP_REPACK_EN                   (QUP_UNPACK_EN | QUP_PACK_EN)
@@ -712,10 +713,11 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	}
 
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
+	__asm__ volatile("dsb osh" ::: "memory");
 	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
-	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u);
+	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u | QUP_NO_INPUT);
 	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_WR_CNT, 4u + len);
@@ -726,6 +728,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		(void)qup_reset();
 		return -2;
 	}
+	(void)qup_set_state(QUP_PAUSE_STATE);
 
 	uint8_t pkt[4 + 16];
 	if (len > 16) {
@@ -745,11 +748,19 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		memcpy(&w, &pkt[i], (total - i >= 4) ? 4 : (total - i));
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
 	}
+	__asm__ volatile("dsb osh" ::: "memory");
+
+	if (!qup_set_state(QUP_RUN_STATE)) {
+		(void)qup_reset();
+		return -2;
+	}
 
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-			printf("SWEET TOUCH: write nack/err status=0x%08x\\n", status);
+			printf("SWEET TOUCH: write nack/err status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\\n",
+			    status, touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
+			    touch_rd(st.qup, QUP_STATE), touch_rd(st.qup, QUP_OUT_FIFO_CNT), touch_rd(st.qup, QUP_IN_FIFO_CNT));
 			(void)qup_reset();
 			return -4;
 		}
@@ -761,8 +772,9 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		delay(5);
 	}
 
-	printf("SWEET TOUCH: write timed out status=0x%08x out_fifo=%u\\n",
-	    touch_rd(st.qup, QUP_I2C_STATUS), touch_rd(st.qup, QUP_OUT_FIFO_CNT));
+	printf("SWEET TOUCH: write timed out status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\\n",
+	    touch_rd(st.qup, QUP_I2C_STATUS), touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
+	    touch_rd(st.qup, QUP_STATE), touch_rd(st.qup, QUP_OUT_FIFO_CNT), touch_rd(st.qup, QUP_IN_FIFO_CNT));
 	(void)qup_reset();
 	return -5;
 }
@@ -782,6 +794,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
+	__asm__ volatile("dsb osh" ::: "memory");
 	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
@@ -796,6 +809,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		(void)qup_reset();
 		return -2;
 	}
+	(void)qup_set_state(QUP_PAUSE_STATE);
 
 	uint8_t tx_pkt[12] = {0};
 	tx_pkt[0] = QUP_TAG2_START;              /* 0x81 */
@@ -814,17 +828,25 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		memcpy(&w, &tx_pkt[i], (total - i >= 4) ? 4 : (total - i));
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
 	}
+	__asm__ volatile("dsb osh" ::: "memory");
+
+	if (!qup_set_state(QUP_RUN_STATE)) {
+		(void)qup_reset();
+		return -2;
+	}
 
 	bool done = false;
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
 		if (status & (QUP_I2C_NACK_FLAG | QUP_I2C_ERR_MASK)) {
-			printf("SWEET TOUCH: read nack/err status=0x%08x\\n", status);
+			printf("SWEET TOUCH: read nack/err status=0x%08x err=0x%08x oper=0x%08x state=0x%08x out=%u in=%u\\n",
+			    status, touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
+			    touch_rd(st.qup, QUP_STATE), touch_rd(st.qup, QUP_OUT_FIFO_CNT), touch_rd(st.qup, QUP_IN_FIFO_CNT));
 			(void)qup_reset();
 			return -4;
 		}
 		if (!(status & QUP_I2C_BUS_ACTIVE) &&
-		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) > 0)) {
+		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len)) {
 			done = true;
 			break;
 		}
@@ -832,8 +854,10 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	if (!done) {
-		printf("SWEET TOUCH: read timed out in_fifo=%u status=0x%08x\\n",
-		    touch_rd(st.qup, QUP_IN_FIFO_CNT), touch_rd(st.qup, QUP_I2C_STATUS));
+		printf("SWEET TOUCH: read timed out in_fifo=%u status=0x%08x err=0x%08x oper=0x%08x state=0x%08x\\n",
+		    touch_rd(st.qup, QUP_IN_FIFO_CNT), touch_rd(st.qup, QUP_I2C_STATUS),
+		    touch_rd(st.qup, QUP_ERROR_FLAGS), touch_rd(st.qup, QUP_OPERATIONAL),
+		    touch_rd(st.qup, QUP_STATE));
 		(void)qup_reset();
 		return -5;
 	}

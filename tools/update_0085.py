@@ -554,8 +554,9 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, 
 	cfg |= (mux << 2) | (pull & 3u) | ((drive & 7u) << 6) | (out ? 0x200u : 0u);
 	touch_wr(base, off, cfg);
 	uint32_t new_cfg = touch_rd(base, off);
-	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x\\n",
-	    pin, old_cfg, cfg, new_cfg);
+	uint32_t io_val = touch_rd(base, io_off);
+	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x\n",
+	    pin, old_cfg, cfg, new_cfg, io_val);
 }
 
 static bool
@@ -712,11 +713,16 @@ qup_reset(void)
 	for (int i = 0; i < 50000; i++) {
 		uint32_t s = touch_rd(st.qup, QUP_STATE);
 		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == QUP_RESET_STATE)) {
+			touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
+			touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 			return true;
 		}
 		delay(2);
 	}
-	return qup_set_state(QUP_RESET_STATE);
+	bool ok = qup_set_state(QUP_RESET_STATE);
+	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
+	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
+	return ok;
 }
 
 static int
@@ -726,6 +732,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		return -1;
 	}
 
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
 	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
@@ -734,8 +741,10 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_WR_CNT, 4u + len);
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);
+	__asm__ volatile("dsb osh" ::: "memory");
 
-	if (!qup_set_state(QUP_RUN_STATE)) {
+	if (!qup_set_state(QUP_PAUSE_STATE)) {
+		(void)qup_reset();
 		return -2;
 	}
 
@@ -756,6 +765,11 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		uint32_t w = 0;
 		memcpy(&w, &pkt[i], (total - i >= 4) ? 4 : (total - i));
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
+	}
+
+	if (!qup_set_state(QUP_RUN_STATE)) {
+		(void)qup_reset();
+		return -2;
 	}
 
 	for (int timeout = 0; timeout < 10000; timeout++) {
@@ -793,6 +807,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		return -1;
 	}
 
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, 0x035du);
 	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_ERR_MASK | QUP_I2C_NACK_FLAG);
 	touch_wr(st.qup, QUP_ERROR_FLAGS, 0xffffffffu);
 	touch_wr(st.qup, QUP_OPERATIONAL, (1u << 8) | (1u << 9));
@@ -800,9 +815,11 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 	touch_wr(st.qup, QUP_IO_MODE, QUP_REPACK_EN);
 	touch_wr(st.qup, QUP_MX_WR_CNT, 9u);
-	touch_wr(st.qup, QUP_MX_INPUT_CNT, len + 2u);
+	touch_wr(st.qup, QUP_MX_INPUT_CNT, len);
+	__asm__ volatile("dsb osh" ::: "memory");
 
-	if (!qup_set_state(QUP_RUN_STATE)) {
+	if (!qup_set_state(QUP_PAUSE_STATE)) {
+		(void)qup_reset();
 		return -2;
 	}
 
@@ -823,6 +840,11 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		touch_wr(st.qup, QUP_OUT_FIFO_BASE, w);
 	}
 
+	if (!qup_set_state(QUP_RUN_STATE)) {
+		(void)qup_reset();
+		return -2;
+	}
+
 	bool done = false;
 	for (int timeout = 0; timeout < 10000; timeout++) {
 		uint32_t status = touch_rd(st.qup, QUP_I2C_STATUS);
@@ -831,7 +853,8 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 			(void)qup_reset();
 			return -4;
 		}
-		if (touch_rd(st.qup, QUP_IN_FIFO_CNT) >= len + 2u) {
+		if (!(status & QUP_I2C_BUS_ACTIVE) &&
+		    (touch_rd(st.qup, QUP_IN_FIFO_CNT) > 0)) {
 			done = true;
 			break;
 		}
@@ -846,7 +869,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	uint8_t in_buf[64] = {0};
-	unsigned words = (len + 2u + 3u) / 4;
+	unsigned words = (len + 3u) / 4u;
 	if (words > 16) words = 16;
 	for (unsigned i = 0; i < words; i++) {
 		uint32_t w = touch_rd(st.qup, QUP_IN_FIFO_BASE);
@@ -854,7 +877,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	}
 
 	(void)qup_reset();
-	memcpy(rx, &in_buf[2], len);
+	memcpy(rx, in_buf, len);
 	return 0;
 }
 
@@ -957,14 +980,23 @@ synaptics_poll_touch(void)
 		if (x > 1079) x = 1079;
 		if (y > 1919) y = 1919;
 
+		/*
+		 * Scale y from panel resolution (1920) to logical coordinate space (2400)
+		 * expected by SweetHIDTouch / 0071-sweet-touch-edge.patch so bottom edge touches
+		 * (y_hid >= 2352) are properly tagged with kIOHIDDigitizerEventFromEdgeTip for
+		 * the iOS swipe-up-to-go-home gesture.
+		 */
+		int y_hid = (y * 2399) / 1919;
+		if (y_hid > 2399) y_hid = 2399;
+
 		if (down || st.down[i]) {
 			st.down[i] = down;
 			st.x[i] = x;
 			st.y[i] = y;
 			if (st.logging) {
-				printf("SWEET TOUCH: finger %d %s at %d,%d\\n", i, down ? "down" : "up", x, y);
+				printf("SWEET TOUCH: finger %d %s at %d,%d (hid %d,%d)\n", i, down ? "down" : "up", x, y, x, y_hid);
 			}
-			sweet_hid_touch(i, down ? 1 : 0, x, y);
+			sweet_hid_touch(i, down ? 1 : 0, x, y_hid);
 		}
 	}
 }

@@ -736,6 +736,7 @@ qup_reset(void)
 			touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_STATUS_RESET);
 			touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERROR_FLAGS_RESET);
 			touch_wr(st.qup, QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
+			touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 			return true;
 		}
 		delay(2);
@@ -744,6 +745,7 @@ qup_reset(void)
 	touch_wr(st.qup, QUP_I2C_STATUS, QUP_I2C_STATUS_RESET);
 	touch_wr(st.qup, QUP_ERROR_FLAGS, QUP_ERROR_FLAGS_RESET);
 	touch_wr(st.qup, QUP_OPERATIONAL, QUP_OPERATIONAL_RESET);
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	return ok;
 }
 
@@ -770,6 +772,7 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);        /* FIFO mode: 0 */
 	touch_wr(st.qup, QUP_MX_WRITE_CNT, 4u + len); /* FIFO mode write count */
 	touch_wr(st.qup, QUP_MX_READ_CNT, 0);         /* FIFO mode: 0 in write */
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	__asm__ volatile("dsb osh" ::: "memory");
 
 	qup_dump_diag("configured", "WR", addr, len);
@@ -907,6 +910,7 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	touch_wr(st.qup, QUP_MX_INPUT_CNT, 0);      /* FIFO mode: 0 */
 	touch_wr(st.qup, QUP_MX_WRITE_CNT, 9u);     /* FIFO mode write count (tag/addr/reg) */
 	touch_wr(st.qup, QUP_MX_READ_CNT, total_rx);/* FIFO mode read count (2 tags + payload) */
+	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	__asm__ volatile("dsb osh" ::: "memory");
 
 	qup_dump_diag("configured", "RD", addr, len);

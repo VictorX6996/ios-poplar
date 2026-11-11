@@ -709,7 +709,7 @@ qup_dump_diag(const char *phase, const char *dir, uint8_t addr, unsigned len)
 	if (!st.logging && st.diag_xfer >= 4) {
 		return;
 	}
-	printf("SWEET TOUCH: [%s %s 0x%02x len=%u] CFG=0x%08x STA=0x%08x IO=0x%08x MX_OUT=%u MX_WR=%u MX_IN=%u MX_RD=%u OUT_F=%u IN_F=%u OP=0x%08x I2C_ST=0x%08x ERR=0x%08x\\n",
+	printf("SWEET TOUCH: [%s %s 0x%02x len=%u] CFG=0x%08x STA=0x%08x IO=0x%08x MX_OUT=%u MX_WR=%u MX_IN=%u MX_RD=%u OUT_F=%u IN_F=%u OP=0x%08x I2C_ST=0x%08x ERR=0x%08x CLK=0x%08x\\n",
 	    phase, dir, addr, len,
 	    touch_rd(st.qup, QUP_CONFIG),
 	    touch_rd(st.qup, QUP_STATE),
@@ -722,7 +722,8 @@ qup_dump_diag(const char *phase, const char *dir, uint8_t addr, unsigned len)
 	    touch_rd(st.qup, QUP_IN_FIFO_CNT),
 	    touch_rd(st.qup, QUP_OPERATIONAL),
 	    touch_rd(st.qup, QUP_I2C_STATUS),
-	    touch_rd(st.qup, QUP_ERROR_FLAGS));
+	    touch_rd(st.qup, QUP_ERROR_FLAGS),
+	    touch_rd(st.qup, QUP_I2C_CLK_CTL));
 }
 
 static bool
@@ -757,8 +758,10 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	qup_dump_diag("pre-reset", "WR", addr, len);
 
 	if (!qup_reset()) {
+		qup_dump_diag("reset-fail", "WR", addr, len);
 		return -1;
 	}
+	qup_dump_diag("post-reset", "WR", addr, len);
 
 	touch_wr(st.qup, QUP_CONFIG, (2u << 8) | 7u | QUP_NO_INPUT);
 	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
@@ -772,17 +775,24 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 	qup_dump_diag("configured", "WR", addr, len);
 
 	if (!qup_set_state(QUP_RUN_STATE)) {
+		qup_dump_diag("run1-fail", "WR", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
+	qup_dump_diag("post-run1", "WR", addr, len);
 
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	__asm__ volatile("dsb osh" ::: "memory");
+	qup_dump_diag("post-clk", "WR", addr, len);
 
 	if (!qup_set_state(QUP_PAUSE_STATE)) {
+		qup_dump_diag("pause-fail", "WR", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
+	qup_dump_diag("post-pause", "WR", addr, len);
+
+	qup_dump_diag("pre-fifo", "WR", addr, len);
 
 	uint8_t pkt[4 + 16];
 	pkt[0] = QUP_TAG2_START;
@@ -802,17 +812,23 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 			    (uint8_t)(w & 0xffu), (uint8_t)((w >> 8) & 0xffu),
 			    (uint8_t)((w >> 16) & 0xffu), (uint8_t)((w >> 24) & 0xffu));
 		}
+		char wphase[16];
+		snprintf(wphase, sizeof(wphase), "fifo-w%u", i / 4u);
+		qup_dump_diag(wphase, "WR", addr, len);
 	}
 	__asm__ volatile("dsb osh" ::: "memory");
 
 	qup_dump_diag("fifo-loaded", "WR", addr, len);
 
+	qup_dump_diag("pre-run2", "WR", addr, len);
+
 	if (!qup_set_state(QUP_RUN_STATE)) {
+		qup_dump_diag("run2-fail", "WR", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
 
-	qup_dump_diag("post-run", "WR", addr, len);
+	qup_dump_diag("post-run2", "WR", addr, len);
 
 	delay(50);
 
@@ -822,18 +838,18 @@ qup_i2c_write(uint8_t addr, const uint8_t *tx, unsigned len)
 		uint32_t err = touch_rd(st.qup, QUP_ERROR_FLAGS);
 
 		if (err & 0x7fu) {
+			qup_dump_diag("err-core", "WR", addr, len);
 			printf("SWEET TOUCH: write core err=0x%08x status=0x%08x oper=0x%08x\\n",
 			    err, status, oper);
-			qup_dump_diag("error", "WR", addr, len);
 			(void)qup_reset();
 			return -4;
 		}
 		if (status & QUP_I2C_ERR_MASK) {
+			qup_dump_diag("err-status", "WR", addr, len);
 			if (!(status & QUP_I2C_NACK_FLAG)) {
 				printf("SWEET TOUCH: write bus err status=0x%08x oper=0x%08x\\n",
 				    status, oper);
 			}
-			qup_dump_diag("err-status", "WR", addr, len);
 			(void)qup_reset();
 			return -4;
 		}
@@ -873,8 +889,10 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	qup_dump_diag("pre-reset", "RD", addr, len);
 
 	if (!qup_reset()) {
+		qup_dump_diag("reset-fail", "RD", addr, len);
 		return -1;
 	}
+	qup_dump_diag("post-reset", "RD", addr, len);
 
 	uint32_t total_rx = len + 2u; /* QUP v2 prepends 2 RX tag bytes in FIFO mode */
 	uint32_t needed_words = (total_rx + 3u) / 4u;
@@ -894,17 +912,24 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 	qup_dump_diag("configured", "RD", addr, len);
 
 	if (!qup_set_state(QUP_RUN_STATE)) {
+		qup_dump_diag("run1-fail", "RD", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
+	qup_dump_diag("post-run1", "RD", addr, len);
 
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	__asm__ volatile("dsb osh" ::: "memory");
+	qup_dump_diag("post-clk", "RD", addr, len);
 
 	if (!qup_set_state(QUP_PAUSE_STATE)) {
+		qup_dump_diag("pause-fail", "RD", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
+	qup_dump_diag("post-pause", "RD", addr, len);
+
+	qup_dump_diag("pre-fifo", "RD", addr, len);
 
 	uint8_t tx_pkt[12] = {0};
 	tx_pkt[0] = QUP_TAG2_START;              /* 0x81 */
@@ -928,17 +953,23 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 			    (uint8_t)(w & 0xffu), (uint8_t)((w >> 8) & 0xffu),
 			    (uint8_t)((w >> 16) & 0xffu), (uint8_t)((w >> 24) & 0xffu));
 		}
+		char wphase[16];
+		snprintf(wphase, sizeof(wphase), "fifo-w%u", i / 4u);
+		qup_dump_diag(wphase, "RD", addr, len);
 	}
 	__asm__ volatile("dsb osh" ::: "memory");
 
 	qup_dump_diag("fifo-loaded", "RD", addr, len);
 
+	qup_dump_diag("pre-run2", "RD", addr, len);
+
 	if (!qup_set_state(QUP_RUN_STATE)) {
+		qup_dump_diag("run2-fail", "RD", addr, len);
 		(void)qup_reset();
 		return -2;
 	}
 
-	qup_dump_diag("post-run", "RD", addr, len);
+	qup_dump_diag("post-run2", "RD", addr, len);
 
 	delay(50);
 
@@ -950,18 +981,18 @@ qup_i2c_read(uint8_t addr, uint8_t reg, uint8_t *rx, unsigned len)
 		uint32_t err = touch_rd(st.qup, QUP_ERROR_FLAGS);
 
 		if (err & 0x7fu) {
+			qup_dump_diag("err-core", "RD", addr, len);
 			printf("SWEET TOUCH: read core err=0x%08x status=0x%08x oper=0x%08x\\n",
 			    err, status, oper);
-			qup_dump_diag("error", "RD", addr, len);
 			(void)qup_reset();
 			return -4;
 		}
 		if (status & QUP_I2C_ERR_MASK) {
+			qup_dump_diag("err-status", "RD", addr, len);
 			if (!(status & QUP_I2C_NACK_FLAG)) {
 				printf("SWEET TOUCH: read bus err status=0x%08x oper=0x%08x\\n",
 				    status, oper);
 			}
-			qup_dump_diag("err-status", "RD", addr, len);
 			(void)qup_reset();
 			return -4;
 		}

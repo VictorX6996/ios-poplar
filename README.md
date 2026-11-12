@@ -67,10 +67,11 @@ powershell -ExecutionPolicy Bypass -File .\tools\poplar-log-pull.ps1 -Which shim
   - `19.2 MHz` timer (`clock-frequency = 19200000`)
   - `/arm-io` (`0x0..0x20000000`) with `gic` (`0x17a00000`, `0x17b00000`), `ufs0` (`0x01da4000`), `wdt0`, and `disp0` (`0x9d400000`, `1080x1920`)
   - `D22AP` / `iPhone10,3` model identity for iOS 16 userland compatibility
-- [`xnu/patches/`](file:///d:/ios-port/xnu/patches/) (`0001..0084`) + [`.github/workflows/xnu.yml`](file:///d:/ios-port/.github/workflows/xnu.yml) build `xnu-8796` with:
+- [`xnu/patches/`](file:///d:/ios-port/xnu/patches/) (`0001..0085`) + [`.github/workflows/xnu.yml`](file:///d:/ios-port/.github/workflows/xnu.yml) build `xnu-8796` with:
   - `0080..0082`: ARMv8.0 (`-mcpu=cortex-a53`), no PAN, commpage `casa` -> `ldaxr/stxr`, userland LSE & `ldapr` trap emulator in `sleh.c`, Gold boot core `0x100`.
   - `0083`: Write-combine console framebuffer mapping.
   - [`0084-poplar-early-fb-watchdog-keys-scale.patch`](file:///d:/ios-port/xnu/patches/0084-poplar-early-fb-watchdog-keys-scale.patch): `poplar` early framebuffer (`0x9d400000` at `+0x1400000` inside `0x9c000000` 32M L2 block, `1080x1920`), MSM8998 APSS WDT keepalive (`0x17817000`), SPMI v3/v5 key driver (`0x0800f000`), and `1125x2436 -> 1080x1920` full-screen scaling in `SweetFramebuffer` + `SweetHID`.
+  - [`0085-poplar-touch-synaptics-rmi4-qup.patch`](file:///d:/ios-port/xnu/patches/0085-poplar-touch-synaptics-rmi4-qup.patch): `poplar` Synaptics ClearPad `S332U` RMI4 touch driver over BLSP1 QUP5 I2C (`0x0c179000`) + RPM GLINK LDO28/LDO14 voting (`bsd/dev/sweet_poplar_touch.c`).
 
 ### Step 4 — CPU cores (SMP)
 - Pass `cpus=4` in boot-args (`shim/build.sh --boot-args "... cpus=4"`).
@@ -86,9 +87,9 @@ powershell -ExecutionPolicy Bypass -File .\tools\poplar-log-pull.ps1 -Which shim
 ### Step 6 — The Lock Screen (`backboardd` & `SpringBoard`)
 - `SweetFramebuffer` reports `1125x2436` (`375x812 @3x`) to `backboardd`/`SpringBoard` so UIKit loads the iPhone X status bar and layout assets, and scales the `1125x2436` surface onto the `1080x1920` panel (toggleable with `sweetfb_scale=0` or `sweetfb_native=1`).
 
-### Step 7 — Touch and Buttons
+### Step 7 — Touch and Buttons (Verified on Hardware)
 - **Buttons**: Polled read-only over MSM8998 SPMI PMIC Arbiter (`0x0800f000` / `0x09400000`) in `bsd/dev/sweet_keys.c` (Power on PON `0x0810`, Vol+ on PM8998 GPIO6 `0xc510`, Vol- on PM8998 GPIO5 `0xc410`).
-- **Touchscreen**: Synaptics ClearPad RMI4 (`synaptics_clearpad@2c`) on BLSP1 QUP5 I2C (`0x0c179000`, IRQ GPIO 125, Reset GPIO 89, VDDIO GPIO 133).
+- **Touchscreen**: Synaptics ClearPad `S332U` RMI4 (`0x2c`) on BLSP1 QUP5 I2C (`0x0c179000`, active-LOW IRQ GPIO 125, RST GPIO 89, active-LOW VDDIO GPIO 133, RPM LDO28/14) feeding `SweetHIDTouch` (`1080x1920`).
 
-### Step 8 — Everything else (Battery, CPU frequency, USB networking)
-- Documented in [`NOTES.md`](file:///d:/ios-port/NOTES.md).
+### Step 8 — Next: USB Networking, Battery/Fuel Gauge, and CPU Frequency
+- `poplar` MSM8998 addresses (`ssusb@a800000`, `qusb@c012000`, `pmi8998` `qpnp,fg`, `msm-cpufreq`) are documented in [`NOTES.md`](file:///d:/ios-port/NOTES.md).

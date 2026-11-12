@@ -73,16 +73,32 @@ All hardware addresses, IRQs, clocks, and memory carve-outs below were extracted
 
 ---
 
-## 4. Touchscreen (Step 7 — Next Driver After Lock Screen)
+## 4. Touchscreen (Step 7 — Complete / Verified on Hardware)
 
-From `msm8998-yoshino-poplar_common.dtsi`:
-- **Controller**: Synaptics ClearPad RMI4 (`compatible = "synaptics,rmi4"`, node `synaptics_clearpad@2c` at I2C address **`0x2c`**)
-- **Bus**: **BLSP1 QUP5 I2C** (`i2c_5: i2c@c179000`, `reg = <0x0c179000 0x1000>`, IRQ `GIC_SPI 100`, SDA GPIO 87, SCL GPIO 88)
-  - Note: MSM8998 uses **BLSP QUP v2** (`i2c-msm-v2`), not QUPv3 GENI SE.
-- **Pins & Rails**:
-  - `synaptics,irq_gpio = <&tlmm 125 0x2008>` (GPIO 125, active low)
-  - `synaptics,rst_gpio = <&tlmm 89 0x00>` (GPIO 89)
-  - `vddio_en_gpio = <&tlmm 133 0>` (GPIO 133, digital VDDIO enable)
-  - `avdd-supply = <&pm8998_l28>` (3.0 V)
-  - `synaptics,preset_x_max = <1079>`, `synaptics,preset_y_max = <1919>`
-- Once Step 6 (Lock Screen) is reached on hardware, we will add `bsd/dev/sweet_rmi4.c` driving BLSP1 QUP5 (`0x0c179000`) + RMI4 F11/F12 at `0x2c` and feeding `sweet_hid_touch()`.
+Implemented in [`0085-poplar-touch-synaptics-rmi4-qup.patch`](file:///d:/ios-port/xnu/patches/0085-poplar-touch-synaptics-rmi4-qup.patch) (`bsd/dev/sweet_poplar_touch.c`, generated via [`tools/update_0085.py`](file:///d:/ios-port/tools/update_0085.py)):
+- **Controller & PDT (`0x2c`)**: Synaptics ClearPad `S332U` (`F34 @0xe9`, `F01 @0xe3`, `F12 @0xdd`, `1080x1920`, `10` fingers, `8` bytes/object).
+- **Rails & Clocks**:
+  - `PM8998 L28` (`3.0 V` AVDD) + `L14` (`1.8 V`) voted over RPM GLINK (`0x00778000`, doorbell `0x17911008`).
+  - `BLSP1` AHB + `QUP5` (`0x0c179000`) clocks enabled in GCC (`0x00100000`, RCG at 19.2 MHz XO, `QUP_I2C_CLK_CTL = 0x00100020` for 355 kHz).
+- **TLMM Pins**:
+  - `GPIO 133` (WEST tile): active-LOW VDDIO enable (`out=0` required; driving HIGH pulls SDA/SCL LOW and causes `BUS_ERROR`).
+  - `GPIO 87/88` (EAST tile): mux `3` (`blsp_i2c5` SDA/SCL).
+  - `GPIO 125` (EAST tile): active-LOW ATTN/IRQ input with pull-up (`0` on pending F12/F01 interrupt, cleared to `1` on Clear-On-Read `F01_DATA01`).
+  - `GPIO 89` (EAST tile): active-LOW reset (`220 ms` low, `1000 ms` wait after high).
+- **RMI4 & HID Path**:
+  - Parses `F12` CTRL/DATA register presence descriptors (`F12_DATA01` at `+0x00`, `F12_DATA15` at `+0x03`, `CTRL08` `1079x1919`).
+  - Configures `F01_CTRL00 = 0x80` (normal/configured) and `F01_CTRL01 = 0x3f` (enable interrupts).
+  - Reads `F12_DATA15` attention mask and fetches only active `F12_DATA01` slots bounded within `<= 32` bytes for QUP v2 FIFO mode, scaling 1:1 into `SweetHIDTouch` (`1080x1920`, `scale=1`).
+  - Boot-args: `poplartouch=0` disables driver, `poplartouchdelay=N`, `poplartouchlog=1` enables verbose touch/QUP trace, `sweetrpm=0` skips RPM LDO votes.
+
+---
+
+## 5. Step 8 Hardware Targets — USB, Battery/Charger & CPU Frequency (`dtb/live.dtb`)
+
+- **USB (`ssusb@a800000` + `qusb@c012000`)**:
+  - `0072-sweet-usb-probe.patch` (`bsd/dev/sweet_usb.c`) targets SM7150 (`0x0a600000` / `0x088e2000`) and is skipped on `poplar` (`sweethw=0`).
+  - `poplar` MSM8998 live DTB uses `/soc/ssusb@a800000` (`qcom,dwc-usb3-msm` `0x0a800000`/`0xf8c00` & `0x0c016000`/`0x400`, `snps,dwc3` `0x0a800000`/`0xcd00`, IRQ `0x83`) and `/soc/qusb@c012000` (`qcom,qusb2phy-v2`, `0x0c012000`/`0x2a8`).
+- **Battery / Fuel Gauge / Charger (`pmi8998@2` over SPMI `0x800f000`)**:
+  - `qpnp,fg` (`qcom,fg-gen3`), `qcom,qpnp-smb2`, `rradc@4500`, `bcl@4200`.
+- **CPU Frequency & Thermal**:
+  - `qcom,msm-cpufreq`, `devfreq-cpufreq`, `cprh-ctrl@179c8000` / `179c4000`, `tsens@10aa000` / `10ad000`.

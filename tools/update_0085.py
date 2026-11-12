@@ -81,7 +81,7 @@ C_SOURCE = """/*
  *   poplartouchdelay=N  delays startup by N seconds (default 0)
  *   poplartouchlog=1    logs touch events to console
  *   sweetrpm=0          skips RPM LDO28 power rail vote
- * Driver build: v9 (F12 presence/ctrl/data parsing, F01 cfg & GPIO125 IRQ audit, bounded F12 reads, 1080x1920 HID)
+ * Driver build: v10 (Step 7 finalized: clean boot/error logs, full debug & touch trace gated on poplartouchlog=1)
  */
 
 #if defined(ARM64_BOARD_CONFIG_SWEET)
@@ -687,10 +687,12 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, 
 	touch_wr(base, off, cfg);
 	uint32_t new_cfg = touch_rd(base, off);
 	uint32_t io_val = touch_rd(base, io_off);
-	printf("SWEET TOUCH: GPIO %u pa=0x%08x cfg: 0x%08x->0x%08x->0x%08x io: 0x%08x(in=%u,out=%u)->0x%08x(in=%u,out=%u)\\n",
-	    pin, touch_tlmm_pa(pin), old_cfg, cfg, new_cfg,
-	    old_io, old_io & 1u, (old_io >> 1) & 1u,
-	    io_val, io_val & 1u, (io_val >> 1) & 1u);
+	if (st.logging) {
+		printf("SWEET TOUCH: GPIO %u pa=0x%08x cfg: 0x%08x->0x%08x->0x%08x io: 0x%08x(in=%u,out=%u)->0x%08x(in=%u,out=%u)\\n",
+		    pin, touch_tlmm_pa(pin), old_cfg, cfg, new_cfg,
+		    old_io, old_io & 1u, (old_io >> 1) & 1u,
+		    io_val, io_val & 1u, (io_val >> 1) & 1u);
+	}
 }
 
 static bool
@@ -950,7 +952,7 @@ static void
 qup_dump_diag(const char *phase, const char *dir, uint8_t addr, unsigned len)
 {
 	bool is_err = qup_is_err_phase(phase);
-	if (!is_err && (st.qup_diag_quiet || st.diag_xfer > 4)) {
+	if (!is_err && (!st.logging || st.qup_diag_quiet || st.diag_xfer > 2)) {
 		return;
 	}
 	uint32_t cbcr = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) : 0;
@@ -1314,7 +1316,9 @@ synaptics_scan_pdt(void)
 	for (unsigned a = 0; a < sizeof(probe_addrs) / sizeof(probe_addrs[0]); a++) {
 		uint8_t addr = probe_addrs[a];
 		for (int retry = 0; retry < 5; retry++) {
-			printf("SWEET TOUCH: probing I2C addr 0x%02x (attempt %d)...\\n", addr, retry + 1);
+			if (st.logging) {
+				printf("SWEET TOUCH: probing I2C addr 0x%02x (attempt %d)...\\n", addr, retry + 1);
+			}
 			/* 1. Select page 0 by writing 0x00 to register 0xff */
 			err = qup_i2c_write_reg(addr, 0xffu, 0x00u);
 			if (!err) {
@@ -1323,8 +1327,10 @@ synaptics_scan_pdt(void)
 				int rerr = qup_i2c_read(addr, 0xffu, &page_rb, 1);
 				if (!rerr && page_rb == 0x00) {
 					st.i2c_addr = addr;
-					printf("SWEET TOUCH: Synaptics verified at I2C addr 0x%02x (page readback 0x%02x)\\n",
-					    addr, page_rb);
+					if (st.logging) {
+						printf("SWEET TOUCH: Synaptics verified at I2C addr 0x%02x (page readback 0x%02x)\\n",
+						    addr, page_rb);
+					}
 					err = 0;
 					break;
 				} else {
@@ -1390,8 +1396,10 @@ synaptics_scan_pdt(void)
 			irq_mask |= (uint8_t)(1u << irq_bit++);
 		}
 
-		printf("SWEET TOUCH: found F%02X @0x%02x q=0x%02x c=0x%02x ctrl=0x%02x d=0x%02x int=%u mask=0x%02x\\n",
-		    fn, addr, qbase, cbase, ctrlbase, dbase, int_cnt, irq_mask);
+		if (st.logging) {
+			printf("SWEET TOUCH: found F%02X @0x%02x q=0x%02x c=0x%02x ctrl=0x%02x d=0x%02x int=%u mask=0x%02x\\n",
+			    fn, addr, qbase, cbase, ctrlbase, dbase, int_cnt, irq_mask);
+		}
 
 		if (fn == 0x34u) {
 			st.f34_irq_mask = irq_mask;
@@ -1465,13 +1473,15 @@ synaptics_query_f12_table(uint8_t q_off, uint8_t *off_arr, unsigned arr_sz, cons
 		}
 	}
 
-	uint8_t p[8] = {0};
-	unsigned show = (pres_cnt < 8u) ? pres_cnt : 8u;
-	for (unsigned i = 0; i < show; i++) {
-		p[i] = qbuf[size_num_bytes + i];
+	if (st.logging) {
+		uint8_t p[8] = {0};
+		unsigned show = (pres_cnt < 8u) ? pres_cnt : 8u;
+		for (unsigned i = 0; i < show; i++) {
+			p[i] = qbuf[size_num_bytes + i];
+		}
+		printf("SWEET TOUCH: F12 %s pres sz=%u nb=%u regs=%u raw=%02x %02x %02x %02x %02x %02x\\n",
+		    label, size_pres, size_num_bytes, offset, p[0], p[1], p[2], p[3], p[4], p[5]);
 	}
-	printf("SWEET TOUCH: F12 %s pres sz=%u nb=%u regs=%u raw=%02x %02x %02x %02x %02x %02x\\n",
-	    label, size_pres, size_num_bytes, offset, p[0], p[1], p[2], p[3], p[4], p[5]);
 	return true;
 }
 
@@ -1480,7 +1490,9 @@ synaptics_query_f12_regs(void)
 {
 	uint8_t q0 = 0;
 	int err = qup_i2c_read(st.i2c_addr, st.f12_query_base, &q0, 1);
-	printf("SWEET TOUCH: F12 QUERY00=0x%02x err=%d (has_desc=%u)\\n", q0, err, q0 & 1u);
+	if (st.logging || err) {
+		printf("SWEET TOUCH: F12 QUERY00=0x%02x err=%d (has_desc=%u)\\n", q0, err, q0 & 1u);
+	}
 	if (err || !(q0 & 0x01u)) {
 		printf("SWEET TOUCH: F12 missing register descriptors, keeping defaults\\n");
 		st.f12_data_off[1] = 0u;
@@ -1495,10 +1507,12 @@ synaptics_query_f12_regs(void)
 		st.f12_data_off[1] = 0u;
 	}
 
-	printf("SWEET TOUCH: F12 off CTRL[08=%02x 20=%02x 23=%02x 26=%02x 27=%02x 28=%02x] DATA[00=%02x 01=%02x 04=%02x 15=%02x]\\n",
-	    st.f12_ctrl_off[8], st.f12_ctrl_off[20], st.f12_ctrl_off[23],
-	    st.f12_ctrl_off[26], st.f12_ctrl_off[27], st.f12_ctrl_off[28],
-	    st.f12_data_off[0], st.f12_data_off[1], st.f12_data_off[4], st.f12_data_off[15]);
+	if (st.logging) {
+		printf("SWEET TOUCH: F12 off CTRL[08=%02x 20=%02x 23=%02x 26=%02x 27=%02x 28=%02x] DATA[00=%02x 01=%02x 04=%02x 15=%02x]\\n",
+		    st.f12_ctrl_off[8], st.f12_ctrl_off[20], st.f12_ctrl_off[23],
+		    st.f12_ctrl_off[26], st.f12_ctrl_off[27], st.f12_ctrl_off[28],
+		    st.f12_data_off[0], st.f12_data_off[1], st.f12_data_off[4], st.f12_data_off[15]);
+	}
 
 	if (st.f12_ctrl_off[8] != 0xffu) {
 		uint8_t c8[4] = {0};
@@ -1544,9 +1558,11 @@ synaptics_query_f12_regs(void)
 		}
 	}
 
-	printf("SWEET TOUCH: F12 x_max=%u y_max=%u n_fingers=%u obj_bytes=%u c20=%02x/%02x/%02x c23=%02x/%02x/%02x c28=%02x\\n",
-	    st.x_max, st.y_max, st.n_fingers, st.n_bytes_per_obj,
-	    c20[0], c20[1], c20[2], c23[0], c23[1], c23[2], c28);
+	if (st.logging) {
+		printf("SWEET TOUCH: F12 x_max=%u y_max=%u n_fingers=%u obj_bytes=%u c20=%02x/%02x/%02x c23=%02x/%02x/%02x c28=%02x\\n",
+		    st.x_max, st.y_max, st.n_fingers, st.n_bytes_per_obj,
+		    c20[0], c20[1], c20[2], c23[0], c23[1], c23[2], c28);
+	}
 }
 
 static void
@@ -1572,8 +1588,10 @@ synaptics_config_f01(void)
 	(void)qup_i2c_read(st.i2c_addr, (uint8_t)(st.f01_ctrl_base + 1u), &c1_pre, 1);
 	(void)qup_i2c_read(st.i2c_addr, (uint8_t)(st.f01_ctrl_base + 2u), &c5_pre, 1);
 
-	printf("SWEET TOUCH: F01 q0=%02x/%02x/%02x/%02x prod='%s' irq=%u->ack(int=0x%02x)->%u dev=0x%02x\\n",
-	    q0[0], q0[1], q0[2], q0[3], pid, irq0, int_pre, irq1, dev_pre);
+	if (st.logging) {
+		printf("SWEET TOUCH: F01 q0=%02x/%02x/%02x/%02x prod='%s' irq=%u->ack(int=0x%02x)->%u dev=0x%02x\\n",
+		    q0[0], q0[1], q0[2], q0[3], pid, irq0, int_pre, irq1, dev_pre);
+	}
 
 	/* Match clearpad_initialize() + clearpad_set_resume_mode(): Normal + Configured, INT_EN=0x3f */
 	uint8_t c0_new = (uint8_t)((c0_pre & ~0x03u) | 0x80u);
@@ -1594,10 +1612,14 @@ synaptics_config_f01(void)
 	uint32_t irq2 = touch_irq_level();
 	st.last_irq_lvl = irq2;
 
-	printf("SWEET TOUCH: F01 CTRL c0=0x%02x->0x%02x(rb=0x%02x w=%d) c1=0x%02x->0x%02x(rb=0x%02x w=%d) c5=0x%02x\\n",
-	    c0_pre, c0_new, c0_rb, w0, c1_pre, c1_new, c1_rb, w1, c5_pre);
-	printf("SWEET TOUCH: F01 post-cfg dev=0x%02x int=0x%02x attn=0x%02x%02x irq=%u\\n",
-	    dev_post, int_post, attn[1], attn[0], irq2);
+	if (st.logging || w0 != 0 || w1 != 0) {
+		printf("SWEET TOUCH: F01 CTRL c0=0x%02x->0x%02x(rb=0x%02x w=%d) c1=0x%02x->0x%02x(rb=0x%02x w=%d) c5=0x%02x\\n",
+		    c0_pre, c0_new, c0_rb, w0, c1_pre, c1_new, c1_rb, w1, c5_pre);
+	}
+	if (st.logging) {
+		printf("SWEET TOUCH: F01 post-cfg dev=0x%02x int=0x%02x attn=0x%02x%02x irq=%u\\n",
+		    dev_post, int_post, attn[1], attn[0], irq2);
+	}
 }
 
 static void
@@ -1726,9 +1748,11 @@ synaptics_poll_touch(bool irq_asserted, bool any_down, bool force_f12)
 		bool was_down = st.down[i];
 		if (down != was_down) {
 			edge_event = true;
-			printf("SWEET TOUCH: t=%llu f%u %s t=0x%02x raw=%d,%d hid=%d,%d irq=%u->%u ist=0x%02x\\n",
-			    (unsigned long long)t_ms, i, down ? "DOWN" : "UP",
-			    raw_type, x, y, x_hid, y_hid, irq_pre, irq_end, istat);
+			if (st.logging) {
+				printf("SWEET TOUCH: t=%llu f%u %s t=0x%02x raw=%d,%d hid=%d,%d irq=%u->%u ist=0x%02x\\n",
+				    (unsigned long long)t_ms, i, down ? "DOWN" : "UP",
+				    raw_type, x, y, x_hid, y_hid, irq_pre, irq_end, istat);
+			}
 		} else if (st.logging && down && (x != st.x[i] || y != st.y[i])) {
 			int dx = x - st.x[i];
 			int dy = y - st.y[i];
@@ -1750,20 +1774,22 @@ synaptics_poll_touch(bool irq_asserted, bool any_down, bool force_f12)
 		}
 	}
 
-	bool has_activity = (istat != 0u) || (attn_mask != 0u) || edge_event;
-	bool log_pkt = (has_activity && (raw_logs < 24u || (st.logging && raw_logs < 48u && edge_event))) ||
-	    (!has_activity && irq_asserted && idle_irq_logs < 6u);
-	if (log_pkt) {
-		if (has_activity) {
-			raw_logs++;
-		} else {
-			idle_irq_logs++;
+	if (st.logging) {
+		bool has_activity = (istat != 0u) || (attn_mask != 0u) || edge_event;
+		bool log_pkt = (has_activity && (raw_logs < 24u || (raw_logs < 48u && edge_event))) ||
+		    (!has_activity && irq_asserted && idle_irq_logs < 6u);
+		if (log_pkt) {
+			if (has_activity) {
+				raw_logs++;
+			} else {
+				idle_irq_logs++;
+			}
+			printf("SWEET TOUCH: pkt#%u t=%llu irq=%u>%u>%u ist=%02x attn=%04x cnt=%u/%u s0=%02x%02x%02x%02x%02x%02x%02x%02x\\n",
+			    has_activity ? raw_logs : idle_irq_logs, (unsigned long long)t_ms,
+			    irq_pre, irq_ack, irq_end, istat, attn_mask, active_cnt, read_slots,
+			    report[0], report[1], report[2], report[3],
+			    report[4], report[5], report[6], report[7]);
 		}
-		printf("SWEET TOUCH: pkt#%u t=%llu irq=%u>%u>%u ist=%02x attn=%04x cnt=%u/%u s0=%02x%02x%02x%02x%02x%02x%02x%02x\\n",
-		    has_activity ? raw_logs : idle_irq_logs, (unsigned long long)t_ms,
-		    irq_pre, irq_ack, irq_end, istat, attn_mask, active_cnt, read_slots,
-		    report[0], report[1], report[2], report[3],
-		    report[4], report[5], report[6], report[7]);
 	}
 }
 
@@ -1822,12 +1848,16 @@ touch_thread(void *arg, wait_result_t result)
 		return;
 	}
 
-	touch_dump_pads("xboot-pre-init");
+	if (st.logging) {
+		touch_dump_pads("xboot-pre-init");
+	}
 
 	/* 4. Enable VDDIO power to touch controller on GPIO 133 (WEST tile, active-low per KDDI DTB/mdss_dsi_panel_driver) */
 	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, false);
 	touch_wait(20);
-	touch_dump_pads("post-vddio-gpio133");
+	if (st.logging) {
+		touch_dump_pads("post-vddio-gpio133");
+	}
 
 	/* 5. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 3 (blsp_i2c5) on EAST tile */
 	touch_gpio(TOUCH_PIN_SDA, 3u, 0, 0, false, false);
@@ -1846,24 +1876,28 @@ touch_thread(void *arg, wait_result_t result)
 	touch_gpio(TOUCH_PIN_RESET, 0, 0, 0, true, true);
 	touch_wait(1000);
 
-	printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x, IRQ=%u\\n",
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
-	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u);
+	if (st.logging) {
+		printf("SWEET TOUCH: SDA CFG=0x%08x, SCL CFG=0x%08x, RESET CFG=0x%08x, VDDIO CFG=0x%08x, IRQ=%u\\n",
+		    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
+		    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
+		    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
+		    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u),
+		    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u) & 1u);
+	}
 
 	/* 8. Program QUP I2C CLK_CTL for 355 kHz standard mode (fs_div=32=0x20, ht_div=16=0x10) */
 	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 	__asm__ volatile("dsb osh" ::: "memory");
-	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x MCFG=0x%08x\\n",
-	    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS),
-	    touch_rd(st.qup, QUP_I2C_MASTER_GEN));
-	printf("SWEET TOUCH: QUP5 HW_VER=0x%08x ERR_EN=0x%08x OP_MASK=0x%08x bitbang_recovery=disabled\\n",
-	    touch_rd(st.qup, QUP_HW_VERSION), touch_rd(st.qup, QUP_ERROR_FLAGS_EN),
-	    touch_rd(st.qup, QUP_OPERATIONAL_MASK));
-	touch_dump_pads("post-init");
+	if (st.logging) {
+		printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x MCFG=0x%08x\\n",
+		    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS),
+		    touch_rd(st.qup, QUP_I2C_MASTER_GEN));
+		printf("SWEET TOUCH: QUP5 HW_VER=0x%08x ERR_EN=0x%08x OP_MASK=0x%08x bitbang_recovery=disabled\\n",
+		    touch_rd(st.qup, QUP_HW_VERSION), touch_rd(st.qup, QUP_ERROR_FLAGS_EN),
+		    touch_rd(st.qup, QUP_OPERATIONAL_MASK));
+		touch_dump_pads("post-init");
+	}
 
 	if (!synaptics_scan_pdt()) {
 		printf("SWEET TOUCH: Synaptics probe failed\\n");
@@ -1874,15 +1908,16 @@ touch_thread(void *arg, wait_result_t result)
 	synaptics_query_f12_regs();
 	synaptics_config_f01();
 	st.qup_diag_quiet = true;
-	printf("SWEET TOUCH: Synaptics ClearPad S332U ready (polling @10ms, irq=%u)\\n",
-	    st.last_irq_lvl);
+	printf("SWEET TOUCH: Synaptics ClearPad S332U ready (%ux%u, fingers=%u, addr=0x%02x, irq=%u)\\n",
+	    (unsigned)st.x_max + 1u, (unsigned)st.y_max + 1u,
+	    st.n_fingers, st.i2c_addr, st.last_irq_lvl);
 
 	unsigned ticks = 0;
 	unsigned irq_edge_logs = 0;
 	while (!st.dead) {
 		uint32_t pin_in = touch_irq_level();
 		if (pin_in != st.last_irq_lvl) {
-			if (irq_edge_logs < 24u) {
+			if (st.logging && irq_edge_logs < 24u) {
 				irq_edge_logs++;
 				printf("SWEET TOUCH: t=%llu IRQ GPIO125 %u->%u\\n",
 				    (unsigned long long)touch_uptime_ms(), st.last_irq_lvl, pin_in);

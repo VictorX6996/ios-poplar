@@ -527,6 +527,7 @@ struct poplar_touch_state {
 	bool dead;
 	int logging;
 	unsigned diag_xfer;
+	uint32_t diag_seq;
 	bool down[TOUCH_MAX];
 	int x[TOUCH_MAX];
 	int y[TOUCH_MAX];
@@ -559,36 +560,101 @@ touch_wait(unsigned ms)
 	thread_block(THREAD_CONTINUE_NULL);
 }
 
+static vm_offset_t
+touch_tlmm_base(unsigned pin)
+{
+	return (pin == TOUCH_PIN_VDDIO) ? st.gpio_west : st.gpio_east;
+}
+
+static uint32_t
+touch_tlmm_pa(unsigned pin)
+{
+	uint32_t tile_pa = (pin == TOUCH_PIN_VDDIO) ? TLMM_WEST_PA : TLMM_EAST_PA;
+	return tile_pa + (uint32_t)pin * 0x1000u;
+}
+
+static const char *
+touch_tlmm_tile(unsigned pin)
+{
+	return (pin == TOUCH_PIN_VDDIO) ? "WEST" : "EAST";
+}
+
+struct qup_tlmm_snap {
+	uint32_t seq;
+	uint64_t ticks;
+	uint32_t sta;
+	uint32_t op;
+	uint32_t err;
+	uint32_t i2c_st;
+	uint32_t sda_cfg;
+	uint32_t sda_io;
+	uint32_t scl_cfg;
+	uint32_t scl_io;
+};
+
+/* Capture QUP and SDA/SCL TLMM registers without interleaved console prints. */
+static void
+touch_snap_capture(struct qup_tlmm_snap *s)
+{
+	s->seq = ++st.diag_seq;
+	s->ticks = mach_absolute_time();
+	s->sta = touch_rd(st.qup, QUP_STATE);
+	s->op = touch_rd(st.qup, QUP_OPERATIONAL);
+	s->err = touch_rd(st.qup, QUP_ERROR_FLAGS);
+	s->i2c_st = touch_rd(st.qup, QUP_I2C_STATUS);
+	s->sda_cfg = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u);
+	s->sda_io = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u + 4u);
+	s->scl_cfg = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u);
+	s->scl_io = touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u + 4u);
+}
+
+static void
+touch_snap_print(const char *tag, const struct qup_tlmm_snap *s)
+{
+	printf("SWEET TOUCH: [chk:%s] seq=%u ticks=%llu STA=0x%08x I2C_ST=0x%08x(sda=%u scl=%u)\\n",
+	    tag, s->seq, (unsigned long long)s->ticks, s->sta, s->i2c_st,
+	    (s->i2c_st >> 26) & 1u, (s->i2c_st >> 27) & 1u);
+	printf("SWEET TOUCH:   [chk:%s] GPIO87 pa=0x%08x cfg=0x%08x io=0x%08x in=%u out=%u\\n",
+	    tag, touch_tlmm_pa(TOUCH_PIN_SDA), s->sda_cfg, s->sda_io,
+	    s->sda_io & 1u, (s->sda_io >> 1) & 1u);
+	printf("SWEET TOUCH:   [chk:%s] GPIO88 pa=0x%08x cfg=0x%08x io=0x%08x in=%u out=%u\\n",
+	    tag, touch_tlmm_pa(TOUCH_PIN_SCL), s->scl_cfg, s->scl_io,
+	    s->scl_io & 1u, (s->scl_io >> 1) & 1u);
+}
+
 static void
 touch_dump_pads(const char *tag)
 {
-	printf("SWEET TOUCH PADS [%s]:\\n", tag);
-	printf("  SDA_GPIO=%u CFG=0x%08x IN=0x%08x\\n",
-	    TOUCH_PIN_SDA,
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u + 4u));
-	printf("  SCL_GPIO=%u CFG=0x%08x IN=0x%08x\\n",
-	    TOUCH_PIN_SCL,
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u + 4u));
-	printf("  IRQ_GPIO=%u CFG=0x%08x IN=0x%08x\\n",
-	    TOUCH_PIN_IRQ,
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u));
-	printf("  RESET_GPIO=%u CFG=0x%08x IN=0x%08x\\n",
-	    TOUCH_PIN_RESET,
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
-	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u + 4u));
-	printf("  VDDIO_GPIO=%u CFG=0x%08x IN=0x%08x\\n",
-	    TOUCH_PIN_VDDIO,
-	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u),
-	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u + 4u));
+	static const struct {
+		const char *name;
+		unsigned pin;
+	} pads[] = {
+		{ "SDA", TOUCH_PIN_SDA },
+		{ "SCL", TOUCH_PIN_SCL },
+		{ "IRQ", TOUCH_PIN_IRQ },
+		{ "RESET", TOUCH_PIN_RESET },
+		{ "VDDIO", TOUCH_PIN_VDDIO },
+	};
+	uint64_t ticks = mach_absolute_time();
+	uint32_t seq = ++st.diag_seq;
+	printf("SWEET TOUCH PADS [%s] seq=%u ticks=%llu:\\n",
+	    tag, seq, (unsigned long long)ticks);
+	for (unsigned i = 0; i < sizeof(pads) / sizeof(pads[0]); i++) {
+		unsigned pin = pads[i].pin;
+		vm_offset_t base = touch_tlmm_base(pin);
+		uint32_t off = (uint32_t)pin * 0x1000u;
+		uint32_t cfg = touch_rd(base, off);
+		uint32_t io = touch_rd(base, off + 4u);
+		printf("  %s_GPIO=%u tile=%s pa=0x%08x cfg=0x%08x io=0x%08x in=%u out=%u\\n",
+		    pads[i].name, pin, touch_tlmm_tile(pin), touch_tlmm_pa(pin),
+		    cfg, io, io & 1u, (io >> 1) & 1u);
+	}
 }
 
 static void
 touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
 {
-	vm_offset_t base = (pin == TOUCH_PIN_VDDIO) ? st.gpio_west : st.gpio_east;
+	vm_offset_t base = touch_tlmm_base(pin);
 	uint32_t off = (uint32_t)pin * 0x1000u;
 	uint32_t io_off = off + 4u;
 
@@ -602,8 +668,10 @@ touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, 
 	touch_wr(base, off, cfg);
 	uint32_t new_cfg = touch_rd(base, off);
 	uint32_t io_val = touch_rd(base, io_off);
-	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io: 0x%08x -> 0x%08x\\n",
-	    pin, old_cfg, cfg, new_cfg, old_io, io_val);
+	printf("SWEET TOUCH: GPIO %u pa=0x%08x cfg: 0x%08x->0x%08x->0x%08x io: 0x%08x(in=%u,out=%u)->0x%08x(in=%u,out=%u)\\n",
+	    pin, touch_tlmm_pa(pin), old_cfg, cfg, new_cfg,
+	    old_io, old_io & 1u, (old_io >> 1) & 1u,
+	    io_val, io_val & 1u, (io_val >> 1) & 1u);
 }
 
 static bool
@@ -725,23 +793,35 @@ qup_set_state(uint32_t state)
 		    state, touch_rd(st.qup, QUP_STATE));
 		return false;
 	}
-	uint32_t pre_sta = touch_rd(st.qup, QUP_STATE);
-	if ((pre_sta & QUP_STATE_MASK) == state) {
+	uint32_t cur_sta = touch_rd(st.qup, QUP_STATE);
+	if ((cur_sta & QUP_STATE_MASK) == state) {
 		return true;
 	}
+	bool want_snap = (st.logging && st.diag_xfer <= 2);
 	uint32_t pre_cfg = touch_rd(st.qup, QUP_CONFIG);
-	uint32_t pre_op = touch_rd(st.qup, QUP_OPERATIONAL);
-	uint32_t pre_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
-	uint32_t pre_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
 	uint32_t pre_mcfg = touch_rd(st.qup, QUP_I2C_MASTER_GEN);
 	uint32_t pre_cbcr = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) : 0;
 
+	struct qup_tlmm_snap pre = {0}, imm = {0}, post = {0};
+	if (want_snap) {
+		touch_snap_capture(&pre);
+	} else {
+		pre.sta = cur_sta;
+		pre.op = touch_rd(st.qup, QUP_OPERATIONAL);
+		pre.err = touch_rd(st.qup, QUP_ERROR_FLAGS);
+		pre.i2c_st = touch_rd(st.qup, QUP_I2C_STATUS);
+	}
+
 	/* 1. Direct state write (standard Qualcomm QUP method) */
 	touch_wr(st.qup, QUP_STATE, state & QUP_STATE_MASK);
-	uint32_t imm_sta = touch_rd(st.qup, QUP_STATE);
-	uint32_t imm_op = touch_rd(st.qup, QUP_OPERATIONAL);
-	uint32_t imm_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
-	uint32_t imm_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
+	if (want_snap) {
+		touch_snap_capture(&imm);
+	} else {
+		imm.sta = touch_rd(st.qup, QUP_STATE);
+		imm.op = touch_rd(st.qup, QUP_OPERATIONAL);
+		imm.err = touch_rd(st.qup, QUP_ERROR_FLAGS);
+		imm.i2c_st = touch_rd(st.qup, QUP_I2C_STATUS);
+	}
 
 	int poll_checks = 0;
 	int poll_delays = 0;
@@ -763,7 +843,7 @@ qup_set_state(uint32_t state)
 
 	if (!success) {
 		/* 2. Try with preserved upper bits */
-		touch_wr(st.qup, QUP_STATE, (pre_sta & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
+		touch_wr(st.qup, QUP_STATE, (pre.sta & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
 		for (int i = 0; i < 50000; i++) {
 			uint32_t s = touch_rd(st.qup, QUP_STATE);
 			poll_checks++;
@@ -778,13 +858,9 @@ qup_set_state(uint32_t state)
 		}
 	}
 
-	uint32_t post_sta = touch_rd(st.qup, QUP_STATE);
-	uint32_t post_op = touch_rd(st.qup, QUP_OPERATIONAL);
-	uint32_t post_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
-	uint32_t post_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
-
-	if (st.logging && st.diag_xfer <= 2) {
-		uint32_t diff = pre_i2c ^ post_i2c;
+	if (want_snap) {
+		touch_snap_capture(&post);
+		uint32_t diff = pre.i2c_st ^ post.i2c_st;
 		char bits_buf[96];
 		format_changed_bits(diff, bits_buf, sizeof(bits_buf));
 
@@ -792,11 +868,27 @@ qup_set_state(uint32_t state)
 		    state, success ? 0 : -1, state & QUP_STATE_MASK,
 		    poll_checks, poll_delays, pre_cfg, pre_mcfg, pre_cbcr);
 		printf("SWEET TOUCH:   pre(STA=0x%08x OP=0x%08x ERR=0x%08x) imm(STA=0x%08x OP=0x%08x ERR=0x%08x I2C=0x%08x)\\n",
-		    pre_sta, pre_op, pre_err, imm_sta, imm_op, imm_err, imm_i2c);
+		    pre.sta, pre.op, pre.err, imm.sta, imm.op, imm.err, imm.i2c_st);
 		printf("SWEET TOUCH:   valid(STA=0x%08x I2C=0x%08x) post(STA=0x%08x OP=0x%08x ERR=0x%08x)\\n",
-		    valid_sta, valid_i2c, post_sta, post_op, post_err);
+		    valid_sta, valid_i2c, post.sta, post.op, post.err);
 		printf("SWEET TOUCH:   I2C_ST_PRE=0x%08x I2C_ST_POST=0x%08x I2C_ST_CHANGED=0x%08x I2C_ST_CHANGED_BITS=%s\\n",
-		    pre_i2c, post_i2c, diff, bits_buf);
+		    pre.i2c_st, post.i2c_st, diff, bits_buf);
+		if (state == QUP_RUN_STATE) {
+			uint32_t prev_st = pre.sta & QUP_STATE_MASK;
+			if (prev_st == QUP_RESET_STATE) {
+				touch_snap_print("pre-run1", &pre);
+				touch_snap_print("imm-run1", &imm);
+				touch_snap_print("post-run1", &post);
+			} else if (prev_st == QUP_PAUSE_STATE) {
+				touch_snap_print("pre-run2", &pre);
+				touch_snap_print("imm-run2", &imm);
+				touch_snap_print("post-run2", &post);
+			} else {
+				touch_snap_print("pre-run", &pre);
+				touch_snap_print("imm-run", &imm);
+				touch_snap_print("post-run", &post);
+			}
+		}
 	}
 
 	if (!success) {
@@ -1352,6 +1444,7 @@ touch_thread(void *arg, wait_result_t result)
 	/* 4. Enable VDDIO power to touch controller on GPIO 133 (WEST tile) */
 	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 	touch_wait(20);
+	touch_dump_pads("post-vddio-gpio133");
 
 	/* 5. Configure GPIO 87 (SDA) and GPIO 88 (SCL) to function 3 (blsp_i2c5) on EAST tile */
 	touch_gpio(TOUCH_PIN_SDA, 3u, 0, 0, false, false);

@@ -448,7 +448,7 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 #define TOUCH_PIN_SCL                   88u  /* EAST tile, mux 3 (blsp_i2c5) */
 #define TOUCH_PIN_RESET                 89u  /* EAST tile, mux 0 (gpio out, active-low) */
 #define TOUCH_PIN_IRQ                   125u /* EAST tile, mux 0 (gpio in, active-low, pull-up) */
-#define TOUCH_PIN_VDDIO                 133u /* WEST tile, mux 0 (gpio out, high) */
+#define TOUCH_PIN_VDDIO                 133u /* WEST tile, mux 0 (gpio out, low) */
 
 /* QUP v2 Registers */
 #define QUP_CONFIG                      0x000u
@@ -1441,8 +1441,8 @@ touch_thread(void *arg, wait_result_t result)
 
 	touch_dump_pads("xboot-pre-init");
 
-	/* 4. Enable VDDIO power to touch controller on GPIO 133 (WEST tile) */
-	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
+	/* 4. Enable VDDIO power to touch controller on GPIO 133 (WEST tile, active-low per KDDI DTB/mdss_dsi_panel_driver) */
+	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, false);
 	touch_wait(20);
 	touch_dump_pads("post-vddio-gpio133");
 

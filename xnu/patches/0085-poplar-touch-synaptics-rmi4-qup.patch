@@ -63,7 +63,7 @@ new file mode 100644
 index 0000000..f34a5d8
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_touch.c
-@@ -0,0 +1,1288 @@
+@@ -0,0 +1,1369 @@
 +/*
 + * poplar (Sony Xperia XZ1 / MSM8998): Synaptics ClearPad S332U touch on
 + * BLSP1 QUP5 I2C (base 0x0c179000). Active-low IRQ/ATTN on TLMM GPIO 125,
@@ -556,15 +556,41 @@ index 0000000..f34a5d8
 +}
 +
 +static void
++touch_dump_pads(const char *tag)
++{
++	printf("SWEET TOUCH PADS [%s]:\n", tag);
++	printf("  SDA_GPIO=%u CFG=0x%08x IN=0x%08x\n",
++	    TOUCH_PIN_SDA,
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SDA * 0x1000u + 4u));
++	printf("  SCL_GPIO=%u CFG=0x%08x IN=0x%08x\n",
++	    TOUCH_PIN_SCL,
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_SCL * 0x1000u + 4u));
++	printf("  IRQ_GPIO=%u CFG=0x%08x IN=0x%08x\n",
++	    TOUCH_PIN_IRQ,
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_IRQ * 0x1000u + 4u));
++	printf("  RESET_GPIO=%u CFG=0x%08x IN=0x%08x\n",
++	    TOUCH_PIN_RESET,
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u),
++	    touch_rd(st.gpio_east, (uint32_t)TOUCH_PIN_RESET * 0x1000u + 4u));
++	printf("  VDDIO_GPIO=%u CFG=0x%08x IN=0x%08x\n",
++	    TOUCH_PIN_VDDIO,
++	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u),
++	    touch_rd(st.gpio_west, (uint32_t)TOUCH_PIN_VDDIO * 0x1000u + 4u));
++}
++
++static void
 +touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
 +{
 +	vm_offset_t base = (pin == TOUCH_PIN_VDDIO) ? st.gpio_west : st.gpio_east;
 +	uint32_t off = (uint32_t)pin * 0x1000u;
 +	uint32_t io_off = off + 4u;
 +
++	uint32_t old_io = touch_rd(base, io_off);
 +	if (out) {
-+		uint32_t io = touch_rd(base, io_off);
-+		touch_wr(base, io_off, (io & ~2u) | (high ? 2u : 0u));
++		touch_wr(base, io_off, (old_io & ~2u) | (high ? 2u : 0u));
 +	}
 +	uint32_t old_cfg = touch_rd(base, off);
 +	uint32_t cfg = old_cfg & ~0x3ffu;
@@ -572,8 +598,8 @@ index 0000000..f34a5d8
 +	touch_wr(base, off, cfg);
 +	uint32_t new_cfg = touch_rd(base, off);
 +	uint32_t io_val = touch_rd(base, io_off);
-+	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io=0x%08x\n",
-+	    pin, old_cfg, cfg, new_cfg, io_val);
++	printf("SWEET TOUCH: GPIO %u cfg: 0x%08x -> wr 0x%08x -> rd 0x%08x io: 0x%08x -> 0x%08x\n",
++	    pin, old_cfg, cfg, new_cfg, old_io, io_val);
 +}
 +
 +static bool
@@ -667,64 +693,106 @@ index 0000000..f34a5d8
 +	return false;
 +}
 +
++static void
++format_changed_bits(uint32_t diff, char *buf, size_t buf_sz)
++{
++	if (diff == 0) {
++		snprintf(buf, buf_sz, "none");
++		return;
++	}
++	size_t pos = 0;
++	for (unsigned b = 0; b < 32; b++) {
++		if (diff & (1u << b)) {
++			int n = snprintf(buf + pos, buf_sz - pos,
++			    pos ? ",%u" : "%u", b);
++			if (n <= 0 || (size_t)n >= buf_sz - pos) {
++				break;
++			}
++			pos += (size_t)n;
++		}
++	}
++}
++
 +static bool
 +qup_set_state(uint32_t state)
 +{
-+	uint32_t pre_sta = touch_rd(st.qup, QUP_STATE);
-+	uint32_t pre_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
-+	uint32_t pre_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
-+	uint32_t pre_cbcr = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) : 0;
-+
 +	if (!qup_wait_state_valid()) {
 +		printf("SWEET TOUCH: qup_set_state(%u): wait valid timed out (state=0x%08x)\n",
 +		    state, touch_rd(st.qup, QUP_STATE));
 +		return false;
 +	}
-+	uint32_t cur = touch_rd(st.qup, QUP_STATE);
-+	if ((cur & QUP_STATE_MASK) == state) {
++	uint32_t pre_sta = touch_rd(st.qup, QUP_STATE);
++	if ((pre_sta & QUP_STATE_MASK) == state) {
 +		return true;
 +	}
++	uint32_t pre_cfg = touch_rd(st.qup, QUP_CONFIG);
++	uint32_t pre_op = touch_rd(st.qup, QUP_OPERATIONAL);
++	uint32_t pre_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
++	uint32_t pre_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
++	uint32_t pre_mcfg = touch_rd(st.qup, QUP_I2C_MASTER_GEN);
++	uint32_t pre_cbcr = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) : 0;
++
 +	/* 1. Direct state write (standard Qualcomm QUP method) */
 +	touch_wr(st.qup, QUP_STATE, state & QUP_STATE_MASK);
 +	uint32_t imm_sta = touch_rd(st.qup, QUP_STATE);
++	uint32_t imm_op = touch_rd(st.qup, QUP_OPERATIONAL);
 +	uint32_t imm_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
 +	uint32_t imm_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
 +
-+	int poll_cnt = 0;
++	int poll_checks = 0;
++	int poll_delays = 0;
++	uint32_t valid_sta = 0;
++	uint32_t valid_i2c = 0;
 +	bool success = false;
-+	for (poll_cnt = 0; poll_cnt < 50000; poll_cnt++) {
++	for (int i = 0; i < 50000; i++) {
 +		uint32_t s = touch_rd(st.qup, QUP_STATE);
++		poll_checks++;
 +		if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
++			valid_sta = s;
++			valid_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
 +			success = true;
 +			break;
 +		}
++		poll_delays++;
 +		delay(2);
 +	}
 +
 +	if (!success) {
 +		/* 2. Try with preserved upper bits */
-+		touch_wr(st.qup, QUP_STATE, (cur & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
-+		for (poll_cnt = 0; poll_cnt < 50000; poll_cnt++) {
++		touch_wr(st.qup, QUP_STATE, (pre_sta & ~QUP_STATE_MASK) | (state & QUP_STATE_MASK));
++		for (int i = 0; i < 50000; i++) {
 +			uint32_t s = touch_rd(st.qup, QUP_STATE);
++			poll_checks++;
 +			if ((s & QUP_STATE_VALID) && ((s & QUP_STATE_MASK) == state)) {
++				valid_sta = s;
++				valid_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
 +				success = true;
 +				break;
 +			}
++			poll_delays++;
 +			delay(2);
 +		}
 +	}
 +
 +	uint32_t post_sta = touch_rd(st.qup, QUP_STATE);
++	uint32_t post_op = touch_rd(st.qup, QUP_OPERATIONAL);
 +	uint32_t post_i2c = touch_rd(st.qup, QUP_I2C_STATUS);
 +	uint32_t post_err = touch_rd(st.qup, QUP_ERROR_FLAGS);
 +
 +	if (st.logging && st.diag_xfer <= 2) {
-+		printf("SWEET TOUCH: [state->%u] pre(STA=0x%08x I2C=0x%08x ERR=0x%08x CBCR=0x%08x) wr=%u imm(STA=0x%08x I2C=0x%08x ERR=0x%08x) polls=%d post(STA=0x%08x I2C=0x%08x ERR=0x%08x)\n",
-+		    state, pre_sta, pre_i2c, pre_err, pre_cbcr,
-+		    state & QUP_STATE_MASK,
-+		    imm_sta, imm_i2c, imm_err,
-+		    poll_cnt,
-+		    post_sta, post_i2c, post_err);
++		uint32_t diff = pre_i2c ^ post_i2c;
++		char bits_buf[96];
++		format_changed_bits(diff, bits_buf, sizeof(bits_buf));
++
++		printf("SWEET TOUCH: [state->%u ret=%d] wr=%u checks=%d delays=%d CFG=0x%08x MCFG=0x%08x CBCR=0x%08x\n",
++		    state, success ? 0 : -1, state & QUP_STATE_MASK,
++		    poll_checks, poll_delays, pre_cfg, pre_mcfg, pre_cbcr);
++		printf("SWEET TOUCH:   pre(STA=0x%08x OP=0x%08x ERR=0x%08x) imm(STA=0x%08x OP=0x%08x ERR=0x%08x I2C=0x%08x)\n",
++		    pre_sta, pre_op, pre_err, imm_sta, imm_op, imm_err, imm_i2c);
++		printf("SWEET TOUCH:   valid(STA=0x%08x I2C=0x%08x) post(STA=0x%08x OP=0x%08x ERR=0x%08x)\n",
++		    valid_sta, valid_i2c, post_sta, post_op, post_err);
++		printf("SWEET TOUCH:   I2C_ST_PRE=0x%08x I2C_ST_POST=0x%08x I2C_ST_CHANGED=0x%08x I2C_ST_CHANGED_BITS=%s\n",
++		    pre_i2c, post_i2c, diff, bits_buf);
 +	}
 +
 +	if (!success) {
@@ -741,32 +809,42 @@ index 0000000..f34a5d8
 +	if (!st.logging && st.diag_xfer >= 4) {
 +		return;
 +	}
-+	uint32_t sda_pad = (st.gpio_east) ? (touch_rd(st.gpio_east, 87u * 0x1000u + 4u) & 1u) : 0;
-+	uint32_t scl_pad = (st.gpio_east) ? (touch_rd(st.gpio_east, 88u * 0x1000u + 4u) & 1u) : 0;
-+	uint32_t irq_pad = (st.gpio_east) ? (touch_rd(st.gpio_east, 125u * 0x1000u + 4u) & 1u) : 0;
-+	uint32_t rst_pad = (st.gpio_east) ? (touch_rd(st.gpio_east, 89u * 0x1000u + 4u) & 1u) : 0;
 +	uint32_t cbcr = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CBCR) : 0;
 +	uint32_t rcgr_cmd = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CMD_RCGR) : 0;
 +	uint32_t rcgr_cfg = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_QUP5_I2C_APPS_CFG_RCGR) : 0;
 +	uint32_t ahb = (st.gcc) ? touch_rd(st.gcc, GCC_BLSP1_AHB_CBCR) : 0;
 +
-+	printf("SWEET TOUCH: [%s %s 0x%02x len=%u] CFG=0x%08x STA=0x%08x IO=0x%08x MX_OUT=%u MX_WR=%u MX_IN=%u MX_RD=%u OUT_F=%u IN_F=%u OP=0x%08x I2C_ST=0x%08x ERR=0x%08x CLK=0x%08x CBCR=0x%08x RCG=0x%08x/0x%08x AHB=0x%08x PADS=(SDA:%u SCL:%u IRQ:%u RST:%u)\n",
++	printf("SWEET TOUCH: [%s %s 0x%02x len=%u] CFG=0x%08x STA=0x%08x IO=0x%08x MCFG=0x%08x OP=0x%08x I2C_ST=0x%08x ERR=0x%08x\n",
 +	    phase, dir, addr, len,
 +	    touch_rd(st.qup, QUP_CONFIG),
 +	    touch_rd(st.qup, QUP_STATE),
 +	    touch_rd(st.qup, QUP_IO_MODE),
++	    touch_rd(st.qup, QUP_I2C_MASTER_GEN),
++	    touch_rd(st.qup, QUP_OPERATIONAL),
++	    touch_rd(st.qup, QUP_I2C_STATUS),
++	    touch_rd(st.qup, QUP_ERROR_FLAGS));
++	printf("SWEET TOUCH:   CNT(OUT=%u WR=%u IN=%u RD=%u FIFO=%u/%u) CLK=0x%08x CBCR=0x%08x RCG_CMD=0x%08x RCG_CFG=0x%08x AHB=0x%08x\n",
 +	    touch_rd(st.qup, QUP_MX_OUTPUT_CNT),
 +	    touch_rd(st.qup, QUP_MX_WRITE_CNT),
 +	    touch_rd(st.qup, QUP_MX_INPUT_CNT),
 +	    touch_rd(st.qup, QUP_MX_READ_CNT),
 +	    touch_rd(st.qup, QUP_OUT_FIFO_CNT),
 +	    touch_rd(st.qup, QUP_IN_FIFO_CNT),
-+	    touch_rd(st.qup, QUP_OPERATIONAL),
-+	    touch_rd(st.qup, QUP_I2C_STATUS),
-+	    touch_rd(st.qup, QUP_ERROR_FLAGS),
 +	    touch_rd(st.qup, QUP_I2C_CLK_CTL),
-+	    cbcr, rcgr_cmd, rcgr_cfg, ahb,
-+	    sda_pad, scl_pad, irq_pad, rst_pad);
++	    cbcr, rcgr_cmd, rcgr_cfg, ahb);
++
++	bool is_pre_reset = (strncmp(phase, "pre-reset", 9) == 0);
++	bool is_key_phase = is_pre_reset ||
++	    (strncmp(phase, "configured", 10) == 0) ||
++	    (strncmp(phase, "post-run1", 9) == 0) ||
++	    (strncmp(phase, "post-run2", 9) == 0) ||
++	    (strncmp(phase, "err-status", 10) == 0) ||
++	    (strncmp(phase, "completed", 9) == 0) ||
++	    (strncmp(phase, "timeout", 7) == 0);
++	if (st.gpio_east && st.gpio_west &&
++	    ((st.diag_xfer <= 2 && is_key_phase) || is_pre_reset)) {
++		touch_dump_pads(phase);
++	}
 +}
 +
 +static bool
@@ -1265,6 +1343,8 @@ index 0000000..f34a5d8
 +		return;
 +	}
 +
++	touch_dump_pads("xboot-pre-init");
++
 +	/* 4. Enable VDDIO power to touch controller on GPIO 133 (WEST tile) */
 +	touch_gpio(TOUCH_PIN_VDDIO, 0, 0, 0, true, true);
 +	touch_wait(20);
@@ -1297,12 +1377,13 @@ index 0000000..f34a5d8
 +	touch_wr(st.qup, QUP_I2C_CLK_CTL, QUP_I2C_CLK_CTL_355KHZ);
 +	touch_wr(st.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
 +	__asm__ volatile("dsb osh" ::: "memory");
-+	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x MGEN=0x%08x\n",
++	printf("SWEET TOUCH: QUP5 I2C CLK_CTL=0x%08x STATUS=0x%08x MCFG=0x%08x\n",
 +	    touch_rd(st.qup, QUP_I2C_CLK_CTL), touch_rd(st.qup, QUP_I2C_STATUS),
 +	    touch_rd(st.qup, QUP_I2C_MASTER_GEN));
-+	printf("SWEET TOUCH: QUP5 HW_VER=0x%08x ERR_EN=0x%08x OP_MASK=0x%08x\n",
++	printf("SWEET TOUCH: QUP5 HW_VER=0x%08x ERR_EN=0x%08x OP_MASK=0x%08x bitbang_recovery=disabled\n",
 +	    touch_rd(st.qup, QUP_HW_VERSION), touch_rd(st.qup, QUP_ERROR_FLAGS_EN),
 +	    touch_rd(st.qup, QUP_OPERATIONAL_MASK));
++	touch_dump_pads("post-init");
 +
 +	if (!synaptics_scan_pdt()) {
 +		printf("SWEET TOUCH: Synaptics probe failed\n");

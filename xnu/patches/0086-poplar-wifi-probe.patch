@@ -1,0 +1,490 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_poplar_touch.c		standard
++bsd/dev/sweet_poplar_wifi_probe.c	standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_poplar_touch_init(void);
++extern void sweet_poplar_wifi_probe(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -667,6 +668,7 @@
+ 	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
+ 	sweet_keys_init();
+ 	sweet_poplar_touch_init();
++	sweet_poplar_wifi_probe();
+ 	if (hw == 1) {
+ 		sweet_touch_init();
+ 		sweet_usb_probe();
+diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_poplar_wifi_probe.c
+@@ -0,0 +1,455 @@
++/*
++ * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
++ *
++ * Controlled by boot-args:
++ *   wifiprobe=0 (default): Completely dormant; normal boot path untouched.
++ *   wifiprobe=1: Level 1 non-invasive read-only diagnostic probe of:
++ *                1. SMEM TOC (0x861ff000)
++ *                2. SMMU ANOC2 capabilities and SMR scan (0x016c0000)
++ *                3. SPMI v3 Arbiter APID mapping (0x0800f000 / 0x0800a000)
++ *                4. RPM GLINK Message RAM TOC (0x00778000)
++ *   wifiprobe_spmi=1 (optional): Enables SPMI observer read transaction for
++ *                PM8998 GPIO3 (disabled by default until locking is unified).
++ *
++ * Safety Boundaries:
++ *   - Zero writes to SMMU registers, context banks, or translation tables.
++ *   - Zero writes to PMIC peripheral registers (no power rail / GPIO changes).
++ *   - Zero access to unclocked MMIO (WCSS 0x18800000 and MSS/RMB 0x04180000
++ *     are strictly excluded).
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <sys/types.h>
++#include <mach/vm_types.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void delay(int usec);
++
++/*
++ * Verified Base Addresses from Poplar Device Tree (dtb/live.dtb)
++ */
++#define POPLAR_SMEM_TOC_PA      0x861ff000u   /* Last 4KB of 2MB SMEM region */
++#define POPLAR_SMMU_ANOC2_PA    0x016c0000u   /* /soc/arm,smmu-anoc2@16c0000 */
++#define POPLAR_SPMI_CORE_PA     0x0800f000u   /* /soc/qcom,spmi@800f000 'core' */
++#define POPLAR_SPMI_CNFG_PA     0x0800a000u   /* /soc/qcom,spmi@800f000 'cnfg' */
++#define POPLAR_SPMI_OBS_PA      0x09400000u   /* /soc/qcom,spmi@800f000 'obsrvr' */
++#define POPLAR_RPM_MSGRAM_PA    0x00778000u   /* /soc/qcom,glink-rpm 'aux-mem1' (28KB) */
++
++/*
++ * ARM SMMUv2 Architecture Register Offsets (ARM IHI 0062D)
++ */
++#define ARM_SMMU_GR0_sCR0       0x0000u
++#define ARM_SMMU_GR0_IDR0       0x0020u
++#define ARM_SMMU_GR0_IDR1       0x0024u
++#define ARM_SMMU_GR0_IDR2       0x0028u
++#define ARM_SMMU_GR0_SMR_BASE   0x0800u
++#define ARM_SMMU_GR0_S2CR_BASE  0x0c00u
++
++/* SMMUv2 IDR0 Bitfields */
++#define SMMU_IDR0_NUMSMRG_MASK  0x000000ffu   /* bits [7:0]: Num SMR groups */
++#define SMMU_IDR0_NUMSIDB_SHIFT 9
++#define SMMU_IDR0_NUMSIDB_MASK  0x0000000fu   /* bits [12:9]: Num StreamID bits */
++#define SMMU_IDR0_BTM           (1u << 13)    /* bit 13: Broadcast TLB maint */
++#define SMMU_IDR0_CTTW          (1u << 14)    /* bit 14: Coherent walk */
++#define SMMU_IDR0_NUMIRPT_SHIFT 16
++#define SMMU_IDR0_NUMIRPT_MASK  0x000000ffu   /* bits [23:16]: Num interrupt lines */
++#define SMMU_IDR0_SMS           (1u << 27)    /* bit 27: Stream Match Support */
++#define SMMU_IDR0_NTS           (1u << 28)    /* bit 28: Nested translation */
++#define SMMU_IDR0_S2TS          (1u << 29)    /* bit 29: Stage 2 translation */
++#define SMMU_IDR0_S1TS          (1u << 30)    /* bit 30: Stage 1 translation */
++
++/* SMMUv2 IDR1 Bitfields */
++#define SMMU_IDR1_NUMCB_MASK    0x000000ffu   /* bits [7:0]: Total Context Banks */
++#define SMMU_IDR1_SMCD          (1u << 15)    /* bit 15: Stream Match Disable */
++#define SMMU_IDR1_NUMS2CB_SHIFT 16
++#define SMMU_IDR1_NUMS2CB_MASK  0x000000ffu   /* bits [23:16]: Num Stage 2-only CBs */
++#define SMMU_IDR1_PAGESIZE      (1u << 31)    /* bit 31: 0=4KB, 1=64KB */
++
++/* SMMUv2 SMR Bitfields */
++#define SMMU_SMR_VALID          (1u << 31)    /* bit 31: Entry valid */
++#define SMMU_SMR_MASK_SHIFT     16
++#define SMMU_SMR_MASK_MASK      0x00007fffu   /* bits [30:16]: 15-bit StreamID mask */
++#define SMMU_SMR_ID_MASK        0x00007fffu   /* bits [14:0]: 15-bit StreamID */
++
++/* SMMUv2 S2CR Bitfields */
++#define SMMU_S2CR_CBNDX_MASK    0x000000ffu   /* bits [7:0]: Context Bank index */
++#define SMMU_S2CR_TYPE_SHIFT    16
++#define SMMU_S2CR_TYPE_MASK     0x00000003u   /* bits [17:16]: 0=trans, 1=bypass, 2=fault */
++
++/* Target WLAN StreamIDs for investigation */
++#define WLAN_STREAM_ID_PRIMARY   0x1900u
++#define WLAN_STREAM_ID_SECONDARY 0x1901u
++
++/* Qualcomm SPMI Arbiter v3 Offsets (MSM8998) */
++#define SPMI_V3_MAP_BASE        0x0800u       /* In CORE region */
++#define SPMI_V3_OWNER_BASE      0x0700u       /* In CNFG region */
++#define SPMI_V3_OBS_STRIDE      0x8000u       /* 32KB stride per APID on v3 */
++#define PM8998_GPIO3_PPID       0x00c2u       /* SID 0, Peripheral 0xc2 */
++
++/* RPM GLINK Message RAM Constants */
++#define RPM_TOC_OFFSET          (0x7000u - 256u)
++#define RPM_TOC_MAGIC           0x67727430u   /* "grt0" */
++
++static inline uint32_t
++probe_rd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++/*
++ * --- 1. SMEM Partition Table Probe ---
++ * Safely reads the TOC at 0x861ff000.
++ * Restricts logging to partition headers; never reads partition payloads.
++ */
++static void
++probe_smem(void)
++{
++	printf("WIFI PROBE: [SMEM] mapping TOC @ 0x%08x (4KB)\n", POPLAR_SMEM_TOC_PA);
++	vm_offset_t toc = ml_io_map(POPLAR_SMEM_TOC_PA, 0x1000);
++	if (!toc) {
++		printf("WIFI PROBE: [SMEM] FAILED: ml_io_map returned NULL\n");
++		return;
++	}
++
++	uint32_t magic = probe_rd32(toc, 0);
++	uint32_t ver = probe_rd32(toc, 4);
++	uint32_t num_entries = probe_rd32(toc, 8);
++	uint32_t max_entries = probe_rd32(toc, 12);
++
++	if (magic != 0x434f5424) { /* "$TOC" */
++		printf("WIFI PROBE: [SMEM] invalid magic 0x%08x (expected '$TOC')\n", magic);
++		return;
++	}
++
++	printf("WIFI PROBE: [SMEM] valid $TOC ver=%u entries=%u max=%u\n", ver, num_entries, max_entries);
++
++	/* Bound scan by mapped 4KB page: 32 bytes header + 48 bytes per entry */
++	uint32_t max_safe_entries = (0x1000u - 32u) / 48u; /* 84 entries max */
++	if (max_entries > 0 && num_entries > max_entries) {
++		num_entries = max_entries;
++	}
++	if (num_entries > max_safe_entries) {
++		num_entries = max_safe_entries;
++	}
++
++	for (uint32_t i = 0; i < num_entries; i++) {
++		uint32_t e_off = 32u + i * 48u;
++		uint32_t off = probe_rd32(toc, e_off);
++		uint32_t size = probe_rd32(toc, e_off + 4);
++		uint32_t flags = probe_rd32(toc, e_off + 8);
++		uint32_t hosts = probe_rd32(toc, e_off + 12);
++		uint16_t h0 = (uint16_t)hosts;
++		uint16_t h1 = (uint16_t)(hosts >> 16);
++
++		if (!off || !size) {
++			continue;
++		}
++
++		/* Overflow-safe range check within 2MB SMEM region */
++		bool in_bounds = (off < 0x200000u && size <= 0x200000u && size <= 0x200000u - off);
++		if (!in_bounds) {
++			printf("WIFI PROBE: [SMEM] p[%02u] [OUT-OF-BOUNDS] off=0x%08x sz=%u fl=0x%x\n",
++			    i, off, size, flags);
++			continue;
++		}
++
++		/*
++		 * Qualcomm SMEM Host IDs: Global = 0, APPS = 1, Modem = 2, ADSP = 3.
++		 * Partitions not including APPS (h0!=1 && h1!=1 && not global) are
++		 * access-protected by the XPU MPU. Reading their payloads causes a bus hang.
++		 */
++		bool is_global = (h0 == 0 && h1 == 0);
++		bool is_apps = (h0 == 1 || h1 == 1);
++		printf("WIFI PROBE: [SMEM] p[%02u] off=0x%05x sz=%uKB fl=0x%x h=%u:%u %s\n",
++		    i, off, size / 1024u, flags, h0, h1,
++		    (is_global || is_apps) ? "APPS-accessible" : "XPU-restricted");
++	}
++}
++
++/*
++ * --- 2. SMMU ANOC2 Probe ---
++ * Reads ARM SMMUv2 capability registers (IDR0, IDR1, IDR2, sCR0).
++ * Bounds SMR scan by hardware-reported NUMSMRG.
++ * Matches stream IDs accounting for the SMR wildcard mask.
++ */
++static void
++probe_smmu(void)
++{
++	printf("WIFI PROBE: [SMMU] mapping ANOC2 @ 0x%08x (16KB)\n", POPLAR_SMMU_ANOC2_PA);
++	vm_offset_t smmu = ml_io_map(POPLAR_SMMU_ANOC2_PA, 0x4000);
++	if (!smmu) {
++		printf("WIFI PROBE: [SMMU] FAILED: ml_io_map returned NULL\n");
++		return;
++	}
++
++	uint32_t scr0 = probe_rd32(smmu, ARM_SMMU_GR0_sCR0);
++	uint32_t idr0 = probe_rd32(smmu, ARM_SMMU_GR0_IDR0);
++	uint32_t idr1 = probe_rd32(smmu, ARM_SMMU_GR0_IDR1);
++	uint32_t idr2 = probe_rd32(smmu, ARM_SMMU_GR0_IDR2);
++
++	bool sms = (idr0 & SMMU_IDR0_SMS) != 0;
++	uint32_t num_smr = idr0 & SMMU_IDR0_NUMSMRG_MASK;
++	uint32_t num_cb = idr1 & SMMU_IDR1_NUMCB_MASK;
++	uint32_t num_s2cb = (idr1 >> SMMU_IDR1_NUMS2CB_SHIFT) & SMMU_IDR1_NUMS2CB_MASK;
++	uint32_t num_sidb = (idr0 >> SMMU_IDR0_NUMSIDB_SHIFT) & SMMU_IDR0_NUMSIDB_MASK;
++	bool s1ts = (idr0 & SMMU_IDR0_S1TS) != 0;
++	bool s2ts = (idr0 & SMMU_IDR0_S2TS) != 0;
++	bool nts = (idr0 & SMMU_IDR0_NTS) != 0;
++	bool smcd = (idr1 & SMMU_IDR1_SMCD) != 0;
++	bool clientpd = (scr0 & 1u) != 0;
++
++	printf("WIFI PROBE: [SMMU] sCR0=0x%08x (CLIENTPD=%u) S1TS=%u S2TS=%u NTS=%u SMS=%u\n",
++	    scr0, clientpd, s1ts, s2ts, nts, sms);
++	printf("WIFI PROBE: [SMMU] IDR0=0x%08x IDR1=0x%08x IDR2=0x%08x -> NUMSMRG=%u NUMCB=%u NUMS2CB=%u SIDB=%u SMCD=%u IAS=%u OAS=%u\n",
++	    idr0, idr1, idr2, num_smr, num_cb, num_s2cb, num_sidb, smcd, idr2 & 0xfu, (idr2 >> 4) & 0xfu);
++
++	if (!sms) {
++		printf("WIFI PROBE: [SMMU] SMS=0: SMMU operates in Stream Indexing mode (linear S2CR table)\n");
++		return;
++	}
++
++	if (num_smr == 0) {
++		printf("WIFI PROBE: [SMMU] SMS=1 but NUMSMRG=0: no SMR groups provisioned\n");
++		return;
++	}
++
++	/* Bound SMR scan by mapped window: SMR is at 0x800, 128 SMRs max in 4KB */
++	if (num_smr > 128u) {
++		num_smr = 128u;
++	}
++
++	uint32_t matched_count = 0;
++	for (uint32_t i = 0; i < num_smr; i++) {
++		uint32_t smr = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + i * 4u);
++		bool valid = (smr & SMMU_SMR_VALID) != 0;
++		if (!valid) {
++			continue;
++		}
++
++		uint32_t mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
++		uint32_t sid = smr & SMMU_SMR_ID_MASK;
++
++		/*
++		 * ARM SMMUv2 stream matching rule:
++		 * An incoming StreamID matches if ((StreamID ^ SMR.ID) & ~SMR.MASK) == 0.
++		 */
++		bool match_1900 = ((WLAN_STREAM_ID_PRIMARY ^ sid) & ~mask) == 0;
++		bool match_1901 = ((WLAN_STREAM_ID_SECONDARY ^ sid) & ~mask) == 0;
++
++		if (match_1900 || match_1901) {
++			matched_count++;
++			uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
++			uint32_t type = (s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
++			uint32_t cbndx = s2cr & SMMU_S2CR_CBNDX_MASK;
++			const char *type_str = (type == 1) ? "BYPASS" : (type == 0) ? "TRANSLATION" : (type == 2) ? "FAULT" : "RESERVED";
++
++			printf("WIFI PROBE: [SMMU] match SMR[%u]: ID=0x%04x mask=0x%04x (matches %s%s%s) -> S2CR: %s (type=%u, cb=%u)\n",
++			    i, sid, mask,
++			    match_1900 ? "0x1900" : "",
++			    (match_1900 && match_1901) ? " & " : "",
++			    match_1901 ? "0x1901" : "",
++			    type_str, type, cbndx);
++		}
++	}
++
++	if (matched_count == 0) {
++		printf("WIFI PROBE: [SMMU] target WLAN StreamIDs 0x1900/0x1901 have no active SMR match (unmapped by XBL)\n");
++	}
++}
++
++/*
++ * Helper: issue EXT_READL command to observer MMIO
++ * Note: this performs an MMIO write to the APPS observer controller register (0x00).
++ */
++static bool
++probe_spmi_read_byte(vm_offset_t obs_page, uint8_t reg_off, uint8_t *val)
++{
++	uint32_t cmd = (1u << 27) | ((uint32_t)reg_off << 4);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)obs_page = cmd; /* MMIO command write to host arbiter */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (int t = 0; t < 1000; t++) {
++		uint32_t st = probe_rd32(obs_page, 0x08);
++		if (st & 1u) {
++			if (st & 0x0eu) return false;
++			*val = (uint8_t)probe_rd32(obs_page, 0x18);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/*
++ * --- 3. PM8998 GPIO3 SPMI Arbiter Probe ---
++ * Inspects SPMI v3 Arbiter APID mapping registers in CORE and CNFG space.
++ * This part is 100% read-only MMIO.
++ *
++ * NOTE: The active observer read transaction (issuing EXT_READL via observer
++ * MMIO) writes a command register in the APPS controller. It is disabled by default
++ * and requires the boot argument 'wifiprobe_spmi=1'.
++ */
++static void
++probe_pm8998_gpio3(void)
++{
++	printf("WIFI PROBE: [SPMI] mapping SPMI CORE @ 0x%08x & CNFG @ 0x%08x\n",
++	    POPLAR_SPMI_CORE_PA, POPLAR_SPMI_CNFG_PA);
++
++	vm_offset_t core = ml_io_map(POPLAR_SPMI_CORE_PA, 0x1000);
++	vm_offset_t cnfg = ml_io_map(POPLAR_SPMI_CNFG_PA, 0x3000);
++	if (!core || !cnfg) {
++		printf("WIFI PROBE: [SPMI] FAILED: ml_io_map failed for CORE or CNFG\n");
++		return;
++	}
++
++	uint32_t arb_ver = probe_rd32(core, 0x00);
++	printf("WIFI PROBE: [SPMI] Arbiter HW version: 0x%08x (%s)\n",
++	    arb_ver, (arb_ver < 0x50000000u) ? "v2/v3 (MSM8998)" : "v5 (SM7150+)");
++
++	/* On SPMI v3, APID mapping table is at CORE + 0x800, ownership at CNFG + 0x700 */
++	uint32_t map_base = (arb_ver >= 0x50000000u) ? 0x900u : SPMI_V3_MAP_BASE;
++	uint16_t target_ppid = PM8998_GPIO3_PPID; /* 0x00c2 */
++	uint16_t found_apid = 0xffffu;
++	uint32_t owner = 0xffffffffu;
++
++	for (uint32_t i = 0; i < 512u; i++) {
++		uint32_t entry = probe_rd32(core, map_base + i * 4u);
++		if (entry != 0 && ((entry >> 8) & 0xfffu) == target_ppid) {
++			found_apid = (uint16_t)i;
++			owner = probe_rd32(cnfg, SPMI_V3_OWNER_BASE + i * 4u) & 7u;
++			break;
++		}
++	}
++
++	if (found_apid == 0xffffu) {
++		printf("WIFI PROBE: [SPMI] PM8998 GPIO3 (PPID 0x00c2) has no APID assigned in SPMI table\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [SPMI] PM8998 GPIO3 (PPID 0x00c2) mapped to APID %u (owner EE=%u: %s)\n",
++	    found_apid, owner, (owner == 0) ? "APPS" : "OTHER/SECURE");
++
++	/* Active observer read transaction check */
++	int spmi_tx = 0;
++	(void)PE_parse_boot_argn("wifiprobe_spmi", &spmi_tx, sizeof(spmi_tx));
++
++	if (!spmi_tx) {
++		printf("WIFI PROBE: [SPMI] observer MMIO command transaction disabled (requires wifiprobe_spmi=1)\n");
++		return;
++	}
++
++	if (owner != 0) {
++		printf("WIFI PROBE: [SPMI] SKIPPED: APID %u is not owned by APPS (EE=%u); write would fault\n",
++		    found_apid, owner);
++		return;
++	}
++
++	/* Map the 4KB page containing this APID's observer channel */
++	uint32_t stride = (arb_ver >= 0x50000000u) ? 0x80u : SPMI_V3_OBS_STRIDE;
++	vm_offset_t obs_page = ml_io_map(POPLAR_SPMI_OBS_PA + stride * (uint32_t)found_apid, 0x1000);
++	if (!obs_page) {
++		printf("WIFI PROBE: [SPMI] FAILED: ml_io_map failed for observer APID %u\n", found_apid);
++		return;
++	}
++
++	uint8_t type = 0, subtype = 0, status = 0, mode = 0, en_ctl = 0;
++	bool ok = probe_spmi_read_byte(obs_page, 0x04, &type);
++	ok = ok && probe_spmi_read_byte(obs_page, 0x05, &subtype);
++	ok = ok && probe_spmi_read_byte(obs_page, 0x10, &status);
++	ok = ok && probe_spmi_read_byte(obs_page, 0x40, &mode);
++	ok = ok && probe_spmi_read_byte(obs_page, 0x46, &en_ctl);
++
++	if (ok) {
++		printf("WIFI PROBE: [SPMI] GPIO3(0xc2) type=0x%02x sub=0x%02x mode=%s in_val=%u en=%u\n",
++		    type, subtype, (mode & 1) ? "OUT" : "IN", status & 1, (en_ctl >> 7) & 1);
++	} else {
++		printf("WIFI PROBE: [SPMI] GPIO3 read timed out on APID %u\n", found_apid);
++	}
++}
++
++/*
++ * --- 4. RPM GLINK Message RAM Header Probe ---
++ * Reads TOC at 0x00778000 + 0x7000 - 256.
++ * Completely read-only: does not kick IPC doorbell and does not send requests.
++ */
++static void
++probe_rpm_msgram(void)
++{
++	printf("WIFI PROBE: [RPM] inspecting Message RAM @ 0x%08x (28KB)\n", POPLAR_RPM_MSGRAM_PA);
++	vm_offset_t ram = ml_io_map(POPLAR_RPM_MSGRAM_PA, 0x7000);
++	if (!ram) {
++		printf("WIFI PROBE: [RPM] FAILED: ml_io_map returned NULL\n");
++		return;
++	}
++
++	volatile uint32_t *toc = (volatile uint32_t *)(ram + RPM_TOC_OFFSET);
++	uint32_t magic = toc[0];
++	uint32_t count = toc[1];
++
++	if (magic != RPM_TOC_MAGIC) { /* "grt0" */
++		printf("WIFI PROBE: [RPM] bad TOC magic 0x%08x (expected 'grt0')\n", magic);
++		return;
++	}
++
++	printf("WIFI PROBE: [RPM] valid TOC magic 'grt0' entry_count=%u\n", count);
++
++	/* Bound scan by TOC table size (up to 20 entries) */
++	if (count > 20u) {
++		count = 20u;
++	}
++
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t id = toc[2 + i * 3];
++		uint32_t off = toc[2 + i * 3 + 1];
++		uint32_t size = toc[2 + i * 3 + 2];
++		char id_str[5] = {
++			(char)(id & 0xff),
++			(char)((id >> 8) & 0xff),
++			(char)((id >> 16) & 0xff),
++			(char)((id >> 24) & 0xff),
++			0
++		};
++
++		/* Overflow-safe bounds check within 28KB Message RAM */
++		if (off < 0x7000u && size >= 8u && size <= 0x7000u - off) {
++			uint32_t head = probe_rd32(ram, off);
++			uint32_t tail = probe_rd32(ram, off + 4u);
++			printf("WIFI PROBE: [RPM] entry[%u] '%s' off=0x%04x sz=%u head=%u tail=%u\n",
++			    i, id_str, off, size, head, tail);
++		}
++	}
++}
++
++/*
++ * Main Probe Entry Point
++ * Invoked from sweet_ufs_init() in bsd/dev/sweet_ufs.c
++ */
++void
++sweet_poplar_wifi_probe(void)
++{
++	int probe = 0;
++	(void)PE_parse_boot_argn("wifiprobe", &probe, sizeof(probe));
++
++	/* Default: completely dormant */
++	if (probe <= 0) {
++		return;
++	}
++
++	printf("\n=======================================================\n");
++	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE (LEVEL %d)  ===\n", probe);
++	printf("=======================================================\n");
++
++	/* Level 1 Probes: Non-invasive, safe, always-clocked buses */
++	probe_smem();
++	probe_smmu();
++	probe_pm8998_gpio3();
++	probe_rpm_msgram();
++
++	printf("=======================================================\n");
++	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");
++	printf("=======================================================\n\n");
++}

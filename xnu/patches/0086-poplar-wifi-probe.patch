@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,511 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -40,7 +40,7 @@ new file mode 100644
 + *   wifiprobe=0 (default): Completely dormant; normal boot path untouched.
 + *   wifiprobe=1: Level 1 non-invasive read-only diagnostic probe of:
 + *                1. SMEM TOC (0x861ff000)
-+ *                2. SMMU ANOC2 capabilities and SMR scan (0x016c0000)
++ *                2. SMMU ANOC2 capabilities, fault status, and full SMR/S2CR dump (0x016c0000)
 + *                3. SPMI v3 Arbiter APID mapping (0x0800f000 / 0x0800a000)
 + *                4. RPM GLINK Message RAM TOC (0x00778000)
 + *   wifiprobe_spmi=1 (optional): Enables SPMI observer read transaction for
@@ -84,6 +84,10 @@ new file mode 100644
 +#define ARM_SMMU_GR0_IDR0       0x0020u
 +#define ARM_SMMU_GR0_IDR1       0x0024u
 +#define ARM_SMMU_GR0_IDR2       0x0028u
++#define ARM_SMMU_GR0_sGFSR      0x0048u
++#define ARM_SMMU_GR0_sGFSYNR0   0x0050u
++#define ARM_SMMU_GR0_sGFSYNR1   0x0054u
++#define ARM_SMMU_GR0_sGFSYNR2   0x0058u
 +#define ARM_SMMU_GR0_SMR_BASE   0x0800u
 +#define ARM_SMMU_GR0_S2CR_BASE  0x0c00u
 +
@@ -218,16 +222,19 @@ new file mode 100644
 +/*
 + * --- 2. SMMU ANOC2 Probe ---
 + * Reads ARM SMMUv2 capability registers (IDR0, IDR1, IDR2, sCR0).
-+ * Bounds SMR scan by hardware-reported NUMSMRG.
-+ * Matches stream IDs accounting for the SMR wildcard mask.
++ * Decodes all control bits (CLIENTPD, USFCFG, SMCFCFG, GFRE, GFIE, GCFGFRE).
++ * Reads SMMU Global Fault Status and Syndrome registers (sGFSR, sGFSYNR0..2).
++ * Dumps all implemented SMR and S2CR entries.
 + */
 +static void
 +probe_smmu(void)
 +{
 +	vm_offset_t smmu;
 +	uint32_t scr0, idr0, idr1, idr2;
++	uint32_t gfsr, gfsynr0, gfsynr1, gfsynr2;
 +	uint32_t num_smr, num_cb, num_s2cb, num_sidb;
-+	bool s1ts, s2ts, nts, sms, smcd, clientpd;
++	bool s1ts, s2ts, nts, sms, smcd;
++	bool clientpd, gfre, gfie, gcfgfre, smcfcfg, usfcfg;
 +	uint32_t matched_count, i;
 +
 +	printf("WIFI PROBE: [SMMU] mapping ANOC2 @ 0x%08x (16KB)\n", POPLAR_SMMU_ANOC2_PA);
@@ -242,21 +249,41 @@ new file mode 100644
 +	idr1 = probe_rd32(smmu, ARM_SMMU_GR0_IDR1);
 +	idr2 = probe_rd32(smmu, ARM_SMMU_GR0_IDR2);
 +
++	gfsr = probe_rd32(smmu, ARM_SMMU_GR0_sGFSR);
++	gfsynr0 = probe_rd32(smmu, ARM_SMMU_GR0_sGFSYNR0);
++	gfsynr1 = probe_rd32(smmu, ARM_SMMU_GR0_sGFSYNR1);
++	gfsynr2 = probe_rd32(smmu, ARM_SMMU_GR0_sGFSYNR2);
++
++	clientpd = (scr0 & (1u << 0)) != 0;
++	gfre     = (scr0 & (1u << 1)) != 0;
++	gfie     = (scr0 & (1u << 2)) != 0;
++	gcfgfre  = (scr0 & (1u << 5)) != 0;
++	smcfcfg  = (scr0 & (1u << 9)) != 0;
++	usfcfg   = (scr0 & (1u << 10)) != 0;
++
 +	sms = (idr0 & SMMU_IDR0_SMS) != 0;
 +	num_smr = idr0 & SMMU_IDR0_NUMSMRG_MASK;
-+	num_cb = idr1 & SMMU_IDR1_NUMCB_MASK;
-+	num_s2cb = (idr1 >> SMMU_IDR1_NUMS2CB_SHIFT) & SMMU_IDR1_NUMS2CB_MASK;
 +	num_sidb = (idr0 >> SMMU_IDR0_NUMSIDB_SHIFT) & SMMU_IDR0_NUMSIDB_MASK;
 +	s1ts = (idr0 & SMMU_IDR0_S1TS) != 0;
 +	s2ts = (idr0 & SMMU_IDR0_S2TS) != 0;
 +	nts = (idr0 & SMMU_IDR0_NTS) != 0;
-+	smcd = (idr1 & SMMU_IDR1_SMCD) != 0;
-+	clientpd = (scr0 & 1u) != 0;
 +
-+	printf("WIFI PROBE: [SMMU] sCR0=0x%08x (CLIENTPD=%u) S1TS=%u S2TS=%u NTS=%u SMS=%u\n",
-+	    scr0, clientpd, s1ts, s2ts, nts, sms);
-+	printf("WIFI PROBE: [SMMU] IDR0=0x%08x IDR1=0x%08x IDR2=0x%08x -> NUMSMRG=%u NUMCB=%u NUMS2CB=%u SIDB=%u SMCD=%u IAS=%u OAS=%u\n",
-+	    idr0, idr1, idr2, num_smr, num_cb, num_s2cb, num_sidb, smcd, idr2 & 0xfu, (idr2 >> 4) & 0xfu);
++	num_cb = idr1 & SMMU_IDR1_NUMCB_MASK;
++	smcd = (idr1 & SMMU_IDR1_SMCD) != 0;
++	num_s2cb = (idr1 >> SMMU_IDR1_NUMS2CB_SHIFT) & SMMU_IDR1_NUMS2CB_MASK;
++
++	printf("WIFI PROBE: [SMMU] sCR0=0x%08x -> CLIENTPD=%u GFRE=%u GFIE=%u GCFGFRE=%u SMCFCFG=%u USFCFG=%u\n",
++	    scr0, clientpd, gfre, gfie, gcfgfre, smcfcfg, usfcfg);
++	printf("WIFI PROBE: [SMMU] IDR0=0x%08x -> NUMSMRG=%u SIDB=%u SMS=%u S1TS=%u S2TS=%u NTS=%u BTM=%u CTTW=%u\n",
++	    idr0, num_smr, num_sidb, sms, s1ts, s2ts, nts, (idr0 >> 13) & 1u, (idr0 >> 14) & 1u);
++	printf("WIFI PROBE: [SMMU] IDR1=0x%08x -> NUMCB=%u SMCD=%u NUMS2CB=%u (raw=0x%02x, %s) NUMPAGENDXB=%u PAGESIZE=%s\n",
++	    idr1, num_cb, smcd, num_s2cb, (idr1 >> 16) & 0xffu, s2ts ? "active" : "N/A (S2TS=0)",
++	    (idr1 >> 28) & 7u, (idr1 & (1u << 31)) ? "64KB" : "4KB");
++	printf("WIFI PROBE: [SMMU] IDR2=0x%08x -> IAS=%u OAS=%u\n",
++	    idr2, idr2 & 0xfu, (idr2 >> 4) & 0xfu);
++	printf("WIFI PROBE: [SMMU] sGFSR=0x%08x (USF=%u SMCF=%u MULTI=%u) sGFSYNR0=0x%08x sGFSYNR1=0x%08x (fault_SID=0x%04x) sGFSYNR2=0x%08x\n",
++	    gfsr, (gfsr >> 1) & 1u, (gfsr >> 2) & 1u, (gfsr >> 31) & 1u,
++	    gfsynr0, gfsynr1, gfsynr1 & 0x7fffu, gfsynr2);
 +
 +	if (!sms) {
 +		printf("WIFI PROBE: [SMMU] SMS=0: SMMU operates in Stream Indexing mode (linear S2CR table)\n");
@@ -273,45 +300,32 @@ new file mode 100644
 +		num_smr = 128u;
 +	}
 +
++	printf("WIFI PROBE: [SMMU] dumping all %u SMR / S2CR register pairs:\n", num_smr);
 +	matched_count = 0;
 +	for (i = 0; i < num_smr; i++) {
 +		uint32_t smr = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + i * 4u);
++		uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
 +		bool valid = (smr & SMMU_SMR_VALID) != 0;
-+		uint32_t mask, sid;
-+		bool match_1900, match_1901;
++		uint32_t mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
++		uint32_t sid = smr & SMMU_SMR_ID_MASK;
++		uint32_t type = (s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
++		uint32_t cbndx = s2cr & SMMU_S2CR_CBNDX_MASK;
++		const char *type_str = (type == 1) ? "BYPASS" : (type == 0) ? "TRANS" : (type == 2) ? "FAULT" : "RSVD";
++		bool match_1900 = valid && (((WLAN_STREAM_ID_PRIMARY ^ sid) & ~mask) == 0);
++		bool match_1901 = valid && (((WLAN_STREAM_ID_SECONDARY ^ sid) & ~mask) == 0);
 +
-+		if (!valid) {
-+			continue;
-+		}
-+
-+		mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
-+		sid = smr & SMMU_SMR_ID_MASK;
-+
-+		/*
-+		 * ARM SMMUv2 stream matching rule:
-+		 * An incoming StreamID matches if ((StreamID ^ SMR.ID) & ~SMR.MASK) == 0.
-+		 */
-+		match_1900 = ((WLAN_STREAM_ID_PRIMARY ^ sid) & ~mask) == 0;
-+		match_1901 = ((WLAN_STREAM_ID_SECONDARY ^ sid) & ~mask) == 0;
++		printf("WIFI PROBE: [SMMU] SMR[%02u]: valid=%u ID=0x%04x mask=0x%04x -> S2CR: %s (type=%u cb=%u)%s%s\n",
++		    i, valid, sid, mask, type_str, type, cbndx,
++		    match_1900 ? " [MATCH 0x1900]" : "",
++		    match_1901 ? " [MATCH 0x1901]" : "");
 +
 +		if (match_1900 || match_1901) {
-+			uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
-+			uint32_t type = (s2cr >> SMMU_S2CR_TYPE_SHIFT) & SMMU_S2CR_TYPE_MASK;
-+			uint32_t cbndx = s2cr & SMMU_S2CR_CBNDX_MASK;
-+			const char *type_str = (type == 1) ? "BYPASS" : (type == 0) ? "TRANSLATION" : (type == 2) ? "FAULT" : "RESERVED";
-+
 +			matched_count++;
-+			printf("WIFI PROBE: [SMMU] match SMR[%u]: ID=0x%04x mask=0x%04x (matches %s%s%s) -> S2CR: %s (type=%u, cb=%u)\n",
-+			    i, sid, mask,
-+			    match_1900 ? "0x1900" : "",
-+			    (match_1900 && match_1901) ? " & " : "",
-+			    match_1901 ? "0x1901" : "",
-+			    type_str, type, cbndx);
 +		}
 +	}
 +
 +	if (matched_count == 0) {
-+		printf("WIFI PROBE: [SMMU] target WLAN StreamIDs 0x1900/0x1901 have no active SMR match (unmapped by XBL)\n");
++		printf("WIFI PROBE: [SMMU] RESULT: StreamIDs 0x1900/0x1901 have no SMR match (USFCFG=1 will generate USF fault on DMA)\n");
 +	}
 +}
 +

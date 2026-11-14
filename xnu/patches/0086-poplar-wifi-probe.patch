@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,543 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -215,19 +215,14 @@ new file mode 100644
 +			printf("WIFI PROBE: [SMEM] p[%02u] [EMPTY] off=0x00000 sz=0KB (unallocated entry)\n", i);
 +			continue;
 +		}
-+		if (off != 0 && size == 0) {
++		if (size == 0) {
 +			printf("WIFI PROBE: [SMEM] p[%02u] [MALFORMED-ZERO-SIZE] off=0x%05x sz=0KB fl=0x%x\n",
 +			    i, off, flags);
 +			continue;
 +		}
-+		if (off == 0 && size != 0) {
-+			printf("WIFI PROBE: [SMEM] p[%02u] [MALFORMED-ZERO-OFFSET] off=0x00000 sz=%uKB fl=0x%x\n",
-+			    i, size / 1024u, flags);
-+			continue;
-+		}
 +
 +		/* Overflow-safe range check within 2MB SMEM region */
-+		in_bounds = (off < 0x200000u && size <= 0x200000u && size <= 0x200000u - off);
++		in_bounds = (size <= 0x200000u && off <= 0x200000u - size);
 +		if (!in_bounds) {
 +			printf("WIFI PROBE: [SMEM] p[%02u] [OUT-OF-BOUNDS] off=0x%08x sz=%u fl=0x%x\n",
 +			    i, off, size, flags);

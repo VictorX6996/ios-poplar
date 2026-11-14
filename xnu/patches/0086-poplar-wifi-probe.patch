@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,598 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -511,12 +511,20 @@ new file mode 100644
 +	DTEntry node = NULL;
 +	void const *prop = NULL;
 +	unsigned int prop_size = 0;
++	int sweetwifi = 0;
++	unsigned int i = 0, count = 0;
++	const uint8_t *mac = NULL;
++	const uint64_t *reg64 = NULL;
++	const uint32_t *irqs = NULL;
++	const uint32_t *sids = NULL;
++	const uint32_t *msa = NULL;
++	uint64_t rel_addr = 0, size = 0, phys_base = 0;
 +
 +	/* 5A: Live Apple Device Tree inspection */
 +	if (SecureDTLookupEntry(NULL, "/chosen", &node) == kSuccess) {
 +		if (SecureDTGetProperty(node, "mac-address-wifi0", &prop, &prop_size) == kSuccess &&
 +		    prop_size == 6) {
-+			const uint8_t *mac = (const uint8_t *)prop;
++			mac = (const uint8_t *)prop;
 +			printf("WIFI PROBE: [ADT] live /chosen/mac-address-wifi0 = %02x:%02x:%02x:%02x:%02x:%02x\n",
 +			    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 +		}
@@ -526,7 +534,54 @@ new file mode 100644
 +	    SecureDTLookupEntry(NULL, "/wlan", &node) != kSuccess) {
 +		printf("WIFI PROBE: [ADT] live device-tree has no active WLAN node (WCN3990 driver unattached)\n");
 +	} else {
-+		printf("WIFI PROBE: [ADT] live device-tree contains WLAN node\n");
++		printf("WIFI PROBE: [ADT] live device-tree contains /arm-io/wlan platform node\n");
++
++		/* Parse compatible */
++		if (SecureDTGetProperty(node, "compatible", &prop, &prop_size) == kSuccess && prop_size > 0) {
++			printf("WIFI PROBE: [ADT]   compatible = '%.*s'\n", (int)prop_size, (const char *)prop);
++		}
++
++		/* Parse reg: address is relative to arm-io SOC_BASE (0x01000000) */
++		if (SecureDTGetProperty(node, "reg", &prop, &prop_size) == kSuccess && prop_size >= 16) {
++			reg64 = (const uint64_t *)prop;
++			rel_addr = reg64[0];
++			size = reg64[1];
++			phys_base = rel_addr + 0x01000000u;
++			printf("WIFI PROBE: [ADT]   reg = <0x%llx 0x%llx> (rel) -> phys base 0x%llx size 0x%llx (8MB)\n",
++			    (unsigned long long)rel_addr, (unsigned long long)size,
++			    (unsigned long long)phys_base, (unsigned long long)size);
++		}
++
++		/* Parse Copy Engine interrupts */
++		if (SecureDTGetProperty(node, "interrupts", &prop, &prop_size) == kSuccess && prop_size >= 4) {
++			irqs = (const uint32_t *)prop;
++			count = prop_size / 4;
++			printf("WIFI PROBE: [ADT]   interrupts (%u Copy Engine lines):", count);
++			for (i = 0; i < count && i < 12; i++) {
++				printf(" %u", irqs[i]);
++			}
++			printf("\n");
++		}
++
++		/* Parse ANOC2 SMMU StreamIDs */
++		if (SecureDTGetProperty(node, "iommus", &prop, &prop_size) == kSuccess && prop_size >= 8) {
++			sids = (const uint32_t *)prop;
++			printf("WIFI PROBE: [ADT]   iommus (StreamIDs): CE=0x%04x, MSA=0x%04x\n", sids[0], sids[1]);
++		}
++
++		/* Parse MSA memory size */
++		if (SecureDTGetProperty(node, "qcom,wlan-msa-memory", &prop, &prop_size) == kSuccess && prop_size >= 4) {
++			msa = (const uint32_t *)prop;
++			printf("WIFI PROBE: [ADT]   qcom,wlan-msa-memory = 0x%x (%u KB)\n", *msa, *msa / 1024u);
++		}
++
++		/* Check Stage 3 activation gate: sweetwifi */
++		(void)PE_parse_boot_argn("sweetwifi", &sweetwifi, sizeof(sweetwifi));
++		if (sweetwifi <= 0) {
++			printf("WIFI PROBE: [GATE] sweetwifi=0 (disabled default): hardware dormant, zero MMIO/regulator/clock access.\n");
++		} else {
++			printf("WIFI PROBE: [GATE] sweetwifi=%d requested (hardware activation blocked in Stage 3A per instruction plan).\n", sweetwifi);
++		}
 +	}
 +
 +	/* 5B: Compile-time reference hardware specification (from Sony MSM8998 stock DTB) */

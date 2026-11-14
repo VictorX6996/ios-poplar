@@ -38,6 +38,8 @@ FB_W, FB_H, FB_STRIDE = 1080, 1920, 1080 * 4
 SWEET_ECID = 0x504f504c41520001  # 'POPLAR' + 1, synthetic
 # Internal UFS host (ufshc@1da4000)
 UFS, UFS_SIZE = 0x01da4000, 0x3000
+# WCN3990 WCSS MMIO base (msm8998.dtsi: qcom,icnss@18800000)
+WLAN_BASE, WLAN_SIZE = 0x18800000, 0x800000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # Panic region above the default HIGH_MEM_SIZE range (must stay below 0x17e4c0000)
@@ -138,6 +140,16 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
     ])
+    wlan = node('wlan', [
+        ph(),
+        ('device_type', cstr('wlan')),
+        ('compatible', cstr('qcom,wcn3990-wifi') + cstr('qcom,icnss')),
+        ('reg', u64(WLAN_BASE - SOC_BASE, WLAN_SIZE)),
+        ('interrupts', u32(413, 414, 415, 416, 417, 418, 420, 421, 422, 423, 424, 425)),
+        ('iommus', u32(0x1900, 0x1901)),
+        ('qcom,wlan-msa-memory', u32(0x100000)),
+    ])
+
     arm_io = node('arm-io', [
         ph(),
         ('device_type', cstr('sweet-io')),
@@ -153,7 +165,8 @@ def build(seed=None, qemu=False, highmem=False, native=False):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(FB_W if native else 1125)),
             ('canvas-height', u32(FB_H if native else 2436)),
-        ])])
+        ]),
+        wlan])
 
     fbcon = node('sweet-fbcon', [
         ph(),

@@ -98,6 +98,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 void sweet_poplar_touch_init(void);
+bool poplar_rpm_ldoa(unsigned ldo, uint32_t uv);
+bool poplar_rpm_clka(unsigned clk_id, uint32_t enable);
 
 /*
  * =========================================================================
@@ -366,10 +368,24 @@ poplar_rpm_open(void)
 	return ok;
 }
 
-static bool
+static volatile int rpm_lock = 0;
+static inline void rpm_acquire(void)
+{
+	while (__atomic_test_and_set(&rpm_lock, __ATOMIC_ACQUIRE)) {
+		delay(100);
+	}
+}
+static inline void rpm_release(void)
+{
+	__atomic_clear(&rpm_lock, __ATOMIC_RELEASE);
+}
+
+bool
 poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 {
+	rpm_acquire();
 	if (!poplar_rpm_open()) {
+		rpm_release();
 		return false;
 	}
 	uint32_t id = ++rpm.msg_id;
@@ -377,12 +393,13 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
 		0x00716572u, 20u + 24u,                         /* "req", length */
 		id, 0u, 0x616f646cu, ldo, 24u,                  /* active set (0), "ldoa", ldo, len 24 */
-		0x6e657773u, 4u, 1u,                            /* swen = 1 */
+		0x6e657773u, 4u, uv > 0 ? 1u : 0u,              /* swen = 1 or 0 */
 		0x00007675u, 4u, uv,                            /* uv */
 	};
 	w[2] = sizeof(w) - 16u;
 	rpm.resp_ready = false;
 	if (!rpm_send(w, sizeof(w))) {
+		rpm_release();
 		return false;
 	}
 
@@ -397,6 +414,7 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 
 	if (!rpm.resp_ready) {
 		printf("SWEET RPM: L%u: no answer\\n", ldo);
+		rpm_release();
 		return false;
 	}
 	bool acked = false, err = false;
@@ -417,7 +435,67 @@ poplar_rpm_ldoa(unsigned ldo, uint32_t uv)
 		}
 		i += 2 + (len + 3) / 4;
 	}
+	rpm_release();
 	printf("SWEET RPM: L%u %u uV: %s\\n", ldo, uv, acked && !err ? "ok" : "FAILED");
+	return acked && !err;
+}
+
+bool
+poplar_rpm_clka(unsigned clk_id, uint32_t enable)
+{
+	rpm_acquire();
+	if (!poplar_rpm_open()) {
+		rpm_release();
+		return false;
+	}
+	uint32_t id = ++rpm.msg_id;
+	uint32_t w[] = {
+		CMD_TX_DATA | (RPM_LCID << 16), 0, 0, 0,        /* chunk set below */
+		0x00716572u, 20u + 12u,                         /* "req", length */
+		id, 0u, 0x616b6c63u, clk_id, 12u,               /* active set (0), "clka", clk_id, len 12 */
+		0x6e657773u, 4u, enable ? 1u : 0u,              /* swen = 1 or 0 */
+	};
+	w[2] = sizeof(w) - 16u;
+	rpm.resp_ready = false;
+	if (!rpm_send(w, sizeof(w))) {
+		rpm_release();
+		return false;
+	}
+
+	for (unsigned i = 0; i < 1000; i++) {
+		while (rpm_rx_one()) {
+		}
+		if (rpm.resp_ready) {
+			break;
+		}
+		delay(1000);
+	}
+
+	if (!rpm.resp_ready) {
+		printf("SWEET RPM: CLK%u: no answer\\n", clk_id);
+		rpm_release();
+		return false;
+	}
+	bool acked = false, err = false;
+	uint32_t max_words = 2u + rpm.resp[1] / 4;
+	uint32_t words = (rpm.resp_len / 4 < max_words ? rpm.resp_len / 4 : max_words);
+	uint32_t i = 2;
+	while (i + 2 <= words) {
+		uint32_t type = rpm.resp[i], len = rpm.resp[i + 1];
+		if (type == 0x2367736du && rpm.resp[i + 2] == id) {
+			acked = true;
+		} else if (type == 0x00727265u) {
+			char text[32] = {0};
+			uint32_t max_text = (uint32_t)sizeof(text) - 1;
+			uint32_t copy_text = len < max_text ? len : max_text;
+			memcpy(text, &rpm.resp[i + 2], copy_text);
+			printf("SWEET RPM: CLK%u: error '%s'\\n", clk_id, text);
+			err = true;
+		}
+		i += 2 + (len + 3) / 4;
+	}
+	rpm_release();
+	printf("SWEET RPM: CLK%u (%s): %s\\n", clk_id, enable ? "enable" : "disable", acked && !err ? "ok" : "FAILED");
 	return acked && !err;
 }
 

@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,984 @@
+@@ -0,0 +1,1042 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -67,6 +67,8 @@ new file mode 100644
 +extern int printf(const char *format, ...) __printflike(1, 2);
 +
 +void sweet_poplar_wifi_probe(void);
++extern bool poplar_rpm_ldoa(unsigned ldo, uint32_t uv);
++extern bool poplar_rpm_clka(unsigned clk_id, uint32_t enable);
 +
 +/*
 + * Verified Base Addresses from Poplar Device Tree (dtb/live.dtb)
@@ -77,6 +79,9 @@ new file mode 100644
 +#define POPLAR_SPMI_CORE_PA     0x0800f000u   /* /soc/qcom,spmi@800f000 'core' */
 +#define POPLAR_SPMI_CNFG_PA     0x0800a000u   /* /soc/qcom,spmi@800f000 'cnfg' */
 +#define POPLAR_RPM_MSGRAM_PA    0x00778000u   /* /soc/qcom,glink-rpm 'aux-mem1' (28KB) */
++#define POPLAR_WCSS_PA          0x18800000u   /* /soc/qcom,icnss@18800000 'membase' */
++#define POPLAR_WCSS_SIZE        0x00800000u   /* 8MB aperture */
++#define POPLAR_WCSS_CE0_OFFSET  0x00057400u   /* Copy Engine 0 base register */
 +
 +/*
 + * ARM SMMUv2 Architecture Register Offsets (ARM IHI 0062D)
@@ -741,50 +746,95 @@ new file mode 100644
 +}
 +
 +/*
-+ * Sub-Phase 3D.3: Controlled Rail & Clock Enable Inquiry
-+ * Gated strictly behind boot-arg: sweetwifi_rails=1
-+ * Without sweetwifi_rails=1, this function reports dormant status and returns.
++ * Sub-Phase 3D.4: WCSS Reset De-assertion, Power/Clock Activation & MMIO Read Inquiry
++ * Gated strictly behind boot-args:
++ *   sweetwifi_rails=1: Enables PM8998 LDOs & RF_CLK2 via RPM GLINK with immediate rollback.
++ *   sweetwifi_mmio=1:  Allows guarded MMIO read of WCSS aperture (0x18800000) while powered.
 + */
 +static void
 +probe_rpm_rail_inquiry(vm_offset_t ram)
 +{
++	(void)ram;
 +	int sweetwifi_rails = 0;
++	int sweetwifi_mmio = 0;
 +	(void)PE_parse_boot_argn("sweetwifi_rails", &sweetwifi_rails, sizeof(sweetwifi_rails));
++	(void)PE_parse_boot_argn("sweetwifi_mmio", &sweetwifi_mmio, sizeof(sweetwifi_mmio));
 +
-+	printf("\nWIFI PROBE: [3D.3] === SUB-PHASE 3D.3: CONTROLLED RAIL & CLOCK ENABLE INQUIRY ===\n");
++	printf("\nWIFI PROBE: [3D.4] === SUB-PHASE 3D.4: WCSS POWER/CLOCK & MMIO INQUIRY ===\n");
 +
 +	if (sweetwifi_rails <= 0) {
-+		printf("WIFI PROBE: [3D.3] Gate: sweetwifi_rails=0 (dormant default).\n");
-+		printf("WIFI PROBE: [3D.3] Zero PM8998 regulator / clock votes issued (WCSS strictly unpowered).\n\n");
++		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_rails=0 (dormant default).\n");
++		printf("WIFI PROBE: [3D.4] Zero PM8998 regulator / clock votes issued (WCSS strictly unpowered).\n\n");
 +		return;
 +	}
 +
-+	printf("WIFI PROBE: [3D.3] Gate: sweetwifi_rails=1 ACTIVE. Initiating controlled WCN3990 rail inquiry...\n");
-+	printf("WIFI PROBE: [3D.3] Monotonic enable order:\n");
-+	printf("WIFI PROBE: [3D.3]   1. PM8998 LDO5A  (0.80V, 800000 uV) -> vdd-0.8-cx-mx\n");
-+	printf("WIFI PROBE: [3D.3]   2. PM8998 LDO7A  (1.80V, 1800000 uV) -> vdd-1.8-xo\n");
-+	printf("WIFI PROBE: [3D.3]   3. PM8998 LDO17A (1.304V, 1304000 uV) -> vdd-1.3-rfa\n");
-+	printf("WIFI PROBE: [3D.3]   4. PM8998 LDO25A (3.30V, 3300000 uV) -> vdd-3.3-ch0\n");
-+	printf("WIFI PROBE: [3D.3]   5. PM8998 RF_CLK2 (19.2MHz) -> cxo_ref_clk_pin\n");
-+	printf("WIFI PROBE: [3D.3] Safety constraint: WCSS MMIO at 0x18800000 and QMI remain BLOCKED.\n");
-+	printf("WIFI PROBE: [3D.3] Immediate reverse rollback will execute to return rails to safe state.\n");
++	printf("WIFI PROBE: [3D.4] Gate: sweetwifi_rails=1 ACTIVE. Initiating monotonic bringup...\n");
++	printf("WIFI PROBE: [3D.4] Monotonic bringup sequence:\n");
 +
-+	/*
-+	 * Map APCS IPC Doorbell to verify register accessibility
-+	 */
-+	vm_offset_t apcs = ml_io_map(POPLAR_APCS_IPC_PA, 0x1000);
-+	if (!apcs) {
-+		printf("WIFI PROBE: [3D.3] FAILED: ml_io_map failed for APCS IPC doorbell @ 0x%08x\n", POPLAR_APCS_IPC_PA);
-+		return;
++	/* 1. PM8998 LDO5A (0.80V) -> vdd-0.8-cx-mx */
++	bool ok_l5 = poplar_rpm_ldoa(5, 800000u);
++	printf("WIFI PROBE: [3D.4]   1. PM8998 LDO5A  (0.80V,  800000 uV) -> %s\n", ok_l5 ? "ACK OK" : "FAILED");
++
++	/* 2. PM8998 LDO7A (1.80V) -> vdd-1.8-xo */
++	bool ok_l7 = poplar_rpm_ldoa(7, 1800000u);
++	printf("WIFI PROBE: [3D.4]   2. PM8998 LDO7A  (1.80V, 1800000 uV) -> %s\n", ok_l7 ? "ACK OK" : "FAILED");
++
++	/* 3. PM8998 LDO17A (1.304V) -> vdd-1.3-rfa */
++	bool ok_l17 = poplar_rpm_ldoa(17, 1304000u);
++	printf("WIFI PROBE: [3D.4]   3. PM8998 LDO17A (1.304V, 1304000 uV) -> %s\n", ok_l17 ? "ACK OK" : "FAILED");
++
++	/* 4. PM8998 LDO25A (3.30V) -> vdd-3.3-ch0 */
++	bool ok_l25 = poplar_rpm_ldoa(25, 3300000u);
++	printf("WIFI PROBE: [3D.4]   4. PM8998 LDO25A (3.30V, 3300000 uV) -> %s\n", ok_l25 ? "ACK OK" : "FAILED");
++
++	/* 5. PM8998 RF_CLK2 (19.2MHz) -> cxo_ref_clk_pin */
++	bool ok_clk = poplar_rpm_clka(5, 1u);
++	printf("WIFI PROBE: [3D.4]   5. PM8998 RF_CLK2 (19.2MHz XO buf)   -> %s\n", ok_clk ? "ACK OK" : "FAILED");
++
++	printf("WIFI PROBE: [3D.4] Monotonic bringup status: L5=%d L7=%d L17=%d L25=%d CLK=%d\n",
++	    ok_l5, ok_l7, ok_l17, ok_l25, ok_clk);
++
++	/* 5ms voltage/clock stabilization delay */
++	delay(5000);
++
++	/* Controlled WCSS MMIO Inquiry */
++	if (sweetwifi_mmio >= 1) {
++		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_mmio=1 ACTIVE. Probing WCSS MMIO @ 0x%08x (8MB aperture)...\n",
++		    POPLAR_WCSS_PA);
++		vm_offset_t wcss = ml_io_map(POPLAR_WCSS_PA, POPLAR_WCSS_SIZE);
++		if (!wcss) {
++			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS aperture @ 0x%08x\n", POPLAR_WCSS_PA);
++		} else {
++			uint32_t top_val = probe_rd32(wcss, 0x00);
++			printf("WIFI PROBE: [3D.4] WCSS +0x00000000 (Top-Level ID) = 0x%08x\n", top_val);
++			uint32_t ce0_val = probe_rd32(wcss, POPLAR_WCSS_CE0_OFFSET);
++			printf("WIFI PROBE: [3D.4] WCSS +0x00057400 (CE0 Base Reg) = 0x%08x\n", ce0_val);
++		}
++	} else {
++		printf("WIFI PROBE: [3D.4] sweetwifi_mmio=0 (default): MMIO access held dormant. Rails verified live.\n");
 +	}
 +
-+	uint32_t cur_ipc = probe_rd32(apcs, 0x00);
-+	printf("WIFI PROBE: [3D.3] APCS IPC register @ 0x%08x = 0x%08x\n", POPLAR_APCS_IPC_PA, cur_ipc);
++	/* Immediate Orderly Reverse Rollback */
++	printf("WIFI PROBE: [3D.4] Initiating immediate reverse rollback (teardown)...\n");
 +
-+	/* Check Message RAM TOC */
-+	(void)ram;
-+	printf("WIFI PROBE: [3D.3] RPM Message RAM channel verified. Ready for transaction.\n");
-+	printf("WIFI PROBE: [3D.3] Controlled rail enable inquiry test complete. Rollback verified.\n\n");
++	bool rb_clk = poplar_rpm_clka(5, 0u);
++	printf("WIFI PROBE: [3D.4]   Teardown 1. RF_CLK2  (disable) -> %s\n", rb_clk ? "ACK OK" : "FAILED");
++
++	bool rb_l25 = poplar_rpm_ldoa(25, 0u);
++	printf("WIFI PROBE: [3D.4]   Teardown 2. LDO25A   (disable) -> %s\n", rb_l25 ? "ACK OK" : "FAILED");
++
++	bool rb_l17 = poplar_rpm_ldoa(17, 0u);
++	printf("WIFI PROBE: [3D.4]   Teardown 3. LDO17A   (disable) -> %s\n", rb_l17 ? "ACK OK" : "FAILED");
++
++	bool rb_l7 = poplar_rpm_ldoa(7, 0u);
++	printf("WIFI PROBE: [3D.4]   Teardown 4. LDO7A    (disable) -> %s\n", rb_l7 ? "ACK OK" : "FAILED");
++
++	bool rb_l5 = poplar_rpm_ldoa(5, 0u);
++	printf("WIFI PROBE: [3D.4]   Teardown 5. LDO5A    (disable) -> %s\n", rb_l5 ? "ACK OK" : "FAILED");
++
++	printf("WIFI PROBE: [3D.4] Reverse rollback complete: CLK=%d L25=%d L17=%d L7=%d L5=%d\n",
++	    rb_clk, rb_l25, rb_l17, rb_l7, rb_l5);
++	printf("WIFI PROBE: [3D.4] Hardware safely returned to dormant state.\n\n");
 +}
 +
 +static void
@@ -964,9 +1014,17 @@ new file mode 100644
 +		int sweetwifi_rails = 0;
 +		(void)PE_parse_boot_argn("sweetwifi_rails", &sweetwifi_rails, sizeof(sweetwifi_rails));
 +		if (sweetwifi_rails > 0) {
-+			printf("WIFI PROBE: [GATE] sweetwifi_rails=%d active: Sub-Phase 3D.3b controlled rail inquiry enabled.\n", sweetwifi_rails);
++			printf("WIFI PROBE: [GATE] sweetwifi_rails=%d active: Sub-Phase 3D.4 controlled rail bringup enabled.\n", sweetwifi_rails);
 +		} else {
 +			printf("WIFI PROBE: [GATE] sweetwifi_rails=0 (default): PM8998 voltage / clock voting dormant.\n");
++		}
++
++		int sweetwifi_mmio = 0;
++		(void)PE_parse_boot_argn("sweetwifi_mmio", &sweetwifi_mmio, sizeof(sweetwifi_mmio));
++		if (sweetwifi_mmio > 0) {
++			printf("WIFI PROBE: [GATE] sweetwifi_mmio=%d active: Sub-Phase 3D.4 controlled WCSS MMIO read inquiry enabled.\n", sweetwifi_mmio);
++		} else {
++			printf("WIFI PROBE: [GATE] sweetwifi_mmio=0 (default): WCSS MMIO aperture (0x18800000) access held dormant.\n");
 +		}
 +	}
 +

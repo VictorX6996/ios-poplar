@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,1049 @@
+@@ -0,0 +1,1231 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -83,6 +83,17 @@ new file mode 100644
 +#define POPLAR_WCSS_CE0_PAGE_PA     0x18857000u   /* Copy Engine 0 page-aligned base (0x18800000 + 0x57000) */
 +#define POPLAR_WCSS_CE0_PAGE_OFF    0x00000400u   /* Offset of CE0 base register within 4KB page (0x57400 - 0x57000) */
 +#define POPLAR_WCSS_PAGE_SZ         0x00001000u   /* 4KB targeted page mapping (prevents io_submap exhaustion) */
++
++/*
++ * Sub-Phase 4.1: Passive Subsystem Live State & Shared Memory Audit Definitions
++ */
++#define POPLAR_SMEM_BASE_PA         0x86000000u   /* /soc/qcom,smem@86000000 2MB base */
++#define POPLAR_SMEM_P08_OFFSET      0x000d3000u   /* p[08] APPS:Modem partition offset */
++#define POPLAR_SMEM_P08_PA          (POPLAR_SMEM_BASE_PA + POPLAR_SMEM_P08_OFFSET) /* 0x860d3000 */
++#define POPLAR_SMEM_P08_SZ          0x00020000u   /* 128KB partition size */
++#define POPLAR_PIL_MBA_PA           0x94100000u   /* /reserved-memory/pil_mba_region@94100000 (2MB) */
++#define SMEM_PART_MAGIC             0x54525024u   /* "$PRT" in little-endian (0x24, 0x50, 0x52, 0x54) */
++#define SMEM_PRIVATE_CANARY         0xa5a5u
 +
 +/*
 + * ARM SMMUv2 Architecture Register Offsets (ARM IHI 0062D)
@@ -800,23 +811,9 @@ new file mode 100644
 +
 +	/* Controlled WCSS MMIO Inquiry */
 +	if (sweetwifi_mmio >= 1) {
-+		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_mmio=1 ACTIVE. Probing WCSS MMIO (4KB page mappings)...\n");
-+
-+		vm_offset_t wcss_top = ml_io_map(POPLAR_WCSS_PA, POPLAR_WCSS_PAGE_SZ);
-+		if (!wcss_top) {
-+			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS top-level @ 0x%08x\n", POPLAR_WCSS_PA);
-+		} else {
-+			uint32_t top_val = probe_rd32(wcss_top, 0x00);
-+			printf("WIFI PROBE: [3D.4] WCSS +0x00000000 (Top-Level ID) = 0x%08x\n", top_val);
-+		}
-+
-+		vm_offset_t wcss_ce0 = ml_io_map(POPLAR_WCSS_CE0_PAGE_PA, POPLAR_WCSS_PAGE_SZ);
-+		if (!wcss_ce0) {
-+			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS CE0 @ 0x%08x\n", POPLAR_WCSS_CE0_PAGE_PA);
-+		} else {
-+			uint32_t ce0_val = probe_rd32(wcss_ce0, POPLAR_WCSS_CE0_PAGE_OFF);
-+			printf("WIFI PROBE: [3D.4] WCSS +0x00057400 (CE0 Base Reg) = 0x%08x\n", ce0_val);
-+		}
++		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_mmio=1 DISCONTINUED (interconnect bus stall discovered).\n");
++		printf("WIFI PROBE: [3D.4] WCSS MMIO aperture (0x18800000) requires Modem DSP PIL / QMI handshake (Stage 4).\n");
++		printf("WIFI PROBE: [3D.4] Holding MMIO read dormant to protect bootstrap thread.\n");
 +	} else {
 +		printf("WIFI PROBE: [3D.4] sweetwifi_mmio=0 (default): MMIO access held dormant. Rails verified live.\n");
 +	}
@@ -1029,9 +1026,17 @@ new file mode 100644
 +		int sweetwifi_mmio = 0;
 +		(void)PE_parse_boot_argn("sweetwifi_mmio", &sweetwifi_mmio, sizeof(sweetwifi_mmio));
 +		if (sweetwifi_mmio > 0) {
-+			printf("WIFI PROBE: [GATE] sweetwifi_mmio=%d active: Sub-Phase 3D.4 controlled WCSS MMIO read inquiry enabled.\n", sweetwifi_mmio);
++			printf("WIFI PROBE: [GATE] sweetwifi_mmio=%d: discontinued (interconnect stall discovered; held dormant).\n", sweetwifi_mmio);
 +		} else {
 +			printf("WIFI PROBE: [GATE] sweetwifi_mmio=0 (default): WCSS MMIO aperture (0x18800000) access held dormant.\n");
++		}
++
++		int wlan_stage4_1_passive = 0;
++		(void)PE_parse_boot_argn("wlan_stage4_1_passive", &wlan_stage4_1_passive, sizeof(wlan_stage4_1_passive));
++		if (wlan_stage4_1_passive > 0) {
++			printf("WIFI PROBE: [GATE] wlan_stage4_1_passive=%d active: Sub-Phase 4.1 passive subsystem audit enabled.\n", wlan_stage4_1_passive);
++		} else {
++			printf("WIFI PROBE: [GATE] wlan_stage4_1_passive=0 (default): Sub-Phase 4.1 passive audit dormant.\n");
 +		}
 +	}
 +
@@ -1044,6 +1049,182 @@ new file mode 100644
 +	printf("WIFI PROBE: [DT-REF]   Supplies: vdd-0.8-cx-mx, vdd-1.8-xo, vdd-1.3-rfa, vdd-3.3-ch0\n");
 +	printf("WIFI PROBE: [DT-REF]   Interrupts: 12 Copy Engine SPIs (413..425) on GICv3\n");
 +	printf("WIFI PROBE: [DT-REF]   Notice: Above is compile-time specification data; no WCSS MMIO touched.\n");
++}
++
++/*
++ * --- 6. Sub-Phase 4.1: Passive Subsystem Live State & Shared Memory Audit ---
++ *
++ * Gated strictly behind dedicated opt-in boot-arg:
++ *   wlan_stage4_1_passive=1
++ *
++ * Safety Boundaries (100% Passive DRAM Reads):
++ *   - Zero MMIO register reads or writes (WCSS 0x18800000 held strictly dormant).
++ *   - Zero APCS doorbell writes (0x17911008 untouched).
++ *   - Zero PM8998 regulator / clock votes.
++ *   - Zero GPIO edits.
++ *   - Zero SMMU register writes or stream attachment.
++ *   - Zero PIL / PAS operations.
++ *   - Reads are strictly bounded within mapped DRAM pages.
++ */
++static void
++probe_smem_p08_audit(void)
++{
++	vm_offset_t p08;
++	uint32_t magic, size, free_uncached, free_cached;
++	uint16_t h0, h1;
++	uint32_t off;
++
++	printf("WIFI PROBE: [4.1A] SMEM p[08] Geometry: base=0x%08x off=0x%05x -> PA=0x%08x (128KB)\n",
++	    POPLAR_SMEM_BASE_PA, POPLAR_SMEM_P08_OFFSET, POPLAR_SMEM_P08_PA);
++
++	p08 = ml_io_map(POPLAR_SMEM_P08_PA, 0x1000u);
++	if (!p08) {
++		printf("WIFI PROBE: [4.1B] FAILED: ml_io_map failed for SMEM p[08] @ 0x%08x\n", POPLAR_SMEM_P08_PA);
++		return;
++	}
++
++	magic = probe_rd32(p08, 0x00);
++	uint32_t hosts = probe_rd32(p08, 0x04);
++	h0 = (uint16_t)hosts;
++	h1 = (uint16_t)(hosts >> 16);
++	size = probe_rd32(p08, 0x08);
++	free_uncached = probe_rd32(p08, 0x0c);
++	free_cached = probe_rd32(p08, 0x10);
++
++	printf("WIFI PROBE: [4.1B] p[08] Header: magic=0x%08x ('%c%c%c%c') hosts=%u:%u size=%u (0x%x)\n",
++	    magic,
++	    (char)(magic & 0xff), (char)((magic >> 8) & 0xff),
++	    (char)((magic >> 16) & 0xff), (char)((magic >> 24) & 0xff),
++	    h0, h1, size, size);
++	printf("WIFI PROBE: [4.1B] p[08] Heap: free_uncached=0x%x free_cached=0x%x\n",
++	    free_uncached, free_cached);
++
++	if (magic != SMEM_PART_MAGIC) {
++		printf("WIFI PROBE: [4.1B] WARNING: unexpected partition magic (expected '$PRT' 0x%08x)\n",
++		    SMEM_PART_MAGIC);
++		return;
++	}
++
++	if (h0 != 1 || h1 != 2) {
++		printf("WIFI PROBE: [4.1B] WARNING: unexpected host IDs (expected 1:2 for APPS:Modem)\n");
++	}
++
++	/* Bounded walk of allocated items in uncached heap */
++	off = 0x20u; /* smem_partition_header is 32 bytes */
++	if (free_uncached > 0x1000u) {
++		free_uncached = 0x1000u;
++	}
++
++	printf("WIFI PROBE: [4.1B] Scanning allocated items in p[08] [0x0020..0x%04x]:\n", free_uncached);
++	int item_count = 0;
++	while (off + 12u <= free_uncached && item_count < 16) {
++		uint32_t w0 = probe_rd32(p08, off);
++		uint16_t canary = (uint16_t)w0;
++		uint16_t item_id = (uint16_t)(w0 >> 16);
++		uint32_t item_sz = probe_rd32(p08, off + 4u);
++		uint32_t w2 = probe_rd32(p08, off + 8u);
++		uint16_t pad_data = (uint16_t)w2;
++		uint16_t pad_hdr = (uint16_t)(w2 >> 16);
++
++		if (canary != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++
++		printf("WIFI PROBE: [4.1B]   item[%u] @ +0x%04x: id=%u sz=%u pad_data=%u pad_hdr=%u\n",
++		    item_count, off, item_id, item_sz, pad_data, pad_hdr);
++
++		uint32_t payload_off = off + 12u + (uint32_t)pad_hdr;
++		if (payload_off + 16u <= 0x1000u && item_sz >= 4u) {
++			char name_buf[17];
++			for (int k = 0; k < 16; k += 4) {
++				uint32_t cw = probe_rd32(p08, payload_off + (uint32_t)k);
++				name_buf[k] = (char)(cw & 0xff);
++				name_buf[k + 1] = (char)((cw >> 8) & 0xff);
++				name_buf[k + 2] = (char)((cw >> 16) & 0xff);
++				name_buf[k + 3] = (char)((cw >> 24) & 0xff);
++			}
++			name_buf[16] = '\0';
++			bool printable = true;
++			for (int k = 0; k < 8 && printable; k++) {
++				if (name_buf[k] < 32 || name_buf[k] > 126) {
++					if (name_buf[k] == 0 && k > 0) break;
++					printable = false;
++				}
++			}
++			if (printable && name_buf[0] != 0) {
++				printf("WIFI PROBE: [4.1B]     payload string preview: '%s'\n", name_buf);
++			}
++		}
++
++		uint32_t total_entry = 12u + (uint32_t)pad_hdr + item_sz + (uint32_t)pad_data;
++		total_entry = (total_entry + 7u) & ~7u;
++		if (total_entry == 0 || off + total_entry <= off) break;
++		off += total_entry;
++		item_count++;
++	}
++
++	if (item_count == 0) {
++		printf("WIFI PROBE: [4.1B]   No private items allocated in p[08] uncached heap (heap empty).\n");
++	}
++}
++
++static void
++probe_pil_mba_audit(void)
++{
++	vm_offset_t mba;
++	uint32_t words[16];
++
++	printf("WIFI PROBE: [4.1C] MBA Region Audit @ 0x%08x (2MB reserved carveout)\n", POPLAR_PIL_MBA_PA);
++
++	mba = ml_io_map(POPLAR_PIL_MBA_PA, 0x1000u);
++	if (!mba) {
++		printf("WIFI PROBE: [4.1C] FAILED: ml_io_map failed for MBA region @ 0x%08x\n", POPLAR_PIL_MBA_PA);
++		return;
++	}
++
++	for (int i = 0; i < 16; i++) {
++		words[i] = probe_rd32(mba, (uint32_t)(i * 4));
++	}
++
++	printf("WIFI PROBE: [4.1C] MBA First 64 Bytes Dump:\n");
++	printf("WIFI PROBE: [4.1C]   [+0x00] %08x %08x %08x %08x\n", words[0], words[1], words[2], words[3]);
++	printf("WIFI PROBE: [4.1C]   [+0x10] %08x %08x %08x %08x\n", words[4], words[5], words[6], words[7]);
++	printf("WIFI PROBE: [4.1C]   [+0x20] %08x %08x %08x %08x\n", words[8], words[9], words[10], words[11]);
++	printf("WIFI PROBE: [4.1C]   [+0x30] %08x %08x %08x %08x\n", words[12], words[13], words[14], words[15]);
++
++	if (words[0] == 0x464c457fu) {
++		printf("WIFI PROBE: [4.1C] Signature: ELF executable header detected ('\\x7fELF')\n");
++	} else if (words[0] == 0x00000003u || words[0] == 0x00000005u || words[0] == 0x00000006u) {
++		printf("WIFI PROBE: [4.1C] Signature: Qualcomm MBN header detected (type=0x%x)\n", words[0]);
++	} else if (words[0] == 0 && words[1] == 0 && words[2] == 0 && words[3] == 0) {
++		printf("WIFI PROBE: [4.1C] Signature: Zero-filled / unpopulated region\n");
++	} else {
++		printf("WIFI PROBE: [4.1C] Signature: Non-zero data present (unidentified format)\n");
++	}
++	printf("WIFI PROBE: [4.1C] Note: Observational audit only; no inference of Modem running state.\n");
++}
++
++static void
++probe_stage4_passive_audit(void)
++{
++	int wlan_stage4_1_passive = 0;
++	(void)PE_parse_boot_argn("wlan_stage4_1_passive", &wlan_stage4_1_passive,
++	    sizeof(wlan_stage4_1_passive));
++
++	printf("\nWIFI PROBE: [4.1] === SUB-PHASE 4.1: PASSIVE SUBSYSTEM LIVE STATE AUDIT ===\n");
++
++	if (wlan_stage4_1_passive <= 0) {
++		printf("WIFI PROBE: [4.1] Gate: wlan_stage4_1_passive=0 (dormant default).\n");
++		printf("WIFI PROBE: [4.1] Zero Stage 4 memory reads issued.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [4.1] Gate: wlan_stage4_1_passive=1 ACTIVE.\n");
++	printf("WIFI PROBE: [4.1] Safety: Pure passive DRAM reads; zero MMIO, zero doorbells, zero votes.\n");
++
++	probe_smem_p08_audit();
++	probe_pil_mba_audit();
++	printf("WIFI PROBE: [4.1] Sub-Phase 4.1 passive audit complete.\n\n");
 +}
 +
 +/*
@@ -1076,6 +1257,7 @@ new file mode 100644
 +	probe_pm8998_gpio3();
 +	probe_rpm_msgram();
 +	probe_wlan_device_tree();
++	probe_stage4_passive_audit();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

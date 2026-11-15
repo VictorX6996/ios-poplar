@@ -145,8 +145,8 @@ def build(seed=None, qemu=False, highmem=False, native=False):
         ('device_type', cstr('wlan')),
         ('compatible', cstr('qcom,wcn3990-wifi') + cstr('qcom,icnss')),
         ('reg', u64(WLAN_BASE - SOC_BASE, WLAN_SIZE)),
-        ('interrupts', u32(413, 414, 415, 416, 417, 418, 420, 421, 422, 423, 424, 425)),
-        ('iommus', u32(0x1900, 0x1901)),
+        ('qcom,interrupts', u32(413, 414, 415, 416, 417, 418, 420, 421, 422, 423, 424, 425)),
+        ('qcom,stream-ids', u32(0x1900, 0x1901)),
         ('qcom,wlan-msa-memory', u32(0x100000)),
     ])
 

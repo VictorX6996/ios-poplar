@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,698 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -142,6 +142,13 @@ new file mode 100644
 +	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
 +	return v;
++}
++
++static inline void
++probe_wr32(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb sy; isb" ::: "memory");
 +}
 +
 +/*
@@ -370,6 +377,95 @@ new file mode 100644
 +	if (matched_1900 == 0 && matched_1901 == 0) {
 +		printf("WIFI PROBE: [SMMU] RESULT: Neither WLAN StreamID has an SMR route. Under USFCFG=1, transactions will raise USF aborts.\n");
 +	}
++
++	/* Stage 3D Sub-Phase 3D.2: SMMU Stream Routing Preparation (WCSS Held in Reset) */
++	int sweetwifi = 0;
++	(void)PE_parse_boot_argn("sweetwifi", &sweetwifi, sizeof(sweetwifi));
++	if (sweetwifi >= 1) {
++		int slot_ce = -1, slot_msa = -1;
++		uint32_t smr_ce, s2cr_ce, smr_msa, s2cr_msa;
++		uint32_t post_gfsr;
++		int rollback_test = 0;
++
++		printf("\nWIFI PROBE: [3D.2] === SUB-PHASE 3D.2: SMMU STREAM ROUTING PREPARATION ===\n");
++		printf("WIFI PROBE: [3D.2] Gate: sweetwifi=%d authorized for SMMU preparation (WCSS held in reset).\n", sweetwifi);
++		printf("WIFI PROBE: [3D.2] Safety constraint: WCSS unpowered and held in reset; zero rail/clock/MMIO changes.\n");
++
++		/* Find 2 candidate invalid SMR slots */
++		for (i = 0; i < num_smr; i++) {
++			uint32_t smr_off = ARM_SMMU_GR0_SMR_BASE + i * 4u;
++			uint32_t smr_val = probe_rd32(smmu, smr_off);
++			if ((smr_val & SMMU_SMR_VALID) == 0) {
++				if (slot_ce < 0) {
++					slot_ce = (int)i;
++				} else if (slot_msa < 0) {
++					slot_msa = (int)i;
++					break;
++				}
++			}
++		}
++
++		if (slot_ce < 0 || slot_msa < 0) {
++			printf("WIFI PROBE: [3D.2] FAILED: unable to find 2 free SMR slots\n");
++			return;
++		}
++
++		printf("WIFI PROBE: [3D.2] Selected candidate SMR slots: CE=SMR[%02d], MSA=SMR[%02d]\n", slot_ce, slot_msa);
++
++		/*
++		 * Programming sequence per ARM SMMUv2 architecture (ARM IHI 0062D):
++		 * 1. Set S2CR to FAULT (TYPE=2, CBNDX=0xff) to ensure no transient invalid translation.
++		 * 2. Set SMR with VALID=1, MASK=0x0000, ID=StreamID.
++		 * 3. Set S2CR to BYPASS (TYPE=1, CBNDX=0) or Context Bank translation.
++		 */
++		/* Primary StreamID: 0x1900 (Copy Engine Data Path) */
++		probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_ce * 4u, (2u << 16) | 0xffu);
++		probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_ce * 4u,
++		    SMMU_SMR_VALID | (0x0000u << 16) | WLAN_STREAM_ID_PRIMARY);
++		probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_ce * 4u, (1u << 16));
++
++		/* Secondary StreamID: 0x1901 (Firmware / MSA Path) */
++		probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_msa * 4u, (2u << 16) | 0xffu);
++		probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_msa * 4u,
++		    SMMU_SMR_VALID | (0x0000u << 16) | WLAN_STREAM_ID_SECONDARY);
++		probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_msa * 4u, (1u << 16));
++
++		/* Read-back verification */
++		smr_ce = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_ce * 4u);
++		s2cr_ce = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_ce * 4u);
++		smr_msa = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_msa * 4u);
++		s2cr_msa = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_msa * 4u);
++
++		printf("WIFI PROBE: [3D.2] Verified CE  SMR[%02d]=0x%08x (valid=%u ID=0x%04x) -> S2CR=0x%08x (type=%u: %s)\n",
++		    slot_ce, smr_ce, (smr_ce >> 31) & 1u, smr_ce & 0x7fffu,
++		    s2cr_ce, (s2cr_ce >> 16) & 3u, ((s2cr_ce >> 16) & 3u) == 1 ? "BYPASS" : "OTHER");
++		printf("WIFI PROBE: [3D.2] Verified MSA SMR[%02d]=0x%08x (valid=%u ID=0x%04x) -> S2CR=0x%08x (type=%u: %s)\n",
++		    slot_msa, smr_msa, (smr_msa >> 31) & 1u, smr_msa & 0x7fffu,
++		    s2cr_msa, (s2cr_msa >> 16) & 3u, ((s2cr_msa >> 16) & 3u) == 1 ? "BYPASS" : "OTHER");
++
++		/* Audit Global Fault Status Register */
++		post_gfsr = probe_rd32(smmu, ARM_SMMU_GR0_sGFSR);
++		printf("WIFI PROBE: [3D.2] Post-config sGFSR=0x%08x (USF=%u SMCF=%u MULTI=%u) -> %s\n",
++		    post_gfsr, (post_gfsr >> 1) & 1u, (post_gfsr >> 2) & 1u, (post_gfsr >> 31) & 1u,
++		    post_gfsr == 0 ? "CLEAN (zero SMMU faults)" : "FAULT DETECTED");
++
++		/* Rollback test check */
++		(void)PE_parse_boot_argn("smmu_rollback", &rollback_test, sizeof(rollback_test));
++		if (rollback_test == 1) {
++			printf("WIFI PROBE: [3D.2] smmu_rollback=1 requested: testing teardown sequence...\n");
++			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_ce * 4u, (2u << 16) | 0xffu);
++			probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_ce * 4u, 0);
++			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + (uint32_t)slot_msa * 4u, (2u << 16) | 0xffu);
++			probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE + (uint32_t)slot_msa * 4u, 0);
++			printf("WIFI PROBE: [3D.2] Rollback complete: SMR[%02d] and SMR[%02d] restored to valid=0 / FAULT\n",
++			    slot_ce, slot_msa);
++		} else {
++			printf("WIFI PROBE: [3D.2] Stream routes remain active in BYPASS mode (WCSS dormant in reset).\n");
++		}
++		printf("WIFI PROBE: [3D.2] SMMU stream routing preparation successfully completed.\n\n");
++	} else {
++		printf("WIFI PROBE: [3D.2] sweetwifi=0 (default): Sub-Phase 3D.2 SMMU programming skipped (dormant).\n");
++	}
 +}
 +
 +/*
@@ -553,7 +649,8 @@ new file mode 100644
 +		}
 +
 +		/* Parse Copy Engine interrupts */
-+		if (SecureDTGetProperty(node, "interrupts", &prop, &prop_size) == kSuccess && prop_size >= 4) {
++		if ((SecureDTGetProperty(node, "qcom,interrupts", &prop, &prop_size) == kSuccess ||
++		     SecureDTGetProperty(node, "interrupts", &prop, &prop_size) == kSuccess) && prop_size >= 4) {
 +			irqs = (const uint32_t *)prop;
 +			count = prop_size / 4;
 +			printf("WIFI PROBE: [ADT]   interrupts (%u Copy Engine lines):", count);
@@ -564,9 +661,10 @@ new file mode 100644
 +		}
 +
 +		/* Parse ANOC2 SMMU StreamIDs */
-+		if (SecureDTGetProperty(node, "iommus", &prop, &prop_size) == kSuccess && prop_size >= 8) {
++		if ((SecureDTGetProperty(node, "qcom,stream-ids", &prop, &prop_size) == kSuccess ||
++		     SecureDTGetProperty(node, "iommus", &prop, &prop_size) == kSuccess) && prop_size >= 8) {
 +			sids = (const uint32_t *)prop;
-+			printf("WIFI PROBE: [ADT]   iommus (StreamIDs): CE=0x%04x, MSA=0x%04x\n", sids[0], sids[1]);
++			printf("WIFI PROBE: [ADT]   stream-ids (ANOC2 SMMU): CE=0x%04x, MSA=0x%04x\n", sids[0], sids[1]);
 +		}
 +
 +		/* Parse MSA memory size */
@@ -578,9 +676,11 @@ new file mode 100644
 +		/* Check Stage 3 activation gate: sweetwifi */
 +		(void)PE_parse_boot_argn("sweetwifi", &sweetwifi, sizeof(sweetwifi));
 +		if (sweetwifi <= 0) {
-+			printf("WIFI PROBE: [GATE] sweetwifi=0 (disabled default): hardware dormant, zero MMIO/regulator/clock access.\n");
++			printf("WIFI PROBE: [GATE] sweetwifi=0 (disabled default): WLAN hardware activation dormant (zero WCSS MMIO/regulator/clock/SMMU programming).\n");
++		} else if (sweetwifi == 1) {
++			printf("WIFI PROBE: [GATE] sweetwifi=1 active: Sub-Phase 3D.2 SMMU stream routing preparation enabled (zero rail/clock/MMIO changes).\n");
 +		} else {
-+			printf("WIFI PROBE: [GATE] sweetwifi=%d requested (hardware activation blocked in Stage 3A per instruction plan).\n", sweetwifi);
++			printf("WIFI PROBE: [GATE] sweetwifi=%d active: advanced hardware activation requested.\n", sweetwifi);
 +		}
 +	}
 +

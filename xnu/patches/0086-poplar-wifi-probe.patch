@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,1042 @@
+@@ -0,0 +1,1049 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -79,9 +79,10 @@ new file mode 100644
 +#define POPLAR_SPMI_CORE_PA     0x0800f000u   /* /soc/qcom,spmi@800f000 'core' */
 +#define POPLAR_SPMI_CNFG_PA     0x0800a000u   /* /soc/qcom,spmi@800f000 'cnfg' */
 +#define POPLAR_RPM_MSGRAM_PA    0x00778000u   /* /soc/qcom,glink-rpm 'aux-mem1' (28KB) */
-+#define POPLAR_WCSS_PA          0x18800000u   /* /soc/qcom,icnss@18800000 'membase' */
-+#define POPLAR_WCSS_SIZE        0x00800000u   /* 8MB aperture */
-+#define POPLAR_WCSS_CE0_OFFSET  0x00057400u   /* Copy Engine 0 base register */
++#define POPLAR_WCSS_PA              0x18800000u   /* /soc/qcom,icnss@18800000 'membase' */
++#define POPLAR_WCSS_CE0_PAGE_PA     0x18857000u   /* Copy Engine 0 page-aligned base (0x18800000 + 0x57000) */
++#define POPLAR_WCSS_CE0_PAGE_OFF    0x00000400u   /* Offset of CE0 base register within 4KB page (0x57400 - 0x57000) */
++#define POPLAR_WCSS_PAGE_SZ         0x00001000u   /* 4KB targeted page mapping (prevents io_submap exhaustion) */
 +
 +/*
 + * ARM SMMUv2 Architecture Register Offsets (ARM IHI 0062D)
@@ -799,15 +800,21 @@ new file mode 100644
 +
 +	/* Controlled WCSS MMIO Inquiry */
 +	if (sweetwifi_mmio >= 1) {
-+		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_mmio=1 ACTIVE. Probing WCSS MMIO @ 0x%08x (8MB aperture)...\n",
-+		    POPLAR_WCSS_PA);
-+		vm_offset_t wcss = ml_io_map(POPLAR_WCSS_PA, POPLAR_WCSS_SIZE);
-+		if (!wcss) {
-+			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS aperture @ 0x%08x\n", POPLAR_WCSS_PA);
++		printf("WIFI PROBE: [3D.4] Gate: sweetwifi_mmio=1 ACTIVE. Probing WCSS MMIO (4KB page mappings)...\n");
++
++		vm_offset_t wcss_top = ml_io_map(POPLAR_WCSS_PA, POPLAR_WCSS_PAGE_SZ);
++		if (!wcss_top) {
++			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS top-level @ 0x%08x\n", POPLAR_WCSS_PA);
 +		} else {
-+			uint32_t top_val = probe_rd32(wcss, 0x00);
++			uint32_t top_val = probe_rd32(wcss_top, 0x00);
 +			printf("WIFI PROBE: [3D.4] WCSS +0x00000000 (Top-Level ID) = 0x%08x\n", top_val);
-+			uint32_t ce0_val = probe_rd32(wcss, POPLAR_WCSS_CE0_OFFSET);
++		}
++
++		vm_offset_t wcss_ce0 = ml_io_map(POPLAR_WCSS_CE0_PAGE_PA, POPLAR_WCSS_PAGE_SZ);
++		if (!wcss_ce0) {
++			printf("WIFI PROBE: [3D.4] FAILED: ml_io_map failed for WCSS CE0 @ 0x%08x\n", POPLAR_WCSS_CE0_PAGE_PA);
++		} else {
++			uint32_t ce0_val = probe_rd32(wcss_ce0, POPLAR_WCSS_CE0_PAGE_OFF);
 +			printf("WIFI PROBE: [3D.4] WCSS +0x00057400 (CE0 Base Reg) = 0x%08x\n", ce0_val);
 +		}
 +	} else {

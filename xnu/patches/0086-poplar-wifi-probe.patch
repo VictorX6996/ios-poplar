@@ -32,7 +32,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,1231 @@
+@@ -0,0 +1,1363 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -94,6 +94,33 @@ new file mode 100644
 +#define POPLAR_PIL_MBA_PA           0x94100000u   /* /reserved-memory/pil_mba_region@94100000 (2MB) */
 +#define SMEM_PART_MAGIC             0x54525024u   /* "$PRT" in little-endian (0x24, 0x50, 0x52, 0x54) */
 +#define SMEM_PRIVATE_CANARY         0xa5a5u
++
++/*
++ * Sub-Phase 4.2A: Passive Clock State & Q6v5 Register Accessibility Audit Definitions
++ */
++#define POPLAR_GCC_MSS_PAGE_PA      0x0018a000u   /* GCC MSS clock branch registers (4KB page) */
++#define GCC_MSS_CFG_AHB_CBCR_OFF    0x000u        /* GCC_MSS_CFG_AHB_CBCR (0x0018a000) */
++#define GCC_MSS_MNOC_BIMC_CBCR_OFF  0x004u        /* GCC_MSS_MNOC_BIMC_AXI_CBCR (0x0018a004) */
++#define GCC_MSS_SNOC_AXI_CBCR_OFF   0x03cu        /* GCC_MSS_SNOC_AXI_CBCR (0x0018a03c) */
++#define GCC_MSS_Q6_BIMC_CBCR_OFF    0x040u        /* GCC_MSS_Q6_BIMC_AXI_CBCR (0x0018a040) */
++
++#define POPLAR_TCSR_MSS_PAGE_PA     0x00179000u   /* TCSR MSS restart register (4KB page) */
++#define TCSR_MSS_RESTART_OFF        0x000u        /* TCSR_MSS_RESTART (0x00179000) */
++
++#define POPLAR_AXI_HALT_PAGE_PA     0x01f63000u   /* AXI halt controllers (4KB page covers halt_q6) */
++#define AXI_HALTREQ_OFF             0x000u
++#define AXI_HALTACK_OFF             0x004u
++#define AXI_IDLE_OFF                0x008u
++
++#define POPLAR_QDSP6SS_PAGE_PA      0x04080000u   /* Q6v5 control block (4KB page) */
++#define QDSP6SS_RESET_OFF           0x014u        /* QDSP6SS_RESET */
++#define QDSP6SS_GFMUX_CTL_OFF       0x020u        /* QDSP6SS_GFMUX_CTL */
++#define QDSP6SS_PWR_CTL_OFF         0x030u        /* QDSP6SS_PWR_CTL */
++
++#define POPLAR_RMB_PAGE_PA          0x04180000u   /* Request Message Block (RMB) (4KB page) */
++#define RMB_MBA_IMAGE_OFF           0x000u        /* RMB_MBA_IMAGE */
++#define RMB_PBL_STATUS_OFF          0x004u        /* RMB_PBL_STATUS */
++#define RMB_MBA_STATUS_OFF          0x00cu        /* RMB_MBA_STATUS */
 +
 +/*
 + * ARM SMMUv2 Architecture Register Offsets (ARM IHI 0062D)
@@ -1038,6 +1065,14 @@ new file mode 100644
 +		} else {
 +			printf("WIFI PROBE: [GATE] wlan_stage4_1_passive=0 (default): Sub-Phase 4.1 passive audit dormant.\n");
 +		}
++
++		int wlan_stage4_2a_passive = 0;
++		(void)PE_parse_boot_argn("wlan_stage4_2a_passive", &wlan_stage4_2a_passive, sizeof(wlan_stage4_2a_passive));
++		if (wlan_stage4_2a_passive > 0) {
++			printf("WIFI PROBE: [GATE] wlan_stage4_2a_passive=%d active: Sub-Phase 4.2A Q6v5/GCC audit enabled.\n", wlan_stage4_2a_passive);
++		} else {
++			printf("WIFI PROBE: [GATE] wlan_stage4_2a_passive=0 (default): Sub-Phase 4.2A audit dormant.\n");
++		}
 +	}
 +
 +	/* 5B: Compile-time reference hardware specification (from Sony MSM8998 stock DTB) */
@@ -1227,6 +1262,102 @@ new file mode 100644
 +	printf("WIFI PROBE: [4.1] Sub-Phase 4.1 passive audit complete.\n\n");
 +}
 +
++static void
++probe_stage4_2a_passive_audit(void)
++{
++	int wlan_stage4_2a_passive = 0;
++	vm_offset_t gcc_mss, tcsr_mss, axi_halt;
++	uint32_t cfg_ahb_cbcr = 0, mnoc_bimc_cbcr = 0, snoc_cbcr = 0, q6_bimc_cbcr = 0;
++	uint32_t ahb_clk_off = 1, ahb_clk_en = 0;
++
++	(void)PE_parse_boot_argn("wlan_stage4_2a_passive", &wlan_stage4_2a_passive,
++	    sizeof(wlan_stage4_2a_passive));
++
++	printf("WIFI PROBE: [4.2A] === SUB-PHASE 4.2A: PASSIVE CLOCK STATE & Q6V5 REGISTER AUDIT ===\n");
++
++	if (wlan_stage4_2a_passive <= 0) {
++		printf("WIFI PROBE: [4.2A] Gate: wlan_stage4_2a_passive=0 (dormant default).\n");
++		printf("WIFI PROBE: [4.2A] Zero Q6v5 / GCC MMIO reads issued.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [4.2A] Gate: wlan_stage4_2a_passive=1 ACTIVE.\n");
++	printf("WIFI PROBE: [4.2A] Safety: Pure passive 4KB reads; conditional Q6v5 access guarded by GCC branch status.\n");
++
++	/* Step 4.2A.1: GCC MSS Clock Branch Register Audit */
++	gcc_mss = ml_io_map(POPLAR_GCC_MSS_PAGE_PA, 0x1000);
++	if (gcc_mss) {
++		cfg_ahb_cbcr = probe_rd32(gcc_mss, GCC_MSS_CFG_AHB_CBCR_OFF);
++		mnoc_bimc_cbcr = probe_rd32(gcc_mss, GCC_MSS_MNOC_BIMC_CBCR_OFF);
++		snoc_cbcr = probe_rd32(gcc_mss, GCC_MSS_SNOC_AXI_CBCR_OFF);
++		q6_bimc_cbcr = probe_rd32(gcc_mss, GCC_MSS_Q6_BIMC_CBCR_OFF);
++
++		ahb_clk_off = (cfg_ahb_cbcr >> 31) & 1u;
++		ahb_clk_en = cfg_ahb_cbcr & 1u;
++
++		printf("WIFI PROBE: [4.2A] GCC MSS Branch Registers @ 0x%08x:\n", POPLAR_GCC_MSS_PAGE_PA);
++		printf("WIFI PROBE: [4.2A]   CFG_AHB_CBCR   = 0x%08x (OFF=%u, EN=%u) -> %s\n",
++		    cfg_ahb_cbcr, ahb_clk_off, ahb_clk_en,
++		    ahb_clk_off == 0 ? "CLOCK ACTIVE" : "CLOCK GATED");
++		printf("WIFI PROBE: [4.2A]   MNOC_BIMC_CBCR = 0x%08x (OFF=%u, EN=%u)\n",
++		    mnoc_bimc_cbcr, (mnoc_bimc_cbcr >> 31) & 1u, mnoc_bimc_cbcr & 1u);
++		printf("WIFI PROBE: [4.2A]   SNOC_AXI_CBCR  = 0x%08x (OFF=%u, EN=%u)\n",
++		    snoc_cbcr, (snoc_cbcr >> 31) & 1u, snoc_cbcr & 1u);
++		printf("WIFI PROBE: [4.2A]   Q6_BIMC_CBCR   = 0x%08x (OFF=%u, EN=%u)\n",
++		    q6_bimc_cbcr, (q6_bimc_cbcr >> 31) & 1u, q6_bimc_cbcr & 1u);
++	} else {
++		printf("WIFI PROBE: [4.2A] FAILED: ml_io_map failed for GCC MSS page 0x%08x\n", POPLAR_GCC_MSS_PAGE_PA);
++	}
++
++	/* Step 4.2A.2: TCSR MSS Restart Register Audit */
++	tcsr_mss = ml_io_map(POPLAR_TCSR_MSS_PAGE_PA, 0x1000);
++	if (tcsr_mss) {
++		uint32_t tcsr_val = probe_rd32(tcsr_mss, TCSR_MSS_RESTART_OFF);
++		printf("WIFI PROBE: [4.2A] TCSR MSS Restart Register @ 0x%08x: 0x%08x\n",
++		    POPLAR_TCSR_MSS_PAGE_PA, tcsr_val);
++	} else {
++		printf("WIFI PROBE: [4.2A] FAILED: ml_io_map failed for TCSR MSS page 0x%08x\n", POPLAR_TCSR_MSS_PAGE_PA);
++	}
++
++	/* Step 4.2A.3: AXI Halt Controller Audit (halt_q6) */
++	axi_halt = ml_io_map(POPLAR_AXI_HALT_PAGE_PA, 0x1000);
++	if (axi_halt) {
++		uint32_t req = probe_rd32(axi_halt, AXI_HALTREQ_OFF);
++		uint32_t ack = probe_rd32(axi_halt, AXI_HALTACK_OFF);
++		uint32_t idle = probe_rd32(axi_halt, AXI_IDLE_OFF);
++		printf("WIFI PROBE: [4.2A] AXI Halt Q6 Controller @ 0x%08x: REQ=0x%x ACK=0x%x IDLE=0x%x\n",
++		    POPLAR_AXI_HALT_PAGE_PA, req, ack, idle);
++	} else {
++		printf("WIFI PROBE: [4.2A] FAILED: ml_io_map failed for AXI Halt page 0x%08x\n", POPLAR_AXI_HALT_PAGE_PA);
++	}
++
++	/* Step 4.2A.4: Conditional Q6v5 & RMB MMIO Inquiry */
++	if (ahb_clk_off != 0) {
++		printf("WIFI PROBE: [4.2A] SAFETY LOCK: MSS CFG AHB clock is GATED (CLK_OFF=1).\n");
++		printf("WIFI PROBE: [4.2A]   Skipping QDSP6SS (0x04080000) & RMB (0x04180000) MMIO reads\n");
++		printf("WIFI PROBE: [4.2A]   to prevent interconnect bus hang (unclocked slave).\n");
++	} else {
++		printf("WIFI PROBE: [4.2A] MSS CFG AHB clock is ACTIVE (CLK_OFF=0): safely querying Q6v5 registers...\n");
++		vm_offset_t q6 = ml_io_map(POPLAR_QDSP6SS_PAGE_PA, 0x1000);
++		if (q6) {
++			uint32_t rst = probe_rd32(q6, QDSP6SS_RESET_OFF);
++			uint32_t gfmux = probe_rd32(q6, QDSP6SS_GFMUX_CTL_OFF);
++			uint32_t pwr = probe_rd32(q6, QDSP6SS_PWR_CTL_OFF);
++			printf("WIFI PROBE: [4.2A] QDSP6SS @ 0x%08x: RESET=0x%08x GFMUX=0x%08x PWR=0x%08x\n",
++			    POPLAR_QDSP6SS_PAGE_PA, rst, gfmux, pwr);
++		}
++		vm_offset_t rmb = ml_io_map(POPLAR_RMB_PAGE_PA, 0x1000);
++		if (rmb) {
++			uint32_t pbl = probe_rd32(rmb, RMB_PBL_STATUS_OFF);
++			uint32_t mba = probe_rd32(rmb, RMB_MBA_STATUS_OFF);
++			printf("WIFI PROBE: [4.2A] RMB Mailbox @ 0x%08x: PBL_STATUS=0x%08x MBA_STATUS=0x%08x\n",
++			    POPLAR_RMB_PAGE_PA, pbl, mba);
++		}
++	}
++
++	printf("WIFI PROBE: [4.2A] Sub-Phase 4.2A passive audit complete.\n\n");
++}
++
 +/*
 + * Main Probe Entry Point
 + * Invoked exactly once from sweet_ufs_init() in bsd/dev/sweet_ufs.c
@@ -1258,6 +1389,7 @@ new file mode 100644
 +	probe_rpm_msgram();
 +	probe_wlan_device_tree();
 +	probe_stage4_passive_audit();
++	probe_stage4_2a_passive_audit();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

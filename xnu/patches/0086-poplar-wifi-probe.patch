@@ -18,12 +18,12 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  extern void sweet_poplar_touch_init(void);
 +extern void sweet_poplar_wifi_probe(void);
  extern void sweet_usb_probe(void);
- 
+
  #define REG_CAP         0x00
-@@ -371,6 +372,107 @@ ufs_find_partition(const char *want)
+@@ -354,6 +355,107 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
- 
+
 +/*
 + * poplar: read-only access to other GPT partitions on LUNs 0-5 (modem firmware in
 + * modem partition). Never writes; the LUN0 GPT fence state is untouched.
@@ -125,6 +125,9 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 +	return error;
 +}
 +
+ static int
+ ufs_take_over_host(void)
+ {
 @@ -667,6 +769,7 @@
  	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
  	sweet_keys_init();

@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,1557 @@
+@@ -0,0 +1,1686 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1569,10 +1569,12 @@ new file mode 100644
 +					if (memcmp(e, "IMAGE      ", 11) == 0) {
 +						image_start_clus = (uint32_t)(e[26] | (e[27] << 8));
 +						found_image_dir = true;
-+						root_entries_to_read = 0;
 +						break;
 +					}
 +				}
++			}
++			if (found_image_dir || root_entries_to_read <= chunk_entries) {
++				break;
 +			}
 +			root_entries_to_read -= chunk_entries;
 +			root_bytes_read += chunk_entries * 32;
@@ -1660,6 +1662,132 @@ new file mode 100644
 +}
 +
 +/*
++ * Sub-Phase 4.4: Passive SCM PAS (Peripheral Authentication Service) Support Query
++ * Controlled by: wlan_stage4_4_passive=1
++ * 100% read-only queries via SMC #0 (PAS_IS_SUPPORTED = 0x07).
++ * Zero writes, zero memory protection changes, zero resets.
++ */
++struct scm_smc_result {
++	int64_t  status; /* x0 */
++	uint64_t val1;   /* x1 */
++	uint64_t val2;   /* x2 */
++	uint64_t val3;   /* x3 */
++};
++
++static struct scm_smc_result
++sweet_scm_call(uint64_t fid, uint64_t arginfo, uint64_t arg0, uint64_t arg1)
++{
++	register uint64_t r0 __asm__("x0") = fid;
++	register uint64_t r1 __asm__("x1") = arginfo;
++	register uint64_t r2 __asm__("x2") = arg0;
++	register uint64_t r3 __asm__("x3") = arg1;
++
++	__asm__ volatile(
++		"smc #0\n"
++		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3)
++		:
++		: "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++		  "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory"
++	);
++
++	struct scm_smc_result res;
++	res.status = (int64_t)r0;
++	res.val1   = r1;
++	res.val2   = r2;
++	res.val3   = r3;
++	return res;
++}
++
++static void
++probe_stage4_4_passive_audit(void)
++{
++	int wlan_stage4_4_passive = 0;
++	(void)PE_parse_boot_argn("wlan_stage4_4_passive", &wlan_stage4_4_passive,
++	    sizeof(wlan_stage4_4_passive));
++
++	printf("\nWIFI PROBE: [4.4] === SUB-PHASE 4.4: SCM PAS INTERFACE AUDIT ===\n");
++
++	if (wlan_stage4_4_passive <= 0) {
++		printf("WIFI PROBE: [4.4] Gate: wlan_stage4_4_passive=0 (dormant default).\n");
++		printf("WIFI PROBE: [4.4] Zero SCM PAS calls issued.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [4.4] Gate: wlan_stage4_4_passive=1 ACTIVE.\n");
++	printf("WIFI PROBE: [4.4] Safety: Pure read-only PAS_IS_SUPPORTED (0x07) queries; zero resets, zero writes.\n");
++
++	/*
++	 * Qualcomm SCM Calling Convention on AArch64:
++	 * ARM_SMCCC_OWNER_SIP = 2
++	 * QCOM_SCM_SVC_PIL    = 0x02
++	 * PAS_IS_SUPPORTED    = 0x07
++	 * FNID(0x02, 0x07)    = 0x0207
++	 * SMC64 Fast Call:    0xC2000207
++	 * SMC32 Fast Call:    0x82000207
++	 */
++	uint32_t fid_64 = 0xC2000207u;
++	uint32_t fid_32 = 0x82000207u;
++
++	/* Probe calling convention with peripheral 4 (Modem) */
++	struct scm_smc_result t64 = sweet_scm_call(fid_64, 1, 4, 0);
++	struct scm_smc_result t32 = sweet_scm_call(fid_32, 1, 4, 0);
++
++	printf("WIFI PROBE: [4.4] SMC64 (0x%08x) -> status=%lld, val1=0x%llx\n",
++	    fid_64, (long long)t64.status, (unsigned long long)t64.val1);
++	printf("WIFI PROBE: [4.4] SMC32 (0x%08x) -> status=%lld, val1=0x%llx\n",
++	    fid_32, (long long)t32.status, (unsigned long long)t32.val1);
++
++	uint32_t active_fid = fid_64;
++	if (t64.status < 0 && t32.status >= 0) {
++		active_fid = fid_32;
++		printf("WIFI PROBE: [4.4] Selecting SMC32 convention (0x%08x)\n", active_fid);
++	} else {
++		printf("WIFI PROBE: [4.4] Selecting SMC64 convention (0x%08x)\n", active_fid);
++	}
++
++	/* Known Qualcomm Peripheral IDs */
++	static const struct {
++		uint32_t id;
++		const char *name;
++	} pas_table[] = {
++		{ 0,  "Reserved / None" },
++		{ 1,  "ADSP (Audio DSP / LPASS)" },
++		{ 2,  "Reserved" },
++		{ 3,  "Modem (Alt)" },
++		{ 4,  "Modem (MSS / MPSS)" },
++		{ 5,  "Venus (Video Core)" },
++		{ 6,  "Reserved" },
++		{ 7,  "Reserved" },
++		{ 8,  "Reserved" },
++		{ 9,  "IPA (IP Accelerator)" },
++		{ 10, "Reserved" },
++		{ 11, "Reserved" },
++		{ 12, "SLPI (Sensors Core)" },
++		{ 13, "Reserved" },
++		{ 14, "GPU / Zap" },
++		{ 15, "SPSS" },
++		{ 16, "Reserved" },
++	};
++
++	unsigned supported_count = 0;
++	printf("WIFI PROBE: [4.4] Querying PAS_IS_SUPPORTED for Peripheral IDs 0..16:\n");
++	for (unsigned i = 0; i < sizeof(pas_table) / sizeof(pas_table[0]); i++) {
++		uint32_t pid = pas_table[i].id;
++		struct scm_smc_result r = sweet_scm_call(active_fid, 1, pid, 0);
++		bool supported = (r.status == 0 && r.val1 != 0);
++		if (supported) {
++			supported_count++;
++		}
++		printf("WIFI PROBE: [4.4]   PAS_ID %2u (%-26s): status=%3lld, supp=%llu -> %s\n",
++		    pid, pas_table[i].name, (long long)r.status, (unsigned long long)r.val1,
++		    supported ? "SUPPORTED (READY)" : (r.status == 0 ? "NOT SUPPORTED" : "REJECTED/UNKNOWN"));
++	}
++
++	printf("WIFI PROBE: [4.4] PAS Query Complete: %u peripheral(s) supported by TrustZone.\n", supported_count);
++	printf("WIFI PROBE: [4.4] Sub-Phase 4.4 passive audit complete.\n\n");
++}
++
++/*
 + * Main Probe Entry Point
 + * Invoked exactly once from sweet_ufs_init() in bsd/dev/sweet_ufs.c
 + * during single-threaded early BSD bootstrap before userland launch.
@@ -1692,6 +1820,7 @@ new file mode 100644
 +	probe_stage4_passive_audit();
 +	probe_stage4_2a_passive_audit();
 +	probe_stage4_3_passive_audit();
++	probe_stage4_4_passive_audit();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

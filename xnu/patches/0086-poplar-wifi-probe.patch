@@ -20,7 +20,112 @@ diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
  extern void sweet_usb_probe(void);
  
  #define REG_CAP         0x00
-@@ -667,6 +668,7 @@
+@@ -371,6 +372,107 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/*
++ * poplar: read-only access to other GPT partitions on LUNs 0-5 (modem firmware in
++ * modem partition). Never writes; the LUN0 GPT fence state is untouched.
++ */
++static struct { char name[37]; uint8_t lun; uint64_t first, nblocks; } part_cache[8];
++static unsigned part_cached;
++
++static int
++ufs_lookup_part(const char *want, unsigned *slot)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++
++	for (unsigned i = 0; i < part_cached; i++) {
++		if (strcmp(part_cache[i].name, want) == 0) {
++			*slot = i;
++			return 0;
++		}
++	}
++	if (part_cached == sizeof(part_cache) / sizeof(part_cache[0]) || strlen(want) > 36) {
++		return ENOSPC;
++	}
++	for (uint8_t lun = 0; lun < 6; lun++) {
++		su.lun = lun;
++		if (ufs_read_blocks(1, 1) != 0 || memcmp(b, "EFI PART", 8) != 0) {
++			continue;
++		}
++		uint64_t entry_lba;
++		uint32_t nent, esz;
++		memcpy(&entry_lba, b + 72, 8);
++		memcpy(&nent, b + 80, 4);
++		memcpy(&esz, b + 84, 4);
++		if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE ||
++		    ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK) != 0) {
++			continue;
++		}
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = b + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) {
++					break;
++				}
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			uint64_t first, last;
++			memcpy(&first, e + 32, 8);
++			memcpy(&last, e + 40, 8);
++			if (strcmp(name, want) != 0 || last < first) {
++				continue;
++			}
++			unsigned k = part_cached++;
++			strlcpy(part_cache[k].name, want, sizeof(part_cache[k].name));
++			part_cache[k].lun = lun;
++			part_cache[k].first = first;
++			part_cache[k].nblocks = last - first + 1;
++			printf("SWEET UFS: partition %s: LUN %u blocks 0x%llx+0x%llx (read-only)\n",
++			    want, lun, first, last - first + 1);
++			*slot = k;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++int
++sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len)
++{
++	unsigned slot = 0;
++	int error;
++
++	if (!su.ready) {
++		return EAGAIN;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t saved = su.lun;
++	error = ufs_lookup_part(want, &slot);
++	uint64_t bytes = error ? 0 : part_cache[slot].nblocks * UFS_BLOCK;
++	if (!error && (off > bytes || len > bytes - off)) {
++		error = EINVAL;
++	}
++	for (uint64_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want_b = (uint32_t)MIN(len - done, (uint64_t)(BOUNCE_SIZE - skip));
++		uint32_t blocks = (skip + want_b + UFS_BLOCK - 1) / UFS_BLOCK;
++		su.lun = part_cache[slot].lun;
++		error = ufs_read_blocks(part_cache[slot].first + pos / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(su.dma + DMA_BOUNCE) + skip, want_b);
++			done += want_b;
++		}
++	}
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+@@ -667,6 +769,7 @@
  	(void)PE_parse_boot_argn("sweethw", &hw, sizeof(hw));
  	sweet_keys_init();
  	sweet_poplar_touch_init();
@@ -32,7 +137,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,1363 @@
+@@ -0,0 +1,1557 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1359,6 +1464,199 @@ new file mode 100644
 +}
 +
 +/*
++ * Sub-Phase 4.3: Stock UFS VFAT Directory & Cluster Offset Passive Audit
++ * Gated strictly behind boot-arg: wlan_stage4_3_passive=1
++ * Reads LBA 0 of partition "modem" via sweet_ufs_read_part("modem", 0, ...).
++ * 100% read-only. Zero disk writes, zero doorbells, zero Q6 MMIO.
++ */
++extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
++
++static uint8_t s_fat_buf[4096];
++static uint8_t s_hdr_buf[64];
++
++static void
++probe_stage4_3_passive_audit(void)
++{
++	int wlan_stage4_3_passive = 0;
++	(void)PE_parse_boot_argn("wlan_stage4_3_passive", &wlan_stage4_3_passive,
++	    sizeof(wlan_stage4_3_passive));
++
++	printf("WIFI PROBE: [4.3] === SUB-PHASE 4.3: STOCK UFS VFAT DIRECTORY & CLUSTER AUDIT ===\n");
++
++	if (wlan_stage4_3_passive <= 0) {
++		printf("WIFI PROBE: [4.3] Gate: wlan_stage4_3_passive=0 (dormant default).\n");
++		printf("WIFI PROBE: [4.3] Zero modem partition reads issued.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [4.3] Gate: wlan_stage4_3_passive=1 ACTIVE.\n");
++	printf("WIFI PROBE: [4.3] Safety: Pure read-only SCSI READ(10) via sweet_ufs_read_part; zero writes.\n");
++
++	/* Step 4.3.1: Read LBA 0 (Boot Sector / BPB) of partition "modem" */
++	int err = sweet_ufs_read_part("modem", 0, s_fat_buf, 4096);
++	if (err != 0) {
++		printf("WIFI PROBE: [4.3] FAILED: sweet_ufs_read_part('modem', 0) returned error %d\n", err);
++		return;
++	}
++
++	uint16_t sig = (uint16_t)(s_fat_buf[510] | (s_fat_buf[511] << 8));
++	if (sig != 0xaa55) {
++		printf("WIFI PROBE: [4.3] FAILED: Invalid boot sector signature 0x%04x (expected 0xaa55)\n", sig);
++		return;
++	}
++
++	char oem[9];
++	memcpy(oem, &s_fat_buf[3], 8);
++	oem[8] = '\0';
++
++	uint16_t bytes_per_sec = (uint16_t)(s_fat_buf[11] | (s_fat_buf[12] << 8));
++	uint8_t  sec_per_clus  = s_fat_buf[13];
++	uint16_t rsvd_sec_cnt  = (uint16_t)(s_fat_buf[14] | (s_fat_buf[15] << 8));
++	uint8_t  num_fats      = s_fat_buf[16];
++	uint16_t root_ent_cnt  = (uint16_t)(s_fat_buf[17] | (s_fat_buf[18] << 8));
++	uint16_t tot_sec_16    = (uint16_t)(s_fat_buf[19] | (s_fat_buf[20] << 8));
++	uint16_t fat_sz_16     = (uint16_t)(s_fat_buf[22] | (s_fat_buf[23] << 8));
++	uint32_t tot_sec_32    = (uint32_t)(s_fat_buf[32] | (s_fat_buf[33] << 8) | (s_fat_buf[34] << 16) | (s_fat_buf[35] << 24));
++	uint32_t fat_sz_32     = (uint32_t)(s_fat_buf[36] | (s_fat_buf[37] << 8) | (s_fat_buf[38] << 16) | (s_fat_buf[39] << 24));
++	uint32_t root_clus     = (uint32_t)(s_fat_buf[44] | (s_fat_buf[45] << 8) | (s_fat_buf[46] << 16) | (s_fat_buf[47] << 24));
++
++	if (bytes_per_sec == 0 || sec_per_clus == 0) {
++		printf("WIFI PROBE: [4.3] FAILED: Invalid BPB geometry (bytes_per_sec=%u, sec_per_clus=%u)\n",
++		    bytes_per_sec, sec_per_clus);
++		return;
++	}
++
++	uint32_t tot_sec = (tot_sec_16 != 0) ? tot_sec_16 : tot_sec_32;
++	uint32_t fat_sz  = (fat_sz_16 != 0) ? fat_sz_16 : fat_sz_32;
++	bool is_fat32    = (fat_sz_16 == 0 && root_ent_cnt == 0);
++
++	printf("WIFI PROBE: [4.3] BPB Decoded: OEM='%s' Type=%s Bps=%u Spc=%u Rsvd=%u FATs=%u FatSz=%u TotSec=%u\n",
++	    oem, is_fat32 ? "FAT32" : "FAT16", bytes_per_sec, sec_per_clus, rsvd_sec_cnt, num_fats, fat_sz, tot_sec);
++	printf("WIFI PROBE: [4.3]   Cluster Size: %u bytes (%u KiB)\n",
++	    (uint32_t)bytes_per_sec * sec_per_clus, ((uint32_t)bytes_per_sec * sec_per_clus) / 1024);
++
++	uint32_t root_dir_sec = rsvd_sec_cnt + (num_fats * fat_sz);
++	uint32_t root_dir_sz_sec = ((uint32_t)root_ent_cnt * 32u + bytes_per_sec - 1u) / bytes_per_sec;
++	uint32_t data_start_sec = is_fat32 ? root_dir_sec : (root_dir_sec + root_dir_sz_sec);
++
++	printf("WIFI PROBE: [4.3]   Root Dir Start Sec: %u (sectors: %u), Data Start Sec: %u\n",
++	    root_dir_sec, root_dir_sz_sec, data_start_sec);
++
++	/* Step 4.3.2: Walk Root Directory to find 'IMAGE' subdirectory */
++	uint32_t image_start_clus = 0;
++	bool found_image_dir = false;
++
++	if (!is_fat32) {
++		uint32_t root_entries_to_read = root_ent_cnt;
++		uint32_t root_bytes_read = 0;
++		while (root_entries_to_read > 0) {
++			uint32_t chunk_entries = root_entries_to_read > (4096 / 32) ? (4096 / 32) : root_entries_to_read;
++			uint64_t root_off = (uint64_t)root_dir_sec * bytes_per_sec + root_bytes_read;
++			err = sweet_ufs_read_part("modem", root_off, s_fat_buf, chunk_entries * 32);
++			if (err != 0) {
++				printf("WIFI PROBE: [4.3] FAILED reading root directory @ offset 0x%llx: %d\n", (unsigned long long)root_off, err);
++				break;
++			}
++			for (uint32_t i = 0; i < chunk_entries; i++) {
++				uint8_t *e = &s_fat_buf[i * 32];
++				if (e[0] == 0x00) { root_entries_to_read = 0; break; }
++				if (e[0] == 0xe5) continue;
++				if (e[11] == 0x0f) continue; /* LFN */
++				if (e[11] & 0x10) { /* Subdirectory */
++					if (memcmp(e, "IMAGE      ", 11) == 0) {
++						image_start_clus = (uint32_t)(e[26] | (e[27] << 8));
++						found_image_dir = true;
++						root_entries_to_read = 0;
++						break;
++					}
++				}
++			}
++			root_entries_to_read -= chunk_entries;
++			root_bytes_read += chunk_entries * 32;
++		}
++	} else {
++		/* FAT32 root directory cluster walk */
++		uint64_t root_off = (uint64_t)(data_start_sec + (root_clus - 2) * sec_per_clus) * bytes_per_sec;
++		err = sweet_ufs_read_part("modem", root_off, s_fat_buf, 4096);
++		if (err == 0) {
++			for (uint32_t i = 0; i < 4096 / 32; i++) {
++				uint8_t *e = &s_fat_buf[i * 32];
++				if (e[0] == 0x00) break;
++				if (e[0] == 0xe5 || e[11] == 0x0f) continue;
++				if (e[11] & 0x10) {
++					if (memcmp(e, "IMAGE      ", 11) == 0) {
++						image_start_clus = (uint32_t)(e[26] | (e[27] << 8) | (e[20] << 16) | (e[21] << 24));
++						found_image_dir = true;
++						break;
++					}
++				}
++			}
++		}
++	}
++
++	if (!found_image_dir) {
++		printf("WIFI PROBE: [4.3] Notice: 'IMAGE' subdirectory not found in root dir; scanning root dir.\n");
++	} else {
++		printf("WIFI PROBE: [4.3] Found 'IMAGE' subdirectory: Starting Cluster = %u\n", image_start_clus);
++	}
++
++	/* Step 4.3.3: Walk directory entries in /IMAGE/ (or root) to locate target firmware */
++	uint64_t dir_cluster_off = found_image_dir ?
++	    (uint64_t)(data_start_sec + (image_start_clus - 2) * sec_per_clus) * bytes_per_sec :
++	    (uint64_t)root_dir_sec * bytes_per_sec;
++
++	printf("WIFI PROBE: [4.3] Scanning directory entries @ offset 0x%llx...\n", (unsigned long long)dir_cluster_off);
++	static const struct { const char *s83; const char *friendly; } targets[] = {
++		{ "MBA     MBN", "mba.mbn" },
++		{ "MODEM   MDT", "modem.mdt" },
++		{ "WLANMDSPMBN", "wlanmdsp.mbn" },
++		{ "BDWLAN  BIN", "bdwlan.bin" },
++		{ "MODEM   B00", "modem.b00" },
++		{ "MODEM   B01", "modem.b01" },
++		{ "MODEM   B02", "modem.b02" },
++		{ "MODEM   B12", "modem.b12" },
++		{ "MODEM   B17", "modem.b17" },
++		{ "MODEM   B22", "modem.b22" },
++	};
++	unsigned target_count = sizeof(targets) / sizeof(targets[0]);
++	unsigned matched_count = 0;
++
++	for (uint32_t chunk = 0; chunk < 4; chunk++) {
++		err = sweet_ufs_read_part("modem", dir_cluster_off + (chunk * 4096), s_fat_buf, 4096);
++		if (err != 0) break;
++
++		for (uint32_t i = 0; i < 4096 / 32; i++) {
++			uint8_t *e = &s_fat_buf[i * 32];
++			if (e[0] == 0x00) goto done_scan;
++			if (e[0] == 0xe5 || e[11] == 0x0f) continue;
++
++			for (unsigned t = 0; t < target_count; t++) {
++				if (memcmp(e, targets[t].s83, 11) == 0) {
++					uint32_t clus = (uint32_t)(e[26] | (e[27] << 8));
++					if (is_fat32) clus |= ((uint32_t)(e[20] | (e[21] << 8)) << 16);
++					uint32_t fsize = (uint32_t)(e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24));
++					uint64_t file_part_off = (uint64_t)(data_start_sec + (clus - 2) * sec_per_clus) * bytes_per_sec;
++
++					/* Read first 16 bytes of the file to verify magic header */
++					memset(s_hdr_buf, 0, sizeof(s_hdr_buf));
++					(void)sweet_ufs_read_part("modem", file_part_off, s_hdr_buf, 16);
++
++					printf("WIFI PROBE: [4.3]   MATCH: %-12s Clus=%-6u PartOff=0x%08llx Size=%-8u [Hdr: %02x %02x %02x %02x %02x %02x %02x %02x]\n",
++					    targets[t].friendly, clus, (unsigned long long)file_part_off, fsize,
++					    s_hdr_buf[0], s_hdr_buf[1], s_hdr_buf[2], s_hdr_buf[3],
++					    s_hdr_buf[4], s_hdr_buf[5], s_hdr_buf[6], s_hdr_buf[7]);
++
++					matched_count++;
++				}
++			}
++		}
++	}
++done_scan:
++	printf("WIFI PROBE: [4.3] Target audit complete: %u key firmware files verified on live partition.\n", matched_count);
++	printf("WIFI PROBE: [4.3] Sub-Phase 4.3 passive audit complete.\n\n");
++}
++
++/*
 + * Main Probe Entry Point
 + * Invoked exactly once from sweet_ufs_init() in bsd/dev/sweet_ufs.c
 + * during single-threaded early BSD bootstrap before userland launch.
@@ -1390,6 +1688,7 @@ new file mode 100644
 +	probe_wlan_device_tree();
 +	probe_stage4_passive_audit();
 +	probe_stage4_2a_passive_audit();
++	probe_stage4_3_passive_audit();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

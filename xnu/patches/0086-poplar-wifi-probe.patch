@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2052 @@
+@@ -0,0 +1,2137 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1815,6 +1815,36 @@ new file mode 100644
 +	}
 +
 +	printf("WIFI PROBE: [4.4] PAS Query Complete: %u peripheral(s) supported by TrustZone.\n", supported_count);
++
++	/* Query SCM_SVC_INFO (0x06) / IS_CALL_AVAIL (0x01) */
++	printf("WIFI PROBE: [4.4] Querying SCM IS_CALL_AVAILABLE capabilities:\n");
++	static const struct {
++		uint32_t svc;
++		uint32_t cmd;
++		const char *name;
++	} scm_query_table[] = {
++		{ 0x01, 0x01, "SVC_BOOT / BOOT_ADDR" },
++		{ 0x02, 0x01, "SVC_PIL / PAS_INIT_IMAGE" },
++		{ 0x02, 0x02, "SVC_PIL / PAS_MEM_SETUP" },
++		{ 0x02, 0x05, "SVC_PIL / PAS_AUTH_AND_RESET" },
++		{ 0x02, 0x07, "SVC_PIL / PAS_IS_SUPPORTED" },
++		{ 0x06, 0x01, "SVC_INFO / IS_CALL_AVAIL" },
++		{ 0x0C, 0x16, "SVC_MP / MP_ASSIGN" },
++		{ 0x0C, 0x05, "SVC_MP / RESTORE_SEC_CFG" },
++		{ 0x0C, 0x10, "SVC_MP / IOMMU_SECURE_PTBL_INIT" },
++	};
++	uint32_t info_fid64 = 0xC2000601u;
++	uint32_t info_fid32 = 0x82000601u;
++	for (unsigned i = 0; i < sizeof(scm_query_table) / sizeof(scm_query_table[0]); i++) {
++		uint32_t target_fnid = (2u << 24) | (scm_query_table[i].svc << 8) | scm_query_table[i].cmd;
++		struct scm_smc_result r64 = sweet_scm_call(info_fid64, 1, target_fnid, 0);
++		struct scm_smc_result r32 = sweet_scm_call(info_fid32, 1, target_fnid, 0);
++		printf("WIFI PROBE: [4.4]   %-35s (FNID 0x%08x): SMC64=%lld(v1=%llx) SMC32=%lld(v1=%llx)\n",
++		    scm_query_table[i].name, target_fnid,
++		    (long long)r64.status, (unsigned long long)r64.val1,
++		    (long long)r32.status, (unsigned long long)r32.val1);
++	}
++
 +	printf("WIFI PROBE: [4.4] Sub-Phase 4.4 passive audit complete.\n\n");
 +}
 +
@@ -1871,8 +1901,12 @@ new file mode 100644
 +#define QDSP6SS_GFMUX_CTL_REG       0x020
 +#define QDSP6SS_PWR_CTL_REG         0x030
 +#define QDSP6V6SS_MEM_PWR_CTL       0x034
++#define QDSP6SS_XO_CBCR             0x038
++#define QDSP6SS_SLEEP_CBCR          0x03C
 +#define QDSP6SS_BHS_STATUS_REG      0x078
++#define QDSP6SS_MEM_PWR_CTL_ALT     0x0B0
 +#define QDSP6V62SS_BHS_STATUS       0x0C4
++#define QDSP6SS_STRAP_ACC           0x110
 +#define QDSP6SS_BOOT_CORE_START     0x400
 +#define QDSP6SS_BOOT_CMD            0x404
 +
@@ -2003,37 +2037,64 @@ new file mode 100644
 +	uint32_t init_q6_rst  = *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG);
 +	uint32_t init_q6_gfm  = *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG);
 +	uint32_t init_q6_pwr  = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
-+	uint32_t init_q6_bhs  = *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS);
++	uint32_t init_q6_xo   = *(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR);
++	uint32_t init_q6_slp  = *(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR);
++	uint32_t init_q6_b78  = *(volatile uint32_t *)(q6_va + QDSP6SS_BHS_STATUS_REG);
++	uint32_t init_q6_bc4  = *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS);
 +	printf("WIFI PROBE: [4.5] Initial States (Clock Active):\n");
-+	printf("WIFI PROBE: [4.5]   RMB: IMG=0x%08x PBL=0x%08x CMD=0x%08x MBA=0x%08x MSS=0x%08x\n",
++	printf("WIFI PROBE: [4.5]   RMB:  IMG=0x%08x PBL=0x%08x CMD=0x%08x MBA=0x%08x MSS=0x%08x\n",
 +	    init_rmb_img, init_rmb_pbl, init_rmb_cmd, init_rmb_mba, init_rmb_mss);
-+	printf("WIFI PROBE: [4.5]   Q6SS: RESET=0x%08x GFMUX=0x%08x PWR_CTL=0x%08x BHS=0x%08x\n",
-+	    init_q6_rst, init_q6_gfm, init_q6_pwr, init_q6_bhs);
++	printf("WIFI PROBE: [4.5]   Q6SS: RST=0x%08x GFM=0x%08x PWR=0x%08x XO=0x%08x SLP=0x%08x\n",
++	    init_q6_rst, init_q6_gfm, init_q6_pwr, init_q6_xo, init_q6_slp);
++	printf("WIFI PROBE: [4.5]         BHS_078=0x%08x BHS_0C4=0x%08x\n",
++	    init_q6_b78, init_q6_bc4);
 +
-+	/* 10. Assert Core and Bus Resets before configuring power */
++	/* 10. Enable Q6SS Subsystem Clocks: XO CBCR (0x038) and SLEEP CBCR (0x03C) */
++	*(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR) |= 1;
++	__asm__ volatile("dmb sy" ::: "memory");
++	for (int i = 0; i < 200; i++) {
++		if ((*(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR) & (1u << 31)) == 0)
++			break;
++		delay(1);
++	}
++
++	*(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR) |= 1;
++	__asm__ volatile("dmb sy" ::: "memory");
++	for (int i = 0; i < 200; i++) {
++		if ((*(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR) & (1u << 31)) == 0)
++			break;
++		delay(1);
++	}
++	uint32_t xo_now = *(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR);
++	uint32_t slp_now = *(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR);
++	printf("WIFI PROBE: [4.5] Q6SS CBCRs un-gated: XO=0x%08x (off=%u) SLEEP=0x%08x (off=%u)\n",
++	    xo_now, (xo_now >> 31) & 1, slp_now, (slp_now >> 31) & 1);
++
++	/* 11. Assert Core and Bus Resets before configuring power */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) = 0x7;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
-+	/* 11. Turn on Block HeadSwitch (BHS) in QDSP6SS_PWR_CTL_REG */
++	/* 12. Turn on Block HeadSwitch (BHS) in QDSP6SS_PWR_CTL_REG */
 +	uint32_t q6_pwr = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
 +	q6_pwr |= (1u << 24); /* QDSP6v55_BHS_ON */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	delay(10);
 +
-+	/* 12. Poll QDSP6V62SS_BHS_STATUS for BHS_EN_REST_ACK (bit 0) */
-+	uint32_t bhs_val = 0;
++	/* 13. Poll both QDSP6SS_BHS_STATUS_REG (0x078) and QDSP6V62SS_BHS_STATUS (0x0C4) */
++	uint32_t bhs_078 = 0, bhs_0c4 = 0;
 +	bool bhs_ack = false;
 +	for (int i = 0; i < 500; i++) {
-+		bhs_val = *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS);
-+		if ((bhs_val & 1) != 0) {
++		bhs_078 = *(volatile uint32_t *)(q6_va + QDSP6SS_BHS_STATUS_REG);
++		bhs_0c4 = *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS);
++		if ((bhs_078 & 1) != 0 || (bhs_0c4 & 1) != 0) {
 +			bhs_ack = true;
 +			break;
 +		}
 +		delay(10);
 +	}
-+	printf("WIFI PROBE: [4.5] Q6SS BHS Power-Up: BHS_STATUS=0x%08x (ACK=%u) -> %s\n",
-+	    bhs_val, bhs_val & 1, bhs_ack ? "STABILIZED" : "TIMEOUT");
++	printf("WIFI PROBE: [4.5] Q6SS BHS Power-Up: BHS_078=0x%08x BHS_0C4=0x%08x -> %s\n",
++	    bhs_078, bhs_0c4, bhs_ack ? "STABILIZED" : "TIMEOUT");
 +
 +	/* 13. Sequential Memory Power-Up: QDSP6V6SS_MEM_PWR_CTL (bits 28 down to 0) */
 +	uint32_t mem_pwr = *(volatile uint32_t *)(q6_va + QDSP6V6SS_MEM_PWR_CTL);
@@ -2154,6 +2215,30 @@ new file mode 100644
 +		printf("WIFI PROBE: [4.5] Note: Polling cycle complete. Final: PBL=0x%08x MBA=0x%08x MSS=0x%08x\n",
 +		    last_pbl, last_mba, last_mss);
 +	}
++
++	/* 21. Complete Register Block Audit Post-Boot Trigger */
++	printf("WIFI PROBE: [4.5] Register Audit Post-Poll:\n");
++	printf("WIFI PROBE: [4.5]   RMB:  IMG=0x%08x PBL=0x%08x CMD=0x%08x MBA=0x%08x MSS=0x%08x ALT=0x%08x\n",
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_COMMAND_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_MSS_STATUS),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_ALT_RESET));
++	printf("WIFI PROBE: [4.5]   Q6SS: RST=0x%08x GFM=0x%08x PWR=0x%08x MEM=0x%08x XO=0x%08x SLP=0x%08x\n",
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG),
++	    *(volatile uint32_t *)(q6_va + QDSP6V6SS_MEM_PWR_CTL),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR));
++	printf("WIFI PROBE: [4.5]         B078=0x%08x B0C4=0x%08x M0B0=0x%08x STRAP=0x%08x CORE=0x%08x CMD=0x%08x\n",
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_BHS_STATUS_REG),
++	    *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_MEM_PWR_CTL_ALT),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_STRAP_ACC),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CORE_START),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CMD));
 +	printf("WIFI PROBE: [4.5] Sub-Phase 4.5 active MBA load complete.\n\n");
 +}
 +

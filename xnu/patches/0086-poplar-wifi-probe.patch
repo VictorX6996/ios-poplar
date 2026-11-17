@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2137 @@
+@@ -0,0 +1,2311 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1729,6 +1729,164 @@ new file mode 100644
 +	return res;
 +}
 +
++static struct scm_smc_result
++sweet_scm_call6(uint64_t fid, uint64_t arginfo, uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3)
++{
++	register uint64_t r0 __asm__("x0") = fid;
++	register uint64_t r1 __asm__("x1") = arginfo;
++	register uint64_t r2 __asm__("x2") = arg0;
++	register uint64_t r3 __asm__("x3") = arg1;
++	register uint64_t r4 __asm__("x4") = arg2;
++	register uint64_t r5 __asm__("x5") = arg3;
++
++	__asm__ volatile(
++		"smc #0\n"
++		: "+r"(r0), "+r"(r1), "+r"(r2), "+r"(r3), "+r"(r4), "+r"(r5)
++		:
++		: "x6", "x7", "x8", "x9", "x10", "x11",
++		  "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory"
++	);
++
++	struct scm_smc_result res;
++	res.status = (int64_t)r0;
++	res.val1   = r1;
++	res.val2   = r2;
++	res.val3   = r3;
++	return res;
++}
++
++/*
++ * Qualcomm SCM Memory Protection (MP) structures for QCOM_SCM_MP_ASSIGN (0x16)
++ * Upstream reference: drivers/firmware/qcom/qcom_scm.c
++ */
++struct qcom_scm_mem_map_info {
++	uint64_t mem_addr;
++	uint64_t mem_size;
++};
++
++struct qcom_scm_current_perm_info {
++	uint32_t vmid;
++	uint32_t perm;
++	uint64_t ctx;
++	uint32_t ctx_size;
++	uint32_t unused;
++};
++
++#define QCOM_SCM_VMID_HLOS          0x3
++#define QCOM_SCM_VMID_MSS_MSA       0xF
++#define QCOM_SCM_PERM_RW            0x6
++#define QCOM_SCM_PERM_RWX           0x7
++
++#define PIL_MPSS_PHYS_BASE          0x8cc00000ULL
++#define PIL_MPSS_SIZE               0x07000000ULL /* 112 MiB */
++
++static uint64_t
++sweet_va_to_pa(vm_offset_t va)
++{
++	uint64_t par = 0;
++	__asm__ volatile(
++		"at s1e1r, %1\n"
++		"isb\n"
++		"mrs %0, par_el1\n"
++		: "=r"(par)
++		: "r"(va)
++		: "memory"
++	);
++	if (par & 1) {
++		return 0;
++	}
++	return (par & 0x0000FFFFFFFFF000ULL) | ((uint64_t)va & 0xFFFULL);
++}
++
++static uint8_t s_scm_scratch_buf[4096] __attribute__((aligned(4096)));
++
++#define SCM_OFFSET_MEM_MAP   0x000
++#define SCM_OFFSET_SRC       0x040
++#define SCM_OFFSET_DEST      0x080
++#define SCM_OFFSET_EXT_ARGS  0x0C0
++
++static int
++sweet_scm_assign_mem(uint64_t mem_addr, uint64_t mem_size, uint32_t src_vmid, uint32_t dest_vmid, uint32_t dest_perm)
++{
++	uint64_t buf_pa = sweet_va_to_pa((vm_offset_t)s_scm_scratch_buf);
++	if (buf_pa == 0) {
++		printf("WIFI PROBE: [4.5] sweet_va_to_pa returned fault; fallback to PA 0x942e0000\n");
++		buf_pa = 0x942e0000ULL;
++	}
++
++	uint64_t mem_map_pa  = buf_pa + SCM_OFFSET_MEM_MAP;
++	uint64_t src_pa      = buf_pa + SCM_OFFSET_SRC;
++	uint64_t dest_pa     = buf_pa + SCM_OFFSET_DEST;
++	uint64_t ext_args_pa = buf_pa + SCM_OFFSET_EXT_ARGS;
++
++	memset(s_scm_scratch_buf, 0, sizeof(s_scm_scratch_buf));
++
++	/* 1. Memory Region Descriptor */
++	struct qcom_scm_mem_map_info *map = (struct qcom_scm_mem_map_info *)(s_scm_scratch_buf + SCM_OFFSET_MEM_MAP);
++	map->mem_addr = mem_addr;
++	map->mem_size = mem_size;
++
++	/* 2. Source VMID Descriptor: 1 entry */
++	uint32_t *src = (uint32_t *)(s_scm_scratch_buf + SCM_OFFSET_SRC);
++	src[0] = src_vmid;
++	uint64_t src_sz = sizeof(uint32_t); /* 4 bytes */
++
++	/* 3. Destination Permission Descriptor: 1 entry */
++	struct qcom_scm_current_perm_info *dest = (struct qcom_scm_current_perm_info *)(s_scm_scratch_buf + SCM_OFFSET_DEST);
++	dest->vmid = dest_vmid;
++	dest->perm = dest_perm;
++	dest->ctx = 0;
++	dest->ctx_size = 0;
++	dest->unused = 0;
++	uint64_t dest_sz = sizeof(struct qcom_scm_current_perm_info); /* 24 bytes */
++
++	/* 4. Extended Arguments: [src_sz, dest_pa, dest_sz, 0] */
++	uint64_t *ext = (uint64_t *)(s_scm_scratch_buf + SCM_OFFSET_EXT_ARGS);
++	ext[0] = src_sz;
++	ext[1] = dest_pa;
++	ext[2] = dest_sz;
++	ext[3] = 0;
++
++	/* Clean cache to Point of Coherence for the descriptor buffer */
++	for (uintptr_t p = (uintptr_t)s_scm_scratch_buf;
++	     p < (uintptr_t)s_scm_scratch_buf + 256;
++	     p += 64) {
++		__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy\nisb" ::: "memory");
++
++	uint64_t fid = 0xC2000C16ULL; /* SMC64 Fast Call: SIP, SVC_MP (0x0C), MP_ASSIGN (0x16) */
++	uint64_t arginfo = 0x1117ULL; /* 7 args: RO, VAL, RO, VAL, RO, VAL, VAL */
++
++	struct scm_smc_result res;
++	int retry = 0;
++	do {
++		res = sweet_scm_call6(fid, arginfo, mem_map_pa, sizeof(struct qcom_scm_mem_map_info), src_pa, ext_args_pa);
++		if (res.status == -12) { /* EBUSY */
++			delay(1000);
++		}
++	} while (res.status == -12 && ++retry < 20);
++
++	printf("WIFI PROBE: [4.5] MP_ASSIGN(0x%llx, %llu MiB) -> status=%lld, v1=0x%llx, v2=0x%llx (retries=%d)\n",
++	    (unsigned long long)mem_addr, (unsigned long long)(mem_size >> 20),
++	    (long long)res.status, (unsigned long long)res.val1, (unsigned long long)res.val2, retry);
++
++	/* If SMC64 failed with non-zero and dest_perm == QCOM_SCM_PERM_RW, try RWX as fallback */
++	if (res.status != 0 && dest_perm == QCOM_SCM_PERM_RW) {
++		printf("WIFI PROBE: [4.5]   Retrying MP_ASSIGN with PERM_RWX (0x7)...\n");
++		dest->perm = QCOM_SCM_PERM_RWX;
++		for (uintptr_t p = (uintptr_t)s_scm_scratch_buf; p < (uintptr_t)s_scm_scratch_buf + 256; p += 64) {
++			__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++		}
++		__asm__ volatile("dsb sy\nisb" ::: "memory");
++		res = sweet_scm_call6(fid, arginfo, mem_map_pa, sizeof(struct qcom_scm_mem_map_info), src_pa, ext_args_pa);
++		printf("WIFI PROBE: [4.5]   MP_ASSIGN fallback (PERM_RWX): status=%lld, v1=0x%llx\n",
++		    (long long)res.status, (unsigned long long)res.val1);
++	}
++
++	return (int)res.status;
++}
++
 +static void
 +probe_stage4_4_passive_audit(void)
 +{
@@ -1966,6 +2124,17 @@ new file mode 100644
 +	__asm__ volatile("dsb sy\nisb" ::: "memory");
 +	printf("WIFI PROBE: [4.5] Data cache cleaned to Point of Coherence for MBA memory region.\n");
 +
++	/* 4.1 Sub-Phase 4.5D: TrustZone Memory Protection Assignment (MP_ASSIGN) */
++	printf("WIFI PROBE: [4.5] Sub-Phase 4.5D: Reassigning memory ownership HLOS (0x3) -> MSS_MSA (0xF)...\n");
++	int assign_mpss = sweet_scm_assign_mem(PIL_MPSS_PHYS_BASE, PIL_MPSS_SIZE,
++	    QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW);
++	int assign_mba = sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_SIZE,
++	    QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW);
++
++	printf("WIFI PROBE: [4.5] MP_ASSIGN Results: MPSS=%s (%d), MBA=%s (%d)\n",
++	    assign_mpss == 0 ? "SUCCESS" : "FAILED", assign_mpss,
++	    assign_mba == 0 ? "SUCCESS" : "FAILED", assign_mba);
++
 +	/* 5. Map Safe Control Registers First (GCC & TCSR) */
 +	vm_offset_t gcc_va  = ml_io_map(GCC_MSS_AHB_PHYS_BASE, GCC_MSS_AHB_SIZE);
 +	vm_offset_t halt_va = ml_io_map(TCSR_MSS_HALT_PHYS_BASE, TCSR_MSS_HALT_SIZE);
@@ -2173,17 +2342,22 @@ new file mode 100644
 +	uint32_t last_mss = 0xFFFFFFFF;
 +	bool success = false;
 +
-+	for (int iter = 0; iter <= 200; iter++) {
++	for (int iter = 0; iter <= 400; iter++) {
 +		uint32_t cur_pbl = *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG);
 +		uint32_t cur_mba = *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG);
 +		uint32_t cur_mss = *(volatile uint32_t *)(rmb_va + RMB_MBA_MSS_STATUS);
 +
-+		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 200) {
++		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 400) {
 +			printf("WIFI PROBE: [4.5]   t=%4d ms | PBL=0x%08x MBA=0x%08x MSS=0x%08x\n",
 +			    iter * 5, cur_pbl, cur_mba, cur_mss);
 +			last_pbl = cur_pbl;
 +			last_mba = cur_mba;
 +			last_mss = cur_mss;
++		}
++
++		if (cur_pbl == 1 && last_pbl != 1) {
++			printf("WIFI PROBE: [4.5] *** PBL HANDSHAKE SUCCESS! PBL=0x00000001 (MBA Authenticated & Launched) at t=%d ms ***\n",
++			    iter * 5);
 +		}
 +
 +		/*

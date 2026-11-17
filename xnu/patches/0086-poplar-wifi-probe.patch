@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2311 @@
+@@ -0,0 +1,2392 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -2044,15 +2044,26 @@ new file mode 100644
 +#define PIL_MBA_PHYS_BASE           0x94100000ULL
 +#define PIL_MBA_SIZE                0x00200000ULL /* 2 MiB carveout */
 +
++/* RMB Registers (MSM8998 DTB: 0x04180000, 0x20) */
 +#define RMB_PHYS_BASE               0x04180000ULL
 +#define RMB_SIZE                    0x00001000ULL /* 4 KiB page */
 +#define RMB_MBA_IMAGE_REG           0x00
 +#define RMB_PBL_STATUS_REG          0x04
 +#define RMB_MBA_COMMAND_REG         0x08
 +#define RMB_MBA_STATUS_REG          0x0C
++#define RMB_PMI_META_DATA_REG       0x10
++#define RMB_PMI_CODE_START_REG      0x14
++#define RMB_PMI_CODE_LENGTH_REG     0x18
++#define RMB_PROTOCOL_VERSION_REG    0x1C
++#define RMB_MBA_DEBUG_INFO_REG      0x20
 +#define RMB_MBA_MSS_STATUS          0x40
 +#define RMB_MBA_ALT_RESET           0x44
 +
++#define STATUS_PBL_SUCCESS          0x1
++#define STATUS_XPU_UNLOCKED         0x1
++#define STATUS_XPU_UNLOCKED_SCRIBBLED 0x2
++
++/* QDSP6SS Registers (MSM8998 DTB: 0x04080000, 0x100) */
 +#define QDSP6SS_PHYS_BASE           0x04080000ULL
 +#define QDSP6SS_SIZE                0x00001000ULL /* 4 KiB page */
 +#define QDSP6SS_RESET_REG           0x014
@@ -2065,17 +2076,48 @@ new file mode 100644
 +#define QDSP6SS_MEM_PWR_CTL_ALT     0x0B0
 +#define QDSP6V62SS_BHS_STATUS       0x0C4
 +#define QDSP6SS_STRAP_ACC           0x110
-+#define QDSP6SS_BOOT_CORE_START     0x400
-+#define QDSP6SS_BOOT_CMD            0x404
 +
++/* QDSP6SS Control Bits (per Qualcomm pil-q6v5.c) */
++#define Q6SS_STOP_CORE              (1u << 0)
++#define Q6SS_CORE_ARES              (1u << 1)
++#define Q6SS_BUS_ARES_ENA           (1u << 2)
++
++#define Q6SS_CLK_ENA                (1u << 1)
++
++#define QDSP6v55_BHS_ON             (1u << 24)
++#define QDSP6v55_LDO_BYP            (1u << 25)
++#define QDSP6v55_CLAMP_QMC_MEM      (1u << 22)
++#define QDSP6v55_CLAMP_WL           (1u << 21)
++#define Q6SS_CLAMP_IO               (1u << 20)
++#define Q6SS_SLP_RET_N              (1u << 19)
++#define Q6SS_L2DATA_STBY_N          (1u << 18)
++
++#define QDSP6v55_BHS_EN_REST_ACK    (1u << 0)
++
++/* TCSR MSS Halt Ports (MSM8998 DTB: halt_q6=0x01f63000, halt_nc=0x01f64000, halt_modem=0x01f65000) */
 +#define TCSR_MSS_HALT_PHYS_BASE     0x01f63000ULL
-+#define TCSR_MSS_HALT_SIZE          0x00001000ULL /* 4 KiB page */
++#define TCSR_MSS_HALT_SIZE          0x00003000ULL /* 3 contiguous 4KB pages */
++#define TCSR_HALT_Q6_OFFSET         0x0000
++#define TCSR_HALT_NC_OFFSET         0x1000
++#define TCSR_HALT_MODEM_OFFSET      0x2000
 +
-+#define GCC_MSS_AHB_PHYS_BASE       0x0018a000ULL
-+#define GCC_MSS_AHB_SIZE            0x00001000ULL /* 4 KiB page covering all MSS CBCR registers */
++#define AXI_HALTREQ_OFF             0x00
++#define AXI_HALTACK_OFF             0x04
++#define AXI_IDLE_OFF                0x08
 +
-+#define GCC_MSS_RESTART_PHYS_BASE   0x00179000ULL
-+#define GCC_MSS_RESTART_SIZE        0x00001000ULL /* 4 KiB page */
++/* GCC Register Base (covers all clock CBCRs and MSS restart) */
++#define GCC_PHYS_BASE               0x00100000ULL
++#define GCC_PHYS_SIZE               0x00090000ULL /* 576 KiB */
++
++#define GCC_BOOT_ROM_AHB_CBCR_OFF   0x38004
++#define GCC_BIMC_MSS_Q6_AXI_CBCR_OFF 0x4401C
++#define GCC_APCS_CLK_ENA_VOTE_OFF   0x52004 /* bit 10: boot_rom_ahb */
++#define GCC_APCS_CLK_ENA_VOTE_1_OFF 0x5200C /* bit 2: gpll0_mss */
++#define GCC_MSS_RESTART_OFF         0x79000
++#define GCC_MSS_CFG_AHB_CBCR_OFF    0x8A000
++#define GCC_MSS_MNOC_BIMC_CBCR_OFF  0x8A004
++#define GCC_MSS_SNOC_AXI_CBCR_OFF   0x8A03C
++#define GCC_MSS_Q6_BIMC_CBCR_OFF    0x8A040
 +
 +static void
 +probe_stage4_5_active_mba_load(void)
@@ -2135,33 +2177,69 @@ new file mode 100644
 +	    assign_mpss == 0 ? "SUCCESS" : "FAILED", assign_mpss,
 +	    assign_mba == 0 ? "SUCCESS" : "FAILED", assign_mba);
 +
-+	/* 5. Map Safe Control Registers First (GCC & TCSR) */
-+	vm_offset_t gcc_va  = ml_io_map(GCC_MSS_AHB_PHYS_BASE, GCC_MSS_AHB_SIZE);
++	/* 5. Map Control Register Blocks (GCC & TCSR AXI Halts) */
++	vm_offset_t gcc_va  = ml_io_map(GCC_PHYS_BASE, GCC_PHYS_SIZE);
 +	vm_offset_t halt_va = ml_io_map(TCSR_MSS_HALT_PHYS_BASE, TCSR_MSS_HALT_SIZE);
-+	vm_offset_t rst_va  = ml_io_map(GCC_MSS_RESTART_PHYS_BASE, GCC_MSS_RESTART_SIZE);
 +
-+	if (!gcc_va || !halt_va || !rst_va) {
-+		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC or TCSR control register blocks.\n");
++	if (!gcc_va || !halt_va) {
++		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC (0x%llx) or TCSR Halt (0x%llx) blocks.\n",
++		    (unsigned long long)GCC_PHYS_BASE, (unsigned long long)TCSR_MSS_HALT_PHYS_BASE);
 +		return;
 +	}
 +
-+	/* 6. Dump Initial Safe Clock and Bus States */
-+	uint32_t init_ahb   = *(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF);
-+	uint32_t init_mnoc  = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
-+	uint32_t init_snoc  = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
-+	uint32_t init_q6clk = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
-+	uint32_t init_halt  = *(volatile uint32_t *)(halt_va + 0x00);
-+	uint32_t init_rst   = *(volatile uint32_t *)(rst_va + 0x00);
-+	printf("WIFI PROBE: [4.5] Initial Safe Bus/Clock States:\n");
-+	printf("WIFI PROBE: [4.5]   GCC MSS Clocks: AHB=0x%08x MNOC=0x%08x SNOC=0x%08x Q6BIMC=0x%08x\n",
-+	    init_ahb, init_mnoc, init_snoc, init_q6clk);
-+	printf("WIFI PROBE: [4.5]   TCSR / GCC: AXI_HALT=0x%08x RESTART=0x%08x\n",
-+	    init_halt, init_rst);
++	/* 6. TCSR AXI Halt Port Status & Release (halt_q6, halt_nc, halt_modem) */
++	uint32_t q6_req   = *(volatile uint32_t *)(halt_va + TCSR_HALT_Q6_OFFSET + AXI_HALTREQ_OFF);
++	uint32_t q6_ack   = *(volatile uint32_t *)(halt_va + TCSR_HALT_Q6_OFFSET + AXI_HALTACK_OFF);
++	uint32_t nc_req   = *(volatile uint32_t *)(halt_va + TCSR_HALT_NC_OFFSET + AXI_HALTREQ_OFF);
++	uint32_t nc_ack   = *(volatile uint32_t *)(halt_va + TCSR_HALT_NC_OFFSET + AXI_HALTACK_OFF);
++	uint32_t mss_req  = *(volatile uint32_t *)(halt_va + TCSR_HALT_MODEM_OFFSET + AXI_HALTREQ_OFF);
++	uint32_t mss_ack  = *(volatile uint32_t *)(halt_va + TCSR_HALT_MODEM_OFFSET + AXI_HALTACK_OFF);
++	printf("WIFI PROBE: [4.5] TCSR AXI Halt Initial States:\n");
++	printf("WIFI PROBE: [4.5]   halt_q6:   req=%u ack=%u | halt_nc: req=%u ack=%u | halt_modem: req=%u ack=%u\n",
++	    q6_req, q6_ack, nc_req, nc_ack, mss_req, mss_ack);
 +
-+	/* 7. Ungate MSS CFG AHB Clock & Enable AXI Bus Clocks */
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF) = 0x1;
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF) = 0x1;
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF) = 0x1;
++	/* Release all three AXI halt requests to 0 per Qualcomm pil_q6v5_halt_axi_port */
++	*(volatile uint32_t *)(halt_va + TCSR_HALT_Q6_OFFSET + AXI_HALTREQ_OFF) = 0x0;
++	*(volatile uint32_t *)(halt_va + TCSR_HALT_NC_OFFSET + AXI_HALTREQ_OFF) = 0x0;
++	*(volatile uint32_t *)(halt_va + TCSR_HALT_MODEM_OFFSET + AXI_HALTREQ_OFF) = 0x0;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	/* 7. Hardware Reset Pulse via GCC_MSS_RESTART (Assert 1 -> wait 10us -> Deassert 0) */
++	uint32_t init_rst = *(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF);
++	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART before pulse: 0x%08x\n", init_rst);
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF) = 0x1;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(10);
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF) = 0x0;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(10);
++	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART pulsed: 0x%08x -> clean reset deasserted\n",
++	    *(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF));
++
++	/* 8. Enable Full Suite of MSS & Boot ROM Clocks (pil_mss_enable_clks) */
++	/* Vote GPLL0 MSS branch in GCC_APCS_CLOCK_BRANCH_ENA_VOTE_1 (bit 2) */
++	*(volatile uint32_t *)(gcc_va + GCC_APCS_CLK_ENA_VOTE_1_OFF) |= (1u << 2);
++
++	/* Vote Boot ROM AHB in GCC_APCS_CLOCK_BRANCH_ENA_VOTE (bit 10) */
++	*(volatile uint32_t *)(gcc_va + GCC_APCS_CLK_ENA_VOTE_OFF) |= (1u << 10);
++
++	/* Ungate Boot ROM AHB CBCR (0x38004) */
++	*(volatile uint32_t *)(gcc_va + GCC_BOOT_ROM_AHB_CBCR_OFF) |= 0x1;
++
++	/* Ungate BIMC MSS Q6 AXI CBCR (0x4401C) */
++	*(volatile uint32_t *)(gcc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF) |= 0x1;
++
++	/* Ungate MSS CFG AHB CBCR (0x8A000) */
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF) |= 0x1;
++
++	/* Ungate MSS SNOC AXI CBCR (0x8A03C) */
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF) |= 0x1;
++
++	/* Ungate MSS MNOC BIMC CBCR (0x8A004) */
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF) |= 0x1;
++
++	/* Ungate MSS Q6 BIMC CBCR (0x8A040) */
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF) |= 0x1;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
 +	/* Poll GCC_MSS_CFG_AHB_CBCR for CLK_OFF == 0 (timeout 100ms) */
@@ -2176,13 +2254,21 @@ new file mode 100644
 +		delay(100);
 +	}
 +
-+	uint32_t snoc_after = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
-+	printf("WIFI PROBE: [4.5] MSS Clocks after enable: AHB=0x%08x (OFF=%u, EN=%u) SNOC=0x%08x (OFF=%u) -> %s\n",
-+	    ahb_after, (ahb_after >> 31) & 1, ahb_after & 1,
-+	    snoc_after, (snoc_after >> 31) & 1,
++	uint32_t rom_cbcr  = *(volatile uint32_t *)(gcc_va + GCC_BOOT_ROM_AHB_CBCR_OFF);
++	uint32_t bimc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF);
++	uint32_t snoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
++	uint32_t mnoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
++	uint32_t q6b_cbcr  = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
++	printf("WIFI PROBE: [4.5] GCC MSS Clocks Post-Enable:\n");
++	printf("WIFI PROBE: [4.5]   AHB=0x%08x (OFF=%u) ROM=0x%08x (OFF=%u) BIMC_Q6=0x%08x (OFF=%u)\n",
++	    ahb_after, (ahb_after >> 31) & 1, rom_cbcr, (rom_cbcr >> 31) & 1,
++	    bimc_cbcr, (bimc_cbcr >> 31) & 1);
++	printf("WIFI PROBE: [4.5]   SNOC=0x%08x (OFF=%u) MNOC=0x%08x (OFF=%u) Q6BIMC=0x%08x (OFF=%u) -> %s\n",
++	    snoc_cbcr, (snoc_cbcr >> 31) & 1, mnoc_cbcr, (mnoc_cbcr >> 31) & 1,
++	    q6b_cbcr, (q6b_cbcr >> 31) & 1,
 +	    ahb_active ? "ACTIVE" : "GATED / FAILED");
 +
-+	/* 8. CRITICAL HARD SAFETY GATE: If AHB clock failed, ABORT immediately to prevent SError */
++	/* 9. CRITICAL HARD SAFETY GATE: If AHB clock failed, ABORT immediately to prevent SError */
 +	if (!ahb_active) {
 +		printf("WIFI PROBE: [4.5] HARD LOCK: MSS CFG AHB clock is GATED (val=0x%08x, CLK_OFF=1).\n", ahb_after);
 +		printf("WIFI PROBE: [4.5]   Skipping QDSP6SS & RMB MMIO accesses to PREVENT SError kernel panic.\n");
@@ -2190,7 +2276,7 @@ new file mode 100644
 +		return;
 +	}
 +
-+	/* 9. Map and Access RMB & QDSP6SS ONLY After AHB Clock Is Active */
++	/* 10. Map RMB & QDSP6SS ONLY After AHB Clock Is Active */
 +	vm_offset_t rmb_va = ml_io_map(RMB_PHYS_BASE, RMB_SIZE);
 +	vm_offset_t q6_va  = ml_io_map(QDSP6SS_PHYS_BASE, QDSP6SS_SIZE);
 +	if (!rmb_va || !q6_va) {
@@ -2218,7 +2304,12 @@ new file mode 100644
 +	printf("WIFI PROBE: [4.5]         BHS_078=0x%08x BHS_0C4=0x%08x\n",
 +	    init_q6_b78, init_q6_bc4);
 +
-+	/* 10. Enable Q6SS Subsystem Clocks: XO CBCR (0x038) and SLEEP CBCR (0x03C) */
++	/* 11. Assert resets & stop core per Qualcomm __pil_q6v55_reset */
++	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) =
++	    (Q6SS_CORE_ARES | Q6SS_BUS_ARES_ENA | Q6SS_STOP_CORE); /* 0x7 */
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	/* 12. Enable Q6SS Subsystem Clocks: XO CBCR (0x038) and SLEEP CBCR (0x03C) */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR) |= 1;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	for (int i = 0; i < 200; i++) {
@@ -2239,33 +2330,45 @@ new file mode 100644
 +	printf("WIFI PROBE: [4.5] Q6SS CBCRs un-gated: XO=0x%08x (off=%u) SLEEP=0x%08x (off=%u)\n",
 +	    xo_now, (xo_now >> 31) & 1, slp_now, (slp_now >> 31) & 1);
 +
-+	/* 11. Assert Core and Bus Resets before configuring power */
-+	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) = 0x7;
-+	__asm__ volatile("dmb sy" ::: "memory");
-+
-+	/* 12. Turn on Block HeadSwitch (BHS) in QDSP6SS_PWR_CTL_REG */
++	/* 13. Turn on Block HeadSwitch (BHS) in QDSP6SS_PWR_CTL_REG */
 +	uint32_t q6_pwr = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
-+	q6_pwr |= (1u << 24); /* QDSP6v55_BHS_ON */
++	q6_pwr |= QDSP6v55_BHS_ON; /* BIT 24 */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	delay(10);
 +
-+	/* 13. Poll both QDSP6SS_BHS_STATUS_REG (0x078) and QDSP6V62SS_BHS_STATUS (0x0C4) */
-+	uint32_t bhs_078 = 0, bhs_0c4 = 0;
++	/* 14. Poll QDSP6V62SS_BHS_STATUS (0x0C4) for BHS_EN_REST_ACK (bit 0) */
++	uint32_t bhs_0c4 = 0;
 +	bool bhs_ack = false;
 +	for (int i = 0; i < 500; i++) {
-+		bhs_078 = *(volatile uint32_t *)(q6_va + QDSP6SS_BHS_STATUS_REG);
 +		bhs_0c4 = *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS);
-+		if ((bhs_078 & 1) != 0 || (bhs_0c4 & 1) != 0) {
++		if ((bhs_0c4 & QDSP6v55_BHS_EN_REST_ACK) != 0) {
 +			bhs_ack = true;
 +			break;
 +		}
 +		delay(10);
 +	}
-+	printf("WIFI PROBE: [4.5] Q6SS BHS Power-Up: BHS_078=0x%08x BHS_0C4=0x%08x -> %s\n",
-+	    bhs_078, bhs_0c4, bhs_ack ? "STABILIZED" : "TIMEOUT");
++	printf("WIFI PROBE: [4.5] Q6SS BHS Power-Up: BHS_0C4=0x%08x -> %s\n",
++	    bhs_0c4, bhs_ack ? "STABILIZED" : "TIMEOUT");
 +
-+	/* 13. Sequential Memory Power-Up: QDSP6V6SS_MEM_PWR_CTL (bits 28 down to 0) */
++	/* 15. Put LDO in bypass mode per __pil_q6v55_reset (BIT 25) */
++	q6_pwr = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
++	q6_pwr |= QDSP6v55_LDO_BYP; /* BIT 25 */
++	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	/* 16. Deassert QDSP6 compiler memory clamp before memory turn-on */
++	q6_pwr &= ~QDSP6v55_CLAMP_QMC_MEM; /* ~BIT 22 */
++	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	/* 17. Deassert memory peripheral sleep and L2 memory standby */
++	q6_pwr |= (Q6SS_L2DATA_STBY_N | Q6SS_SLP_RET_N); /* BIT 18 | BIT 19 */
++	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(1);
++
++	/* 18. Sequential Memory Power-Up: QDSP6V6SS_MEM_PWR_CTL (bits 28 down to 0) */
 +	uint32_t mem_pwr = *(volatile uint32_t *)(q6_va + QDSP6V6SS_MEM_PWR_CTL);
 +	for (int i = 28; i >= 0; i--) {
 +		mem_pwr |= (1u << i);
@@ -2275,79 +2378,59 @@ new file mode 100644
 +	}
 +	printf("WIFI PROBE: [4.5] Q6SS Memory Arrays: MEM_PWR_CTL=0x%08x (all 29 banks enabled)\n", mem_pwr);
 +
-+	/* 14. Wake L2 / L1 Cache Arrays from Sleep in QDSP6SS_PWR_CTL_REG */
++	/* 19. Remove word line clamp */
 +	q6_pwr = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
-+	q6_pwr |= (1u << 19) | (1u << 18) | (1u << 17) | (1u << 16); /* L2TAG & ETB sleep deassert */
-+	q6_pwr |= (1u << 2) | (1u << 1) | (1u << 0);                  /* L2DATA sleep deassert */
++	q6_pwr &= ~QDSP6v55_CLAMP_WL; /* ~BIT 21 */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
 +	__asm__ volatile("dmb sy" ::: "memory");
-+	delay(10);
 +
-+	/* 15. Deassert Clamps: Compiler Memory Clamp, Wordline Clamp, and I/O Clamp */
-+	q6_pwr &= ~(1u << 22); /* QDSP6v55_CLAMP_QMC_MEM */
-+	q6_pwr &= ~(1u << 21); /* QDSP6v55_CLAMP_WL */
-+	q6_pwr &= ~(1u << 20); /* Q6SS_CLAMP_IO */
++	/* 20. Remove IO clamp */
++	q6_pwr &= ~Q6SS_CLAMP_IO; /* ~BIT 20 */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG) = q6_pwr;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	delay(20);
-+	uint32_t pwr_after = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
-+	printf("WIFI PROBE: [4.5] Q6SS Clamps Released: PWR_CTL=0x%08x (BHS_ON=%u, CLAMP_IO=%u, WL=%u, QMC=%u)\n",
-+	    pwr_after, (pwr_after >> 24) & 1, (pwr_after >> 20) & 1,
-+	    (pwr_after >> 21) & 1, (pwr_after >> 22) & 1);
 +
-+	/* 16. Program RMB_MBA_IMAGE_REG with MBA Carveout Physical Address */
++	uint32_t pwr_after = *(volatile uint32_t *)(q6_va + QDSP6SS_PWR_CTL_REG);
++	printf("WIFI PROBE: [4.5] Q6SS Clamps Released: PWR_CTL=0x%08x (BHS_ON=%u, LDO_BYP=%u, CLAMP_IO=%u, WL=%u, QMC=%u)\n",
++	    pwr_after, (pwr_after >> 24) & 1, (pwr_after >> 25) & 1,
++	    (pwr_after >> 20) & 1, (pwr_after >> 21) & 1, (pwr_after >> 22) & 1);
++
++	/* 21. Program RMB Registers with MBA Carveout Physical Address */
 +	*(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG) = (uint32_t)PIL_MBA_PHYS_BASE;
 +	*(volatile uint32_t *)(rmb_va + RMB_MBA_COMMAND_REG) = 0x0;
++	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_START_REG) = 0x0;
++	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_LENGTH_REG) = 0x0;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	printf("WIFI PROBE: [4.5] Programmed RMB_MBA_IMAGE_REG = 0x%08x\n", (uint32_t)PIL_MBA_PHYS_BASE);
 +
-+	/* 17. Release TCSR MSS AXI Halt */
-+	*(volatile uint32_t *)(halt_va + 0x00) = 0x0;
++	/* 22. Bring Hexagon Core Out of Reset (clear Q6SS_CORE_ARES and Q6SS_STOP_CORE; KEEP BUS_ARES_ENA) */
++	uint32_t q6_rst = *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG);
++	q6_rst &= ~(Q6SS_CORE_ARES | Q6SS_STOP_CORE);
++	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) = q6_rst;
 +	__asm__ volatile("dmb sy" ::: "memory");
-+	delay(1000);
-+	uint32_t halt_after = *(volatile uint32_t *)(halt_va + 0x00);
-+	printf("WIFI PROBE: [4.5] TCSR_MSS_AXI_HALT released: 0x%08x (ack=%u, req=%u)\n",
-+	    halt_after, (halt_after >> 1) & 1, halt_after & 1);
 +
-+	/* 18. Deassert GCC MSS Restart if asserted */
-+	if (init_rst & 1) {
-+		*(volatile uint32_t *)(rst_va + 0x00) = 0x0;
-+		__asm__ volatile("dmb sy" ::: "memory");
-+		delay(1000);
-+		printf("WIFI PROBE: [4.5] GCC_MSS_RESTART de-asserted -> 0x%08x\n",
-+		    *(volatile uint32_t *)(rst_va + 0x00));
-+	}
-+
-+	/* 19. Enable Q6SS Clock & Deassert Core Resets to Trigger Boot */
++	/* 23. Turn on Hexagon Core Clock */
 +	uint32_t q6_gfm = *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG);
-+	q6_gfm |= (1u << 1); /* Q6SS_CLK_ENA */
++	q6_gfm |= Q6SS_CLK_ENA; /* BIT 1 */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG) = q6_gfm;
 +	__asm__ volatile("dmb sy" ::: "memory");
++	printf("WIFI PROBE: [4.5] Hexagon Core Boot Triggered: RESET=0x%08x, GFMUX=0x%08x\n",
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG),
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG));
 +
-+	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) = 0x0; /* deassert core and bus resets */
-+	__asm__ volatile("dmb sy" ::: "memory");
-+
-+	*(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CORE_START) = 0x1;
-+	__asm__ volatile("dmb sy" ::: "memory");
-+	*(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CMD) = 0x1;
-+	__asm__ volatile("dmb sy" ::: "memory");
-+	printf("WIFI PROBE: [4.5] Q6SS GFMUX=0x%08x, RESET=0x%08x, triggered BOOT_CORE_START & BOOT_CMD\n",
-+	    *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG),
-+	    *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG));
-+
-+	/* 20. Monitor PBL and MBA Handshake */
++	/* 24. Monitor PBL and MBA Handshake */
 +	printf("WIFI PROBE: [4.5] Polling RMB_MBA_STATUS_REG (0x0C) and RMB_PBL_STATUS_REG (0x04)...\n");
 +	uint32_t last_pbl = 0xFFFFFFFF;
 +	uint32_t last_mba = 0xFFFFFFFF;
 +	uint32_t last_mss = 0xFFFFFFFF;
 +	bool success = false;
 +
-+	for (int iter = 0; iter <= 400; iter++) {
++	for (int iter = 0; iter <= 500; iter++) {
 +		uint32_t cur_pbl = *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG);
 +		uint32_t cur_mba = *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG);
 +		uint32_t cur_mss = *(volatile uint32_t *)(rmb_va + RMB_MBA_MSS_STATUS);
 +
-+		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 400) {
++		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 500) {
 +			printf("WIFI PROBE: [4.5]   t=%4d ms | PBL=0x%08x MBA=0x%08x MSS=0x%08x\n",
 +			    iter * 5, cur_pbl, cur_mba, cur_mss);
 +			last_pbl = cur_pbl;
@@ -2355,17 +2438,17 @@ new file mode 100644
 +			last_mss = cur_mss;
 +		}
 +
-+		if (cur_pbl == 1 && last_pbl != 1) {
++		if (cur_pbl == STATUS_PBL_SUCCESS && last_pbl != STATUS_PBL_SUCCESS) {
 +			printf("WIFI PROBE: [4.5] *** PBL HANDSHAKE SUCCESS! PBL=0x00000001 (MBA Authenticated & Launched) at t=%d ms ***\n",
 +			    iter * 5);
 +		}
 +
 +		/*
 +		 * Check for MBA Success:
-+		 * 1: RMB_MBA_XPU_UNLOCKED (MBA ready / boot done)
-+		 * 2: RMB_MBA_XPU_UNLOCKED_SCRIBBLED
++		 * 1: STATUS_XPU_UNLOCKED (MBA ready / boot done)
++		 * 2: STATUS_XPU_UNLOCKED_SCRIBBLED
 +		 */
-+		if (cur_mba == 1 || cur_mba == 2) {
++		if (cur_mba == STATUS_XPU_UNLOCKED || cur_mba == STATUS_XPU_UNLOCKED_SCRIBBLED) {
 +			printf("WIFI PROBE: [4.5] *** MBA BOOT SUCCESS! MBA Status = 0x%08x (MBA Ready / Boot Done) at t=%d ms ***\n",
 +			    cur_mba, iter * 5);
 +			success = true;
@@ -2390,7 +2473,7 @@ new file mode 100644
 +		    last_pbl, last_mba, last_mss);
 +	}
 +
-+	/* 21. Complete Register Block Audit Post-Boot Trigger */
++	/* 25. Complete Register Block Audit Post-Boot Trigger */
 +	printf("WIFI PROBE: [4.5] Register Audit Post-Poll:\n");
 +	printf("WIFI PROBE: [4.5]   RMB:  IMG=0x%08x PBL=0x%08x CMD=0x%08x MBA=0x%08x MSS=0x%08x ALT=0x%08x\n",
 +	    *(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG),
@@ -2406,13 +2489,11 @@ new file mode 100644
 +	    *(volatile uint32_t *)(q6_va + QDSP6V6SS_MEM_PWR_CTL),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_XO_CBCR),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_SLEEP_CBCR));
-+	printf("WIFI PROBE: [4.5]         B078=0x%08x B0C4=0x%08x M0B0=0x%08x STRAP=0x%08x CORE=0x%08x CMD=0x%08x\n",
++	printf("WIFI PROBE: [4.5]         B078=0x%08x B0C4=0x%08x M0B0=0x%08x STRAP=0x%08x\n",
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_BHS_STATUS_REG),
 +	    *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_MEM_PWR_CTL_ALT),
-+	    *(volatile uint32_t *)(q6_va + QDSP6SS_STRAP_ACC),
-+	    *(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CORE_START),
-+	    *(volatile uint32_t *)(q6_va + QDSP6SS_BOOT_CMD));
++	    *(volatile uint32_t *)(q6_va + QDSP6SS_STRAP_ACC));
 +	printf("WIFI PROBE: [4.5] Sub-Phase 4.5 active MBA load complete.\n\n");
 +}
 +

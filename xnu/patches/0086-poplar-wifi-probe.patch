@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,3189 @@
+@@ -0,0 +1,5659 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1540,6 +1540,205 @@ new file mode 100644
 +static struct sweet_fw_cat_entry s_fw_bdwlan;
 +static struct sweet_fw_cat_entry s_fw_modem_seg[30]; /* modem.b00 .. modem.b29 */
 +
++#define SWEET_IMG_DIR_MAX 128u
++struct sweet_fat_img_ent {
++	char     name83[11];
++	uint8_t  pad;
++	uint32_t start_clus;
++	uint32_t size;
++};
++static struct sweet_fat_img_ent s_img_dir[SWEET_IMG_DIR_MAX];
++static unsigned s_img_dir_cnt = 0;
++static uint8_t  s_slice_clus_buf[32768] __attribute__((aligned(64)));
++static uint32_t s_slice_cached_clus = 0xFFFFFFFFu;
++
++static unsigned
++sweet_str_len(const char *s)
++{
++	unsigned n = 0u;
++	while (s && s[n] != '\0') {
++		n++;
++	}
++	return n;
++}
++
++static char
++sweet_ascii_toupper(char c)
++{
++	return (c >= 'a' && c <= 'z') ? (char)(c - ('a' - 'A')) : c;
++}
++
++static bool
++sweet_modem_fat16_lookup_filename(const char *basename, uint32_t *out_clus, uint32_t *out_size)
++{
++	if (!basename || basename[0] == '\0' || s_img_dir_cnt == 0u) {
++		return false;
++	}
++
++	/* Strip any leading path directories */
++	const char *base = basename;
++	for (const char *p = basename; *p != '\0'; p++) {
++		if (*p == '/' || *p == '\\') {
++			base = p + 1;
++		}
++	}
++	if (base[0] == '\0') {
++		return false;
++	}
++
++	char target83[11];
++	for (unsigned i = 0u; i < 11u; i++) {
++		target83[i] = ' ';
++	}
++
++	unsigned ni = 0u, ei = 0u;
++	bool in_ext = false;
++	for (const char *p = base; *p != '\0'; p++) {
++		if (*p == '.') {
++			if (in_ext) {
++				return false;
++			}
++			in_ext = true;
++			continue;
++		}
++		char uc = sweet_ascii_toupper(*p);
++		if (!in_ext) {
++			if (ni >= 8u) {
++				return false;
++			}
++			target83[ni++] = uc;
++		} else {
++			if (ei >= 3u) {
++				return false;
++			}
++			target83[8u + ei++] = uc;
++		}
++	}
++	if (ni == 0u) {
++		return false;
++	}
++
++	for (unsigned i = 0u; i < s_img_dir_cnt; i++) {
++		if (memcmp(s_img_dir[i].name83, target83, 11u) == 0) {
++			if (out_clus) {
++				*out_clus = s_img_dir[i].start_clus;
++			}
++			if (out_size) {
++				*out_size = s_img_dir[i].size;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++static int
++sweet_modem_fat16_read_slice(uint32_t start_clus, uint32_t file_size,
++    uint32_t offset, uint32_t len, void *dst)
++{
++	if (len == 0u) {
++		return 0;
++	}
++	if (!s_fat16_valid || s_fat_bytes_per_sec == 0u || s_fat_sec_per_clus == 0u) {
++		return EINVAL;
++	}
++	if (offset > file_size || len > file_size - offset) {
++		return EINVAL;
++	}
++	uint32_t clus_bytes = s_fat_bytes_per_sec * s_fat_sec_per_clus;
++	if (clus_bytes == 0u || clus_bytes > sizeof(s_slice_clus_buf)) {
++		return EINVAL;
++	}
++
++	uint32_t skip_clus = offset / clus_bytes;
++	uint32_t cur = start_clus;
++	for (uint32_t k = 0u; k < skip_clus; k++) {
++		if (cur < 2u || cur >= 8192u) {
++			return EIO;
++		}
++		cur = s_fat16_table[cur];
++	}
++
++	uint32_t intra = offset % clus_bytes;
++	uint32_t done = 0u;
++	uint32_t hops = 0u;
++
++	/* Partial leading head within the starting cluster */
++	if (intra != 0u) {
++		if (cur < 2u || cur >= 8192u) {
++			return EIO;
++		}
++		if (s_slice_cached_clus != cur) {
++			uint64_t coff = (uint64_t)(s_fat_data_start_sec +
++			    (cur - 2u) * s_fat_sec_per_clus) * s_fat_bytes_per_sec;
++			int err = sweet_ufs_read_part("modem", coff, s_slice_clus_buf, clus_bytes);
++			if (err != 0) {
++				s_slice_cached_clus = 0xFFFFFFFFu;
++				return err;
++			}
++			s_slice_cached_clus = cur;
++		}
++		uint32_t take = clus_bytes - intra;
++		if (take > len) {
++			take = len;
++		}
++		memcpy(dst, s_slice_clus_buf + intra, take);
++		done += take;
++		if (done < len) {
++			cur = s_fat16_table[cur];
++			hops++;
++		}
++	}
++
++	/* Coalesced full-cluster middle runs + optional cached tail */
++	while (done < len) {
++		if (cur < 2u || cur >= 8192u || hops >= 8192u) {
++			return EIO;
++		}
++		uint32_t rem = len - done;
++		if (rem < clus_bytes) {
++			if (s_slice_cached_clus != cur) {
++				uint64_t coff = (uint64_t)(s_fat_data_start_sec +
++				    (cur - 2u) * s_fat_sec_per_clus) * s_fat_bytes_per_sec;
++				int err = sweet_ufs_read_part("modem", coff, s_slice_clus_buf, clus_bytes);
++				if (err != 0) {
++					s_slice_cached_clus = 0xFFFFFFFFu;
++					return err;
++				}
++				s_slice_cached_clus = cur;
++			}
++			memcpy((uint8_t *)dst + done, s_slice_clus_buf, rem);
++			done += rem;
++			break;
++		}
++
++		uint32_t run_start = cur;
++		uint32_t run_bytes = clus_bytes;
++		while (done + run_bytes + clus_bytes <= len && hops < 8192u) {
++			uint16_t nxt = s_fat16_table[cur];
++			if (nxt == cur + 1u && nxt < 8192u) {
++				cur = nxt;
++				run_bytes += clus_bytes;
++				hops++;
++			} else {
++				break;
++			}
++		}
++		uint64_t roff = (uint64_t)(s_fat_data_start_sec +
++		    (run_start - 2u) * s_fat_sec_per_clus) * s_fat_bytes_per_sec;
++		int err = sweet_ufs_read_part("modem", roff, (uint8_t *)dst + done, run_bytes);
++		if (err != 0) {
++			return err;
++		}
++		done += run_bytes;
++		hops++;
++		if (done < len) {
++			cur = s_fat16_table[cur];
++		}
++	}
++	return 0;
++}
++
 +static bool
 +sweet_fat16_check_contiguous(uint32_t start_clus, uint32_t fsize)
 +{
@@ -1693,6 +1892,8 @@ new file mode 100644
 +
 +	/* Cache FAT16 allocation table in BSS for cluster-chain reads (Final Stage readiness) */
 +	s_fat16_valid = false;
++	s_img_dir_cnt = 0;
++	s_slice_cached_clus = 0xFFFFFFFFu;
 +	memset(&s_fw_mba, 0, sizeof(s_fw_mba));
 +	memset(&s_fw_mdt, 0, sizeof(s_fw_mdt));
 +	memset(&s_fw_wlanmdsp, 0, sizeof(s_fw_wlanmdsp));
@@ -1829,6 +2030,15 @@ new file mode 100644
 +				}
 +				uint32_t fsize = (uint32_t)(e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24));
 +				bool contig = sweet_fat16_check_contiguous(clus, fsize);
++
++				/* Cache full /IMAGE/ filename catalog for Stage 5B TFTP / BDF lookup */
++				if (s_img_dir_cnt < SWEET_IMG_DIR_MAX) {
++					memcpy(s_img_dir[s_img_dir_cnt].name83, e, 11u);
++					s_img_dir[s_img_dir_cnt].pad = 0u;
++					s_img_dir[s_img_dir_cnt].start_clus = clus;
++					s_img_dir[s_img_dir_cnt].size = fsize;
++					s_img_dir_cnt++;
++				}
 +
 +				/* Populate full Final-Stage firmware catalog */
 +				if (memcmp(e, "MBA     MBN", 11) == 0) {
@@ -1985,6 +2195,8 @@ new file mode 100644
 +
 +#define QCOM_SCM_VMID_HLOS          0x3
 +#define QCOM_SCM_VMID_MSS_MSA       0xF
++#define QCOM_SCM_VMID_WLAN          0x18u
++#define QCOM_SCM_VMID_WLAN_CE       0x19u
 +#define QCOM_SCM_PERM_RW            0x6
 +#define QCOM_SCM_PERM_RWX           0x7
 +
@@ -2095,6 +2307,84 @@ new file mode 100644
 +		printf("WIFI PROBE: [4.5]   MP_ASSIGN fallback (0x%x): status=%lld, v1=0x%llx\n",
 +		    alt_perm, (long long)res.status, (unsigned long long)res.val1);
 +	}
++
++	return (int)res.status;
++}
++
++static int
++sweet_scm_assign_mem_multi(uint64_t mem_addr, uint64_t mem_size,
++    const uint32_t *src_vmids, unsigned n_src,
++    const uint32_t *dst_vmids, const uint32_t *dst_perms, unsigned n_dst)
++{
++	if (!src_vmids || !dst_vmids || !dst_perms ||
++	    n_src == 0u || n_src > 4u || n_dst == 0u || n_dst > 4u) {
++		return -22;
++	}
++
++	uint64_t buf_pa = sweet_va_to_pa((vm_offset_t)s_scm_scratch_buf);
++	if (buf_pa == 0u) {
++		printf("WIFI PROBE: [5B] sweet_va_to_pa returned fault; fallback to PA 0x942e0000\n");
++		buf_pa = 0x942e0000ULL;
++	}
++
++	uint64_t mem_map_pa  = buf_pa + SCM_OFFSET_MEM_MAP;
++	uint64_t src_pa      = buf_pa + SCM_OFFSET_SRC;
++	uint64_t dest_pa     = buf_pa + SCM_OFFSET_DEST;
++	uint64_t ext_args_pa = buf_pa + 0x180u;
++
++	memset(s_scm_scratch_buf, 0, sizeof(s_scm_scratch_buf));
++
++	struct qcom_scm_mem_map_info *map =
++	    (struct qcom_scm_mem_map_info *)(s_scm_scratch_buf + SCM_OFFSET_MEM_MAP);
++	map->mem_addr = mem_addr;
++	map->mem_size = mem_size;
++
++	uint32_t *src = (uint32_t *)(s_scm_scratch_buf + SCM_OFFSET_SRC);
++	for (unsigned i = 0u; i < n_src; i++) {
++		src[i] = src_vmids[i];
++	}
++	uint64_t src_sz = (uint64_t)n_src * sizeof(uint32_t);
++
++	struct qcom_scm_current_perm_info *dest =
++	    (struct qcom_scm_current_perm_info *)(s_scm_scratch_buf + SCM_OFFSET_DEST);
++	for (unsigned i = 0u; i < n_dst; i++) {
++		dest[i].vmid = dst_vmids[i];
++		dest[i].perm = dst_perms[i];
++		dest[i].ctx = 0u;
++		dest[i].ctx_size = 0u;
++		dest[i].unused = 0u;
++	}
++	uint64_t dest_sz = (uint64_t)n_dst * sizeof(struct qcom_scm_current_perm_info);
++
++	uint64_t *ext = (uint64_t *)(s_scm_scratch_buf + 0x180u);
++	ext[0] = src_sz;
++	ext[1] = dest_pa;
++	ext[2] = dest_sz;
++	ext[3] = 0u;
++
++	for (uintptr_t p = (uintptr_t)s_scm_scratch_buf;
++	     p < (uintptr_t)s_scm_scratch_buf + 512u;
++	     p += 64u) {
++		__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy\nisb" ::: "memory");
++
++	uint64_t fid = 0xC2000C16ULL;
++	uint64_t arginfo = 0x1117ULL;
++	struct scm_smc_result res;
++	int retry = 0;
++	do {
++		res = sweet_scm_call6(fid, arginfo, mem_map_pa,
++		    sizeof(struct qcom_scm_mem_map_info), src_pa, ext_args_pa);
++		if (res.status == -12) {
++			delay(1000);
++		}
++	} while (res.status == -12 && ++retry < 20);
++
++	printf("WIFI PROBE: [5B] MP_ASSIGN_MULTI(0x%llx, 0x%llx [%llu KiB], src=%u dst=%u) -> status=%lld, v1=0x%llx\n",
++	    (unsigned long long)mem_addr, (unsigned long long)mem_size,
++	    (unsigned long long)(mem_size >> 10), n_src, n_dst,
++	    (long long)res.status, (unsigned long long)res.val1);
 +
 +	return (int)res.status;
 +}
@@ -2890,10 +3180,19 @@ new file mode 100644
 +	return (st == want_status) ? 0 : -1;
 +}
 +
++static bool     s_mpss_boot_ok = false;
++static uint32_t s_smem_p07_pa = 0u;
++static uint32_t s_smem_p07_sz = 0u;
++static uint32_t s_smem_p07_cacheline = 32u;
++
 +static void
 +probe_stage5a_smem_modem_audit(void)
 +{
 +	printf("WIFI PROBE: [5A.3] Inspecting SMEM APPS:Modem (0:1) partition for SMP2P & GLINK...\n");
++
++	s_smem_p07_pa = 0u;
++	s_smem_p07_sz = 0u;
++	s_smem_p07_cacheline = 32u;
 +
 +	vm_offset_t toc = ml_io_map(POPLAR_SMEM_TOC_PA, 0x1000u);
 +	if (!toc) {
@@ -2916,13 +3215,14 @@ new file mode 100644
 +	}
 +
 +	uint32_t part_idx = 0xFFFFFFFFu;
-+	uint32_t part_off = 0u, part_sz = 0u;
++	uint32_t part_off = 0u, part_sz = 0u, part_cl = 32u;
 +	uint16_t part_h0 = 0u, part_h1 = 0u;
 +	for (uint32_t i = 0u; i < num_entries; i++) {
 +		uint32_t e_off = 32u + i * 48u;
 +		uint32_t off   = probe_rd32(toc, e_off);
 +		uint32_t sz    = probe_rd32(toc, e_off + 4u);
 +		uint32_t hosts = probe_rd32(toc, e_off + 12u);
++		uint32_t cl    = probe_rd32(toc, e_off + 16u);
 +		uint16_t h0 = (uint16_t)hosts;
 +		uint16_t h1 = (uint16_t)(hosts >> 16);
 +		if (((h0 == 0u && h1 == 1u) || (h0 == 1u && h1 == 0u)) &&
@@ -2930,6 +3230,7 @@ new file mode 100644
 +			part_idx = i;
 +			part_off = off;
 +			part_sz  = sz;
++			part_cl  = (cl > 0u) ? cl : 32u;
 +			part_h0  = h0;
 +			part_h1  = h1;
 +			break;
@@ -2942,9 +3243,12 @@ new file mode 100644
 +	}
 +
 +	uint32_t part_pa = POPLAR_SMEM_BASE_PA + part_off;
++	s_smem_p07_pa = part_pa;
++	s_smem_p07_sz = part_sz;
++	s_smem_p07_cacheline = part_cl;
 +	uint32_t map_len = (part_sz < 0x20000u) ? part_sz : 0x20000u;
-+	printf("WIFI PROBE: [5A.3] Found p[%02u] off=0x%05x PA=0x%08x sz=%uKB hosts=%u:%u (mapping %uKB Device-nGnRnE)\n",
-+	    part_idx, part_off, part_pa, part_sz / 1024u, part_h0, part_h1, map_len / 1024u);
++	printf("WIFI PROBE: [5A.3] Found p[%02u] off=0x%05x PA=0x%08x sz=%uKB hosts=%u:%u cl=%u (mapping %uKB Device-nGnRnE)\n",
++	    part_idx, part_off, part_pa, part_sz / 1024u, part_h0, part_h1, part_cl, map_len / 1024u);
 +
 +	vm_offset_t part_va = ml_io_map(part_pa, map_len);
 +	if (!part_va) {
@@ -2981,7 +3285,7 @@ new file mode 100644
 +	uint32_t off = 0x20u;
 +	uint32_t items = 0u;
 +
-+	while (off + 12u <= limit && items < 32u) {
++	while (off + 16u <= limit && items < 32u) {
 +		uint32_t w0      = probe_rd32(part_va, off);
 +		uint16_t canary  = (uint16_t)w0;
 +		uint16_t item_id = (uint16_t)(w0 >> 16);
@@ -2993,7 +3297,7 @@ new file mode 100644
 +		if (canary != SMEM_PRIVATE_CANARY) {
 +			break;
 +		}
-+		uint32_t hdr_and_pad = 12u + (uint32_t)pad_hdr;
++		uint32_t hdr_and_pad = 16u + (uint32_t)pad_hdr;
 +		if (hdr_and_pad > map_len - off || item_sz > map_len - off - hdr_and_pad) {
 +			break;
 +		}
@@ -3079,6 +3383,7 @@ new file mode 100644
 +	(void)PE_parse_boot_argn("wlan_stage5a_mpss", &wlan_stage5a_mpss,
 +	    sizeof(wlan_stage5a_mpss));
 +
++	s_mpss_boot_ok = false;
 +	printf("\nWIFI PROBE: [5A] === STAGE 5A: FULL MPSS SELF-AUTH ELF LOAD & SMEM 0:1 AUDIT ===\n");
 +
 +	if (wlan_stage5a_mpss <= 0) {
@@ -3285,12 +3590,2176 @@ new file mode 100644
 +
 +	/* Reclaim MBA+DP 1 MiB carveout (0x94100000) back to HLOS for Stage 5B wlan_msa (pil-msa.c:848) */
 +	printf("WIFI PROBE: [5A.2] Reclaiming MBA+DP (0x94100000, 1 MiB) MSS_MSA -> HLOS...\n");
-+	(void)sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_DP_SIZE,
++	int reclaim_rc = sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_DP_SIZE,
 +	    QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RWX);
++	s_mpss_boot_ok = (reclaim_rc == 0);
 +
 +	/* Step 5A.3: Audit SMEM APPS:Modem (0:1) live state */
 +	probe_stage5a_smem_modem_audit();
 +	printf("WIFI PROBE: [5A] Stage 5A MPSS boot & audit complete.\n\n");
++}
++
++/*
++ * =========================================================================
++ * STAGE 5B: ANOC2 SMMU, PM8998 RAILS, GLINK/IPCRTR, PD/RMTFS/TFTP & WLFW QMI
++ * Controlled by: wlan_stage5b_wlfw=1 (default 0 / dormant)
++ * Prerequisites: wlan_stage4_3_passive=1, wlan_stage4_5_load=1, wlan_stage5a_mpss=1
++ * =========================================================================
++ */
++
++#define ARM_SMMU_GR0_sTLBIALL       0x0060u
++#define ARM_SMMU_GR0_sTLBGSYNC      0x0070u
++#define ARM_SMMU_GR0_sTLBGSTATUS    0x0074u
++#define POPLAR_RMTFS_CARVEOUT_PA    0x93c00000ULL /* pil_video_region@93c00000 (5 MiB unused) */
++#define POPLAR_RMTFS_CARVEOUT_SIZE  0x00200000ULL /* 2 MiB */
++#define POPLAR_SMEM_HWLOCK_PA       0x01f43000u   /* TCSR SFPB Mutex #3 */
++#define POPLAR_APCS_IPC_PAGE_PA     0x17911000u   /* APCS IPC register page (+0x08 doorbell) */
++#define APCS_IPC_MPSS_SMP2P_MASK    0x00004000u   /* BIT(14): SMEM SMP2P Modem doorbell */
++#define APCS_IPC_MPSS_GLINK_MASK    0x00008000u   /* BIT(15): GLINK Modem doorbell */
++
++#define SMEM_SMP2P_OUT_MODEM_ID     428u          /* 427 + local_pid(0)*8 + remote_pid(1) */
++#define SMEM_SMP2P_IN_MODEM_ID      435u          /* 427 + remote_pid(1)*8 + local_pid(0) */
++#define SMEM_GLINK_XPRT_DESC_ID     478u
++#define SMEM_GLINK_FIFO_0_ID        479u
++#define SMEM_GLINK_FIFO_1_ID        480u
++#define SMEM_GLINK_FIFO_SIZE        0x4000u       /* 16 KiB ring buffer */
++
++#define QRTR_PROTO_VER_1            1u
++#define QRTR_PORT_CTRL              0xfffffffeu
++#define QRTR_NODE_BCAST             0xffffffffu
++#define QRTR_NODE_APPS              1u
++
++#define QRTR_TYPE_DATA              1u
++#define QRTR_TYPE_HELLO             2u
++#define QRTR_TYPE_BYE               3u
++#define QRTR_TYPE_NEW_SERVER        4u
++#define QRTR_TYPE_DEL_SERVER        5u
++#define QRTR_TYPE_DEL_CLIENT        6u
++#define QRTR_TYPE_RESUME_TX         7u
++#define QRTR_TYPE_EXIT              8u
++#define QRTR_TYPE_PING              9u
++#define QRTR_TYPE_NEW_LOOKUP        10u
++
++#define QRTR_SVC_RMTFS              0x000eu
++#define QRTR_SVC_SERVREG_LOC        0x0040u
++#define QRTR_SVC_SERVREG_NOTIF      0x0042u
++#define QRTR_SVC_WLFW               0x0045u
++#define QRTR_SVC_TFTP               0x1000u       /* 4096 */
++
++#define QRTR_LOCAL_PORT_SERVREG_1   1u
++#define QRTR_LOCAL_PORT_RMTFS       2u
++#define QRTR_LOCAL_PORT_TFTP        3u
++#define QRTR_LOCAL_PORT_SERVREG_0   4u
++#define QRTR_LOCAL_PORT_TFTP_SESS0  16u
++#define QRTR_LOCAL_PORT_WLFW_CLNT   32u
++
++#define QMI_MSG_REQUEST             0u
++#define QMI_MSG_RESPONSE            2u
++#define QMI_MSG_INDICATION          4u
++
++#define WLFW_IND_REGISTER_REQ       0x0020u
++#define WLFW_FW_READY_IND           0x0021u
++#define WLFW_CAP_REQ                0x0024u
++#define WLFW_BDF_DOWNLOAD_REQ       0x0025u
++#define WLFW_CAL_REPORT_REQ         0x0026u
++#define WLFW_PIN_CONNECT_IND        0x002cu
++#define WLFW_MSA_INFO_REQ           0x002du
++#define WLFW_MSA_READY_REQ          0x002eu
++#define WLFW_MSA_READY_IND_ALT1     0x0037u
++#define WLFW_MSA_READY_IND_ALT2     0x0038u
++#define WLFW_CLIENT_ID_KNEL         0x4b4e454cu
++
++#define TFTP_OP_RRQ                 1u
++#define TFTP_OP_WRQ                 2u
++#define TFTP_OP_DATA                3u
++#define TFTP_OP_ACK                 4u
++#define TFTP_OP_ERROR               5u
++#define TFTP_OP_OACK                6u
++
++struct qrtr_hdr_v1 {
++	uint32_t version;
++	uint32_t type;
++	uint32_t src_node_id;
++	uint32_t src_port_id;
++	uint32_t confirm_rx;
++	uint32_t size;
++	uint32_t dst_node_id;
++	uint32_t dst_port_id;
++};
++
++struct qrtr_ctrl_pkt {
++	uint32_t cmd;
++	uint32_t a0;
++	uint32_t a1;
++	uint32_t a2;
++	uint32_t a3;
++};
++
++struct glink_rem_intent {
++	uint32_t iid;
++	uint32_t size;
++	bool     valid;
++	bool     in_use;
++};
++
++#define MPSS_MAX_REM_INTENTS 32u
++#define TFTP_MAX_SESS        8u
++#define IPCRTR_RXQ_SLOTS     8u
++
++struct tftp_session {
++	bool     active;
++	bool     is_wrq;
++	bool     has_rsize;
++	bool     oack_pending;
++	bool     eof_sent;
++	uint32_t local_port;
++	uint32_t peer_node;
++	uint32_t peer_port;
++	uint32_t clus;
++	uint32_t fsize;
++	uint32_t seek;
++	uint32_t rsize;
++	uint32_t xfer_len;
++	uint32_t blksize;
++	uint32_t wsize;
++	uint32_t base_offset;
++	uint16_t last_sent_block;
++	uint16_t win_start_block;
++	uint32_t win_bytes_sent;
++};
++
++struct ipcrtr_rxq_slot {
++	uint32_t len;
++	uint8_t  data[1024];
++};
++
++static struct {
++	vm_offset_t hwlock_va;
++	vm_offset_t ipc_va;
++	vm_offset_t unc_va;
++	vm_offset_t cac_va;
++	uint32_t    cac_win_off;
++	uint32_t    cac_win_sz;
++	uint32_t    descs_off;     /* offset inside unc_va */
++	uint32_t    tx_tail_idx;
++	uint32_t    tx_head_idx;
++	uint32_t    rx_tail_idx;
++	uint32_t    rx_head_idx;
++	uint32_t    tx_fifo_off;   /* partition offset inside cac_va */
++	uint32_t    tx_fifo_len;
++	uint32_t    rx_fifo_off;   /* partition offset inside cac_va */
++	uint32_t    rx_fifo_len;
++	bool        bound;
++	bool        link_up;
++	bool        glink_reuse;
++	bool        ipcrtr_rem_open;
++	bool        ipcrtr_open_acked;
++	bool        intents_seeded;
++	uint32_t    ipcrtr_rcid;
++	uint32_t    next_liid;
++	struct glink_rem_intent rem_intents[MPSS_MAX_REM_INTENTS];
++	uint32_t    rx_pkt_len;
++	bool        rx_pkt_active;
++
++	/* IPCRTR routing state */
++	bool        hello_sent;
++	bool        hello_recvd;
++	uint32_t    mpss_node_id;
++	bool        wlfw_up;
++	uint32_t    wlfw_node;
++	uint32_t    wlfw_port;
++	uint32_t    next_qmi_txn;
++
++	/* WLFW handshake state */
++	bool        wlfw_fw_ready;
++	bool        wlfw_msa_ready_ind;
++	bool        qmi_resp_ready;
++	uint16_t    qmi_resp_txn;
++	uint16_t    qmi_resp_msg;
++	uint32_t    qmi_resp_len;
++
++	/* Deferred IPCRTR packet queue when pumping for TX intent */
++	bool        in_intent_wait;
++	uint32_t    rxq_head;
++	uint32_t    rxq_tail;
++	struct ipcrtr_rxq_slot rxq[IPCRTR_RXQ_SLOTS];
++
++	/* RMTFS open client handles */
++	uint32_t    rmtfs_caller_id[5];
++	struct tftp_session tftp[TFTP_MAX_SESS];
++} s5b;
++
++static uint8_t s_5b_rx_pkt_buf[8192]  __attribute__((aligned(8)));
++static uint8_t s_5b_tx_pkt_buf[8192]  __attribute__((aligned(8)));
++static uint8_t s_5b_ipcr_tx_buf[8192] __attribute__((aligned(8)));
++static uint8_t s_5b_qmi_resp_buf[8192] __attribute__((aligned(8)));
++static uint8_t s_5b_qmi_tx_buf[2048]  __attribute__((aligned(8)));
++static uint8_t s_5b_tftp_tx_buf[8192] __attribute__((aligned(8)));
++static uint8_t s_5b_rmtfs_io_buf[16384] __attribute__((aligned(64)));
++static uint8_t s_5b_bdf_buf[20480]    __attribute__((aligned(64)));
++
++static inline uint16_t
++s5b_rd_le16(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++static inline uint32_t
++s5b_rd_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
++	       ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static inline uint64_t
++s5b_rd_le64(const uint8_t *p)
++{
++	return (uint64_t)s5b_rd_le32(p) | ((uint64_t)s5b_rd_le32(p + 4) << 32);
++}
++
++static inline uint16_t
++s5b_rd_be16(const uint8_t *p)
++{
++	return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
++}
++
++static inline void
++s5b_wr_le16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v & 0xffu);
++	p[1] = (uint8_t)((v >> 8) & 0xffu);
++}
++
++static inline void
++s5b_wr_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)(v & 0xffu);
++	p[1] = (uint8_t)((v >> 8) & 0xffu);
++	p[2] = (uint8_t)((v >> 16) & 0xffu);
++	p[3] = (uint8_t)((v >> 24) & 0xffu);
++}
++
++static inline void
++s5b_wr_le64(uint8_t *p, uint64_t v)
++{
++	s5b_wr_le32(p, (uint32_t)(v & 0xffffffffULL));
++	s5b_wr_le32(p + 4, (uint32_t)(v >> 32));
++}
++
++static inline void
++s5b_wr_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)((v >> 8) & 0xffu);
++	p[1] = (uint8_t)(v & 0xffu);
++}
++
++static bool
++s5b_str_eq_ci(const char *a, const char *b)
++{
++	while (*a != '\0' && *b != '\0') {
++		if (sweet_ascii_toupper(*a) != sweet_ascii_toupper(*b)) {
++			return false;
++		}
++		a++;
++		b++;
++	}
++	return (*a == '\0' && *b == '\0');
++}
++
++static bool
++s5b_str_contains(const char *hay, const char *needle)
++{
++	unsigned nlen = sweet_str_len(needle);
++	if (nlen == 0u) {
++		return true;
++	}
++	for (unsigned i = 0u; hay[i] != '\0'; i++) {
++		unsigned j = 0u;
++		while (j < nlen && hay[i + j] == needle[j]) {
++			j++;
++		}
++		if (j == nlen) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static uint32_t
++s5b_parse_dec(const char *s, bool *ok)
++{
++	uint64_t val = 0u;
++	if (!s || s[0] == '\0') {
++		*ok = false;
++		return 0u;
++	}
++	for (unsigned i = 0u; s[i] != '\0'; i++) {
++		if (s[i] < '0' || s[i] > '9') {
++			*ok = false;
++			return 0u;
++		}
++		val = val * 10u + (uint64_t)(s[i] - '0');
++		if (val > 0xffffffffULL) {
++			*ok = false;
++			return 0xffffffffu;
++		}
++	}
++	*ok = true;
++	return (uint32_t)val;
++}
++
++static unsigned
++s5b_fmt_u32_dec(uint32_t v, char *out, unsigned cap)
++{
++	char tmp[16];
++	unsigned n = 0u;
++	if (v == 0u) {
++		tmp[n++] = '0';
++	} else {
++		while (v > 0u && n < sizeof(tmp)) {
++			tmp[n++] = (char)('0' + (v % 10u));
++			v /= 10u;
++		}
++	}
++	unsigned len = 0u;
++	while (n > 0u && len + 1u < cap) {
++		out[len++] = tmp[--n];
++	}
++	if (cap > 0u) {
++		out[len] = '\0';
++	}
++	return len;
++}
++
++static bool
++s5b_cac_valid_off(uint32_t part_off, uint32_t size)
++{
++	return (s5b.cac_va != 0u &&
++	    part_off >= s5b.cac_win_off &&
++	    size <= s_smem_p07_sz &&
++	    part_off <= s_smem_p07_sz - size);
++}
++
++static uint32_t
++s5b_cac_rd32(uint32_t part_off)
++{
++	if (!s5b_cac_valid_off(part_off, 4u)) {
++		return 0u;
++	}
++	return probe_rd32(s5b.cac_va, part_off - s5b.cac_win_off);
++}
++
++static void
++s5b_cac_wr32(uint32_t part_off, uint32_t val)
++{
++	if (!s5b_cac_valid_off(part_off, 4u)) {
++		return;
++	}
++	probe_wr32(s5b.cac_va, part_off - s5b.cac_win_off, val);
++}
++
++static bool
++s5b_smem_lock(void)
++{
++	if (!s5b.hwlock_va) {
++		return false;
++	}
++	for (unsigned i = 0u; i < 2000u; i++) {
++		probe_wr32(s5b.hwlock_va, 0u, 1u);
++		if (probe_rd32(s5b.hwlock_va, 0u) == 1u) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++static void
++s5b_smem_unlock(void)
++{
++	if (!s5b.hwlock_va) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	probe_wr32(s5b.hwlock_va, 0u, 0u);
++}
++
++static void
++s5b_unc_wr_ascii4(uint32_t part_off, const char *s, unsigned nbytes)
++{
++	for (unsigned k = 0u; k < nbytes; k += 4u) {
++		uint32_t w = 0u;
++		for (unsigned b = 0u; b < 4u && (k + b) < nbytes; b++) {
++			uint8_t ch = (uint8_t)s[k + b];
++			w |= ((uint32_t)ch << (b * 8u));
++			if (ch == '\0') {
++				break;
++			}
++		}
++		probe_wr32(s5b.unc_va, part_off + k, w);
++	}
++}
++
++static void
++s5b_glink_kick(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_GLINK_MASK);
++}
++
++static uint32_t
++s5b_fifo_avail_rx(void)
++{
++	uint32_t head = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_head_idx * 4u);
++	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	return (head >= tail) ? (head - tail) : (s5b.rx_fifo_len - tail + head);
++}
++
++static void
++s5b_fifo_peek_bytes(uint32_t off, uint8_t *dst, uint32_t n)
++{
++	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	uint32_t pos = (tail + off) % s5b.rx_fifo_len;
++	uint32_t i = 0u;
++	while (i < n) {
++		uint32_t w = s5b_cac_rd32(s5b.rx_fifo_off + (pos & ~3u));
++		uint32_t shift = (pos & 3u) * 8u;
++		dst[i] = (uint8_t)((w >> shift) & 0xffu);
++		i++;
++		pos++;
++		if (pos >= s5b.rx_fifo_len) {
++			pos = 0u;
++		}
++	}
++}
++
++static void
++s5b_fifo_advance_rx(uint32_t n)
++{
++	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	probe_wr32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u,
++	    (tail + n) % s5b.rx_fifo_len);
++}
++
++static bool
++s5b_glink_send_raw(const uint8_t *buf, uint32_t n)
++{
++	if (!s5b.bound || s5b.tx_fifo_len == 0u) {
++		return false;
++	}
++	uint32_t total = (n + 7u) & ~7u;
++	if (total >= s5b.tx_fifo_len) {
++		printf("WIFI PROBE: [5B] ERROR: GLINK tx frame %u >= fifo len %u\n",
++		    total, s5b.tx_fifo_len);
++		return false;
++	}
++	for (unsigned tries = 0u;; tries++) {
++		uint32_t head = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u);
++		uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_tail_idx * 4u);
++		uint32_t avail = (tail <= head) ? (s5b.tx_fifo_len - head + tail) : (tail - head);
++		if (avail > total) {
++			break;
++		}
++		if (tries == 200u) {
++			printf("WIFI PROBE: [5B] ERROR: GLINK TX FIFO full (head=%u tail=%u need=%u)\n",
++			    head, tail, total);
++			return false;
++		}
++		delay(1000);
++	}
++
++	uint32_t pos = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u);
++	for (uint32_t i = 0u; i < total; i += 4u) {
++		uint32_t w = 0u;
++		for (uint32_t b = 0u; b < 4u; b++) {
++			if (i + b < n) {
++				w |= ((uint32_t)buf[i + b] << (b * 8u));
++			}
++		}
++		s5b_cac_wr32(s5b.tx_fifo_off + pos, w);
++		pos += 4u;
++		if (pos >= s5b.tx_fifo_len) {
++			pos = 0u;
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	probe_wr32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u, pos);
++	s5b_glink_kick();
++	return true;
++}
++
++static bool
++s5b_glink_send_cmd(uint16_t cmd, uint16_t p1, uint32_t p2)
++{
++	uint8_t msg[8];
++	s5b_wr_le16(msg + 0, cmd);
++	s5b_wr_le16(msg + 2, p1);
++	s5b_wr_le32(msg + 4, p2);
++	return s5b_glink_send_raw(msg, sizeof(msg));
++}
++
++static bool
++s5b_glink_send_open(uint16_t lcid, const char *name)
++{
++	uint32_t slen = sweet_str_len(name) + 1u;
++	uint8_t msg[32];
++	if (slen > 24u) {
++		return false;
++	}
++	memset(msg, 0, sizeof(msg));
++	s5b_wr_le16(msg + 0, GLINK_CMD_OPEN);
++	s5b_wr_le16(msg + 2, lcid);
++	s5b_wr_le32(msg + 4, slen);
++	memcpy(msg + 8, name, slen);
++	return s5b_glink_send_raw(msg, 8u + slen);
++}
++
++static void
++s5b_glink_seed_intents(uint32_t count, uint32_t sz)
++{
++	uint8_t msg[8u + 8u * 8u];
++	if (count > 8u) {
++		count = 8u;
++	}
++	s5b_wr_le16(msg + 0, GLINK_CMD_INTENT);
++	s5b_wr_le16(msg + 2, 1u); /* local lcid=1 ("IPCRTR") */
++	s5b_wr_le32(msg + 4, count);
++	for (uint32_t i = 0u; i < count; i++) {
++		uint32_t liid = s5b.next_liid++;
++		s5b_wr_le32(msg + 8u + i * 8u + 0u, sz);
++		s5b_wr_le32(msg + 8u + i * 8u + 4u, liid);
++	}
++	(void)s5b_glink_send_raw(msg, 8u + count * 8u);
++}
++
++static void s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len);
++static bool s5b_glink_rx_step(void);
++
++static bool
++s5b_glink_tx_data(const uint8_t *payload, uint32_t len)
++{
++	if (!s5b.ipcrtr_open_acked || !s5b.ipcrtr_rem_open || len > sizeof(s_5b_tx_pkt_buf) - 16u) {
++		return false;
++	}
++
++	int slot = -1;
++	for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
++		if (s5b.rem_intents[i].valid && !s5b.rem_intents[i].in_use &&
++		    s5b.rem_intents[i].size >= len) {
++			slot = (int)i;
++			break;
++		}
++	}
++
++	if (slot < 0) {
++		(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ, 1u, len);
++		bool prev_wait = s5b.in_intent_wait;
++		s5b.in_intent_wait = true;
++		for (unsigned ms = 0u; ms < 500u && slot < 0; ms++) {
++			while (s5b_glink_rx_step()) {
++			}
++			for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
++				if (s5b.rem_intents[i].valid && !s5b.rem_intents[i].in_use &&
++				    s5b.rem_intents[i].size >= len) {
++					slot = (int)i;
++					break;
++				}
++			}
++			if (slot < 0) {
++				delay(1000);
++			}
++		}
++		s5b.in_intent_wait = prev_wait;
++	}
++
++	if (slot < 0) {
++		printf("WIFI PROBE: [5B] WARN: no MPSS RX intent available for len=%u\n", len);
++		return false;
++	}
++
++	s5b.rem_intents[slot].in_use = true;
++	uint32_t riid = s5b.rem_intents[slot].iid;
++
++	s5b_wr_le16(s_5b_tx_pkt_buf + 0, GLINK_CMD_TX_DATA);
++	s5b_wr_le16(s_5b_tx_pkt_buf + 2, 1u); /* local lcid=1 */
++	s5b_wr_le32(s_5b_tx_pkt_buf + 4, riid);
++	s5b_wr_le32(s_5b_tx_pkt_buf + 8, len);
++	s5b_wr_le32(s_5b_tx_pkt_buf + 12, 0u);
++	memcpy(s_5b_tx_pkt_buf + 16, payload, len);
++	return s5b_glink_send_raw(s_5b_tx_pkt_buf, 16u + len);
++}
++
++static bool
++s5b_glink_rx_step(void)
++{
++	uint32_t avail = s5b_fifo_avail_rx();
++	if (avail < 8u) {
++		return false;
++	}
++
++	uint8_t h[16];
++	s5b_fifo_peek_bytes(0u, h, 8u);
++	uint16_t cmd = s5b_rd_le16(h + 0);
++	uint16_t p1  = s5b_rd_le16(h + 2);
++	uint32_t p2  = s5b_rd_le32(h + 4);
++
++	switch (cmd) {
++	case GLINK_CMD_VERSION:
++		s5b_fifo_advance_rx(8u);
++		if (p1 >= 1u) {
++			s5b.glink_reuse = (p2 & 1u) != 0u;
++			(void)s5b_glink_send_cmd(GLINK_CMD_VERSION_ACK, 1u, p2 & 1u);
++		}
++		break;
++
++	case GLINK_CMD_VERSION_ACK:
++		s5b_fifo_advance_rx(8u);
++		if (p1 == 1u) {
++			s5b.glink_reuse = (p2 & 1u) != 0u;
++			if (!s5b.link_up) {
++				s5b.link_up = true;
++				(void)s5b_glink_send_open(1u, "IPCRTR");
++			}
++		}
++		break;
++
++	case GLINK_CMD_OPEN: {
++		uint32_t frame_len = 8u + ((p2 + 7u) & ~7u);
++		if (p2 > 128u || avail < frame_len) {
++			return false;
++		}
++		char cname[40];
++		uint32_t clen = (p2 < sizeof(cname) - 1u) ? p2 : (uint32_t)(sizeof(cname) - 1u);
++		memset(cname, 0, sizeof(cname));
++		s5b_fifo_peek_bytes(8u, (uint8_t *)cname, clen);
++		cname[clen] = '\0';
++		s5b_fifo_advance_rx(frame_len);
++		if (strcmp(cname, "IPCRTR") == 0) {
++			s5b.ipcrtr_rcid = p1;
++			s5b.ipcrtr_rem_open = true;
++			(void)s5b_glink_send_cmd(GLINK_CMD_OPEN_ACK, p1, 0u);
++			if (s5b.ipcrtr_open_acked && !s5b.intents_seeded) {
++				s5b.intents_seeded = true;
++				s5b_glink_seed_intents(8u, 8192u);
++			}
++		} else {
++			printf("WIFI PROBE: [5B.2] GLINK remote open '%s' (rcid=%u) ignored\n",
++			    cname, p1);
++		}
++		break;
++	}
++
++	case GLINK_CMD_OPEN_ACK:
++		s5b_fifo_advance_rx(8u);
++		if (p1 == 1u) {
++			s5b.ipcrtr_open_acked = true;
++			if (s5b.ipcrtr_rem_open && !s5b.intents_seeded) {
++				s5b.intents_seeded = true;
++				s5b_glink_seed_intents(8u, 8192u);
++			}
++		}
++		break;
++
++	case GLINK_CMD_CLOSE:
++		s5b_fifo_advance_rx(8u);
++		(void)s5b_glink_send_cmd(GLINK_CMD_CLOSE_ACK, p1, 0u);
++		if (p1 == s5b.ipcrtr_rcid) {
++			s5b.ipcrtr_rem_open = false;
++		}
++		break;
++
++	case GLINK_CMD_CLOSE_ACK:
++		s5b_fifo_advance_rx(8u);
++		break;
++
++	case GLINK_CMD_INTENT: {
++		if (p2 > 64u) {
++			s5b_fifo_advance_rx(8u);
++			break;
++		}
++		uint32_t frame_len = 8u + p2 * 8u;
++		if (avail < frame_len) {
++			return false;
++		}
++		for (uint32_t k = 0u; k < p2; k++) {
++			uint8_t ib[8];
++			s5b_fifo_peek_bytes(8u + k * 8u, ib, 8u);
++			if (p1 == s5b.ipcrtr_rcid) {
++				uint32_t sz  = s5b_rd_le32(ib + 0);
++				uint32_t iid = s5b_rd_le32(ib + 4);
++				for (unsigned s = 0u; s < MPSS_MAX_REM_INTENTS; s++) {
++					if (!s5b.rem_intents[s].valid) {
++						s5b.rem_intents[s].iid = iid;
++						s5b.rem_intents[s].size = sz;
++						s5b.rem_intents[s].valid = true;
++						s5b.rem_intents[s].in_use = false;
++						break;
++					}
++				}
++			}
++		}
++		s5b_fifo_advance_rx(frame_len);
++		break;
++	}
++
++	case GLINK_CMD_RX_DONE:
++	case GLINK_CMD_RX_DONE_W_REUSE:
++		s5b_fifo_advance_rx(8u);
++		if (p1 == s5b.ipcrtr_rcid) {
++			for (unsigned s = 0u; s < MPSS_MAX_REM_INTENTS; s++) {
++				if (s5b.rem_intents[s].valid && s5b.rem_intents[s].iid == p2) {
++					if (cmd == GLINK_CMD_RX_DONE_W_REUSE) {
++						s5b.rem_intents[s].in_use = false;
++					} else {
++						s5b.rem_intents[s].valid = false;
++						s5b.rem_intents[s].in_use = false;
++					}
++					break;
++				}
++			}
++		}
++		break;
++
++	case GLINK_CMD_RX_INTENT_REQ:
++		s5b_fifo_advance_rx(8u);
++		if (p1 == s5b.ipcrtr_rcid) {
++			uint32_t grant_sz = (p2 > 8192u) ? 8192u : ((p2 < 2048u) ? 2048u : p2);
++			s5b_glink_seed_intents(1u, grant_sz);
++			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 1u, 1u);
++		}
++		break;
++
++	case GLINK_CMD_RX_INTENT_REQ_ACK:
++		s5b_fifo_advance_rx(8u);
++		break;
++
++	case GLINK_CMD_TX_DATA:
++	case GLINK_CMD_TX_DATA_CONT: {
++		if (avail < 16u) {
++			return false;
++		}
++		s5b_fifo_peek_bytes(0u, h, 16u);
++		uint32_t liid  = s5b_rd_le32(h + 4);
++		uint32_t chunk = s5b_rd_le32(h + 8);
++		uint32_t left  = s5b_rd_le32(h + 12);
++		uint32_t frame_len = (16u + chunk + 7u) & ~7u;
++		if (avail < frame_len) {
++			return false;
++		}
++		if (p1 == s5b.ipcrtr_rcid) {
++			if (cmd == GLINK_CMD_TX_DATA) {
++				s5b.rx_pkt_len = 0u;
++				s5b.rx_pkt_active = true;
++			}
++			if (s5b.rx_pkt_active && s5b.rx_pkt_len + chunk <= sizeof(s_5b_rx_pkt_buf)) {
++				s5b_fifo_peek_bytes(16u, s_5b_rx_pkt_buf + s5b.rx_pkt_len, chunk);
++				s5b.rx_pkt_len += chunk;
++			} else {
++				s5b.rx_pkt_active = false;
++			}
++		}
++		s5b_fifo_advance_rx(frame_len);
++		if (p1 == s5b.ipcrtr_rcid && left == 0u) {
++			uint32_t plen = s5b.rx_pkt_active ? s5b.rx_pkt_len : 0u;
++			s5b.rx_pkt_active = false;
++			s5b.rx_pkt_len = 0u;
++			if (s5b.glink_reuse) {
++				(void)s5b_glink_send_cmd(GLINK_CMD_RX_DONE_W_REUSE, 1u, liid);
++			} else {
++				(void)s5b_glink_send_cmd(GLINK_CMD_RX_DONE, 1u, liid);
++				s5b_glink_seed_intents(1u, 8192u);
++			}
++			if (plen > 0u) {
++				if (s5b.in_intent_wait) {
++					uint32_t nxt = (s5b.rxq_head + 1u) % IPCRTR_RXQ_SLOTS;
++					if (nxt != s5b.rxq_tail && plen <= sizeof(s5b.rxq[0].data)) {
++						s5b.rxq[s5b.rxq_head].len = plen;
++						memcpy(s5b.rxq[s5b.rxq_head].data, s_5b_rx_pkt_buf, plen);
++						s5b.rxq_head = nxt;
++					}
++				} else {
++					s5b_ipcrtr_rx_packet(s_5b_rx_pkt_buf, plen);
++				}
++			}
++		}
++		break;
++	}
++
++	case GLINK_CMD_READ_NOTIF:
++		s5b_fifo_advance_rx(8u);
++		s5b_glink_kick();
++		break;
++
++	case GLINK_CMD_SIGNALS:
++		s5b_fifo_advance_rx(8u);
++		break;
++
++	default:
++		printf("WIFI PROBE: [5B.2] GLINK unknown cmd=%u p1=%u p2=0x%x\n", cmd, p1, p2);
++		s5b_fifo_advance_rx(8u);
++		break;
++	}
++	return true;
++}
++
++static void
++s5b_pump_all(void)
++{
++	while (s5b_glink_rx_step()) {
++	}
++	while (!s5b.in_intent_wait && s5b.rxq_tail != s5b.rxq_head) {
++		uint32_t idx = s5b.rxq_tail;
++		uint32_t plen = s5b.rxq[idx].len;
++		s5b.rxq_tail = (idx + 1u) % IPCRTR_RXQ_SLOTS;
++		s5b_ipcrtr_rx_packet(s5b.rxq[idx].data, plen);
++	}
++}
++
++static bool
++s5b_ipcrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
++    const void *payload, uint32_t size)
++{
++	uint32_t pad_sz = (size + 3u) & ~3u;
++	if (32u + pad_sz > sizeof(s_5b_ipcr_tx_buf)) {
++		return false;
++	}
++	memset(s_5b_ipcr_tx_buf, 0, 32u + pad_sz);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 0,  QRTR_PROTO_VER_1);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 4,  type);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 8,  QRTR_NODE_APPS);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 12, src_port);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 16, 0u);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 20, size);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 24, dst_node);
++	s5b_wr_le32(s_5b_ipcr_tx_buf + 28, dst_port);
++	if (size > 0u && payload != NULL) {
++		memcpy(s_5b_ipcr_tx_buf + 32, payload, size);
++	}
++	return s5b_glink_tx_data(s_5b_ipcr_tx_buf, 32u + pad_sz);
++}
++
++static void
++s5b_ipcrtr_send_ctrl(uint32_t dst_node, uint32_t cmd, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
++{
++	uint8_t ctrl[20];
++	s5b_wr_le32(ctrl + 0,  cmd);
++	s5b_wr_le32(ctrl + 4,  a0);
++	s5b_wr_le32(ctrl + 8,  a1);
++	s5b_wr_le32(ctrl + 12, a2);
++	s5b_wr_le32(ctrl + 16, a3);
++	(void)s5b_ipcrtr_send(cmd, QRTR_PORT_CTRL, dst_node, QRTR_PORT_CTRL, ctrl, sizeof(ctrl));
++}
++
++static void
++s5b_advertise_apps_servers(uint32_t dst_node)
++{
++	/* Advertise pd-mapper (0x40), rmtfs (0x0e), and tqftpserv (0x1000) */
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC, (1u << 8) | 1u, QRTR_NODE_APPS, QRTR_LOCAL_PORT_SERVREG_1);
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC, 1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_SERVREG_0);
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_RMTFS,       1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_RMTFS);
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,        1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
++}
++
++static uint32_t
++s5b_qmi_put_tlv(uint8_t *dst, uint32_t off, uint8_t tag, uint16_t len, const void *val)
++{
++	dst[off + 0] = tag;
++	s5b_wr_le16(dst + off + 1, len);
++	if (len > 0u && val != NULL) {
++		memcpy(dst + off + 3, val, len);
++	}
++	return off + 3u + len;
++}
++
++static uint32_t
++s5b_qmi_put_result(uint8_t *dst, uint32_t off, uint16_t result, uint16_t error)
++{
++	uint8_t v[4];
++	s5b_wr_le16(v + 0, result);
++	s5b_wr_le16(v + 2, error);
++	return s5b_qmi_put_tlv(dst, off, 0x02u, 4u, v);
++}
++
++static const uint8_t *
++s5b_qmi_find_tlv(const uint8_t *sdu, uint32_t sdu_len, uint8_t want_tag, uint16_t *out_len)
++{
++	uint32_t pos = 0u;
++	while (pos + 3u <= sdu_len) {
++		uint8_t  tag  = sdu[pos + 0];
++		uint16_t tlen = s5b_rd_le16(sdu + pos + 1);
++		if (tlen > sdu_len - (pos + 3u)) {
++			break;
++		}
++		if (tag == want_tag) {
++			if (out_len) {
++				*out_len = tlen;
++			}
++			return sdu + pos + 3u;
++		}
++		pos += 3u + tlen;
++	}
++	return NULL;
++}
++
++static void
++s5b_qmi_send_sdu(uint8_t msg_type, uint16_t txn_id, uint16_t msg_id,
++    uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
++    const uint8_t *sdu, uint16_t sdu_len)
++{
++	if (7u + sdu_len > sizeof(s_5b_qmi_tx_buf)) {
++		return;
++	}
++	s_5b_qmi_tx_buf[0] = msg_type;
++	s5b_wr_le16(s_5b_qmi_tx_buf + 1, txn_id);
++	s5b_wr_le16(s_5b_qmi_tx_buf + 3, msg_id);
++	s5b_wr_le16(s_5b_qmi_tx_buf + 5, sdu_len);
++	if (sdu_len > 0u && sdu != NULL) {
++		memcpy(s_5b_qmi_tx_buf + 7, sdu, sdu_len);
++	}
++	(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, src_port, dst_node, dst_port,
++	    s_5b_qmi_tx_buf, 7u + sdu_len);
++}
++
++static uint32_t
++s5b_servreg_append_entry(uint8_t *buf, uint32_t off, const char *domain, uint32_t instance_id)
++{
++	unsigned slen = sweet_str_len(domain);
++	buf[off++] = (uint8_t)slen;
++	memcpy(buf + off, domain, slen);
++	off += slen;
++	s5b_wr_le32(buf + off, instance_id);
++	off += 4u;
++	buf[off++] = 0u; /* service_data_valid = 0 */
++	s5b_wr_le32(buf + off, 0u);
++	off += 4u;
++	return off;
++}
++
++static void
++s5b_handle_servreg_qmi(uint32_t local_port, uint32_t src_node, uint32_t src_port,
++    uint16_t txn, uint16_t msg_id, const uint8_t *sdu, uint32_t sdu_len)
++{
++	uint8_t resp[256];
++	uint32_t roff = 0u;
++
++	if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_REQ */
++		uint16_t slen = 0u, olen = 0u;
++		const uint8_t *sv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &slen);
++		const uint8_t *ov = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &olen);
++		char svc_name[72];
++		memset(svc_name, 0, sizeof(svc_name));
++		if (sv && slen > 0u) {
++			uint32_t copy_n = (slen < sizeof(svc_name) - 1u) ? slen : (uint32_t)(sizeof(svc_name) - 1u);
++			memcpy(svc_name, sv, copy_n);
++		}
++		uint32_t dom_off = (ov && olen >= 4u) ? s5b_rd_le32(ov) : 0u;
++
++		bool has_root = s5b_str_contains(svc_name, "servreg") || s5b_str_contains(svc_name, "pdr_enabled");
++		bool has_wlan = s5b_str_contains(svc_name, "servreg") || s5b_str_contains(svc_name, "wlan") ||
++		                s5b_str_contains(svc_name, "elf_loader");
++
++		uint16_t total = (uint16_t)((has_root ? 1u : 0u) + (has_wlan ? 1u : 0u));
++		printf("WIFI PROBE: [5B.3] SERVREG_LOC(port=%u) GET_DOMAIN_LIST svc='%s' off=%u -> total=%u\n",
++		    local_port, svc_name, dom_off, total);
++
++		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++		uint8_t u16buf[2];
++		s5b_wr_le16(u16buf, total);
++		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 2u, u16buf);
++		s5b_wr_le16(u16buf, 1u); /* db_rev_count */
++		roff = s5b_qmi_put_tlv(resp, roff, 0x11u, 2u, u16buf);
++
++		if (total > 0u && dom_off < total) {
++			uint8_t list_buf[160];
++			uint32_t loff = 1u;
++			uint8_t cnt = 0u;
++			if (has_root && dom_off == 0u) {
++				loff = s5b_servreg_append_entry(list_buf, loff, "msm/modem/root_pd", 180u);
++				cnt++;
++			}
++			if (has_wlan) {
++				loff = s5b_servreg_append_entry(list_buf, loff, "msm/modem/wlan_pd", 180u);
++				cnt++;
++			}
++			list_buf[0] = cnt;
++			roff = s5b_qmi_put_tlv(resp, roff, 0x12u, (uint16_t)loff, list_buf);
++		}
++		s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
++		    resp, (uint16_t)roff);
++	} else {
++		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++		s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
++		    resp, (uint16_t)roff);
++	}
++}
++
++static const char *
++s5b_rmtfs_part_from_caller(uint32_t cid)
++{
++	switch (cid) {
++	case 1u: return "modemst1";
++	case 2u: return "modemst2";
++	case 3u: return "fsg";
++	case 4u: return "fsc";
++	default: return NULL;
++	}
++}
++
++static void
++s5b_handle_rmtfs_qmi(uint32_t src_node, uint32_t src_port,
++    uint16_t txn, uint16_t msg_id, const uint8_t *sdu, uint32_t sdu_len)
++{
++	uint8_t resp[64];
++	uint32_t roff = 0u;
++
++	if (msg_id == 0x0001u) { /* OPEN_REQ */
++		uint16_t plen = 0u;
++		const uint8_t *pv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &plen);
++		char path[64];
++		memset(path, 0, sizeof(path));
++		if (pv && plen > 0u) {
++			uint32_t cn = (plen < sizeof(path) - 1u) ? plen : (uint32_t)(sizeof(path) - 1u);
++			memcpy(path, pv, cn);
++		}
++		uint32_t cid = 0u;
++		if (s5b_str_contains(path, "fs1"))      cid = 1u;
++		else if (s5b_str_contains(path, "fs2")) cid = 2u;
++		else if (s5b_str_contains(path, "fsg")) cid = 3u;
++		else if (s5b_str_contains(path, "fsc")) cid = 4u;
++
++		printf("WIFI PROBE: [5B.3] RMTFS OPEN '%s' -> caller_id=%u\n", path, cid);
++		if (cid == 0u) {
++			roff = s5b_qmi_put_result(resp, roff, 1u, 1u);
++		} else {
++			uint8_t cid_le[4];
++			s5b.rmtfs_caller_id[cid] = cid;
++			s5b_wr_le32(cid_le, cid);
++			roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++			roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 4u, cid_le);
++		}
++	} else if (msg_id == 0x0004u) { /* ALLOC_BUFF_REQ */
++		uint8_t addr_le[8];
++		s5b_wr_le64(addr_le, POPLAR_RMTFS_CARVEOUT_PA);
++		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 8u, addr_le);
++	} else if (msg_id == 0x0003u) { /* RW_IOVEC_REQ */
++		uint16_t cl = 0u, dl = 0u, il = 0u;
++		const uint8_t *cv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &cl);
++		const uint8_t *dv = s5b_qmi_find_tlv(sdu, sdu_len, 0x02u, &dl);
++		const uint8_t *iv = s5b_qmi_find_tlv(sdu, sdu_len, 0x03u, &il);
++		uint32_t cid = (cv && cl >= 4u) ? s5b_rd_le32(cv) : 0u;
++		uint8_t dir = (dv && dl >= 1u) ? dv[0] : 1u;
++		const char *part = s5b_rmtfs_part_from_caller(cid);
++		int rw_err = 0;
++
++		if (part != NULL && dir == 0u && iv && il >= 1u) {
++			uint8_t nent = iv[0];
++			if ((uint32_t)nent * 12u <= il - 1u) {
++				vm_offset_t rmt_va = ml_io_map_unmappable(POPLAR_RMTFS_CARVEOUT_PA,
++				    POPLAR_RMTFS_CARVEOUT_SIZE, SWEET_VM_WIMG_WCOMB);
++				if (rmt_va) {
++					for (uint8_t e = 0u; e < nent; e++) {
++						const uint8_t *ev = iv + 1u + (uint32_t)e * 12u;
++						uint32_t sec_addr = s5b_rd_le32(ev + 0);
++						uint32_t phys_off = s5b_rd_le32(ev + 4);
++						uint32_t nsec     = s5b_rd_le32(ev + 8);
++						uint64_t bytes    = (uint64_t)nsec * 512ULL;
++						if (phys_off > POPLAR_RMTFS_CARVEOUT_SIZE ||
++						    bytes > POPLAR_RMTFS_CARVEOUT_SIZE - phys_off) {
++							rw_err = EINVAL;
++							break;
++						}
++						uint32_t done = 0u;
++						while (done < (uint32_t)bytes) {
++							uint32_t chunk = (uint32_t)bytes - done;
++							if (chunk > sizeof(s_5b_rmtfs_io_buf)) {
++								chunk = (uint32_t)sizeof(s_5b_rmtfs_io_buf);
++							}
++							int urc = sweet_ufs_read_part(part,
++							    (uint64_t)sec_addr * 512ULL + done,
++							    s_5b_rmtfs_io_buf, chunk);
++							if (urc != 0) {
++								rw_err = urc;
++								break;
++							}
++							for (uint32_t k = 0u; k < chunk; k += 4u) {
++								uint32_t w = s5b_rd_le32(s_5b_rmtfs_io_buf + k);
++								probe_wr32(rmt_va, phys_off + done + k, w);
++							}
++							done += chunk;
++						}
++						sweet_dcache_clean_poc(rmt_va + phys_off, (size_t)bytes);
++						if (rw_err != 0) {
++							break;
++						}
++					}
++					ml_io_unmap(rmt_va, POPLAR_RMTFS_CARVEOUT_SIZE);
++				} else {
++					rw_err = EIO;
++				}
++			}
++			printf("WIFI PROBE: [5B.3] RMTFS READ '%s' -> err=%d\n", part, rw_err);
++		} else if (dir != 0u) {
++			printf("WIFI PROBE: [5B.3] RMTFS WRITE cid=%u ignored (read-only mode)\n", cid);
++		}
++		roff = s5b_qmi_put_result(resp, roff, rw_err == 0 ? 0u : 1u, rw_err == 0 ? 0u : 1u);
++	} else if (msg_id == 0x0005u) { /* GET_DEV_ERROR_REQ */
++		uint8_t zero[4] = { 0, 0, 0, 0 };
++		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 4u, zero);
++	} else {
++		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++	}
++
++	s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, QRTR_LOCAL_PORT_RMTFS,
++	    src_node, src_port, resp, (uint16_t)roff);
++}
++
++static uint32_t
++s5b_max_rem_intent_size(void)
++{
++	uint32_t best = 0u;
++	for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
++		if (s5b.rem_intents[i].valid && s5b.rem_intents[i].size > best) {
++			best = s5b.rem_intents[i].size;
++		}
++	}
++	return (best > 0u) ? best : 2048u;
++}
++
++static void
++s5b_tftp_send_error(uint32_t src_port, uint32_t dst_node, uint32_t dst_port,
++    uint16_t errcode, const char *msg)
++{
++	uint8_t buf[96];
++	unsigned mlen = sweet_str_len(msg) + 1u;
++	if (4u + mlen > sizeof(buf)) {
++		mlen = sizeof(buf) - 4u;
++	}
++	s5b_wr_be16(buf + 0, TFTP_OP_ERROR);
++	s5b_wr_be16(buf + 2, errcode);
++	memcpy(buf + 4, msg, mlen - 1u);
++	buf[4u + mlen - 1u] = '\0';
++	(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, src_port, dst_node, dst_port, buf, 4u + mlen);
++}
++
++static void
++s5b_tftp_send_ack(uint32_t src_port, uint32_t dst_node, uint32_t dst_port, uint16_t block)
++{
++	uint8_t buf[4];
++	s5b_wr_be16(buf + 0, TFTP_OP_ACK);
++	s5b_wr_be16(buf + 2, block);
++	(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, src_port, dst_node, dst_port, buf, 4u);
++}
++
++static void
++s5b_tftp_send_window(struct tftp_session *sess)
++{
++	if (!sess->active || sess->is_wrq || sess->eof_sent) {
++		return;
++	}
++
++	uint32_t sent_so_far = sess->base_offset;
++	if (sess->has_rsize && sess->rsize == 0u) {
++		sess->eof_sent = true;
++		return;
++	}
++
++	if (sent_so_far >= sess->xfer_len) {
++		if (!sess->has_rsize && (sess->xfer_len == 0u || (sess->xfer_len % sess->blksize) == 0u)) {
++			uint16_t blk = (uint16_t)(sess->last_sent_block + 1u);
++			s5b_wr_be16(s_5b_tftp_tx_buf + 0, TFTP_OP_DATA);
++			s5b_wr_be16(s_5b_tftp_tx_buf + 2, blk);
++			(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, sess->local_port,
++			    sess->peer_node, sess->peer_port, s_5b_tftp_tx_buf, 4u);
++			sess->last_sent_block = blk;
++		}
++		sess->eof_sent = true;
++		return;
++	}
++
++	sess->win_start_block = sess->last_sent_block;
++	sess->win_bytes_sent = 0u;
++	for (uint32_t w = 0u; w < sess->wsize; w++) {
++		uint32_t off = sess->base_offset + sess->win_bytes_sent;
++		if (off >= sess->xfer_len) {
++			sess->eof_sent = true;
++			break;
++		}
++		uint32_t chunk = sess->xfer_len - off;
++		if (chunk > sess->blksize) {
++			chunk = sess->blksize;
++		}
++		s5b_wr_be16(s_5b_tftp_tx_buf + 0, TFTP_OP_DATA);
++		s5b_wr_be16(s_5b_tftp_tx_buf + 2, (uint16_t)(sess->last_sent_block + 1u));
++		int err = sweet_modem_fat16_read_slice(sess->clus, sess->fsize,
++		    sess->seek + off, chunk, s_5b_tftp_tx_buf + 4);
++		if (err != 0) {
++			printf("WIFI PROBE: [5B.3] TFTP read err=%d off=%u len=%u\n", err, sess->seek + off, chunk);
++			s5b_tftp_send_error(sess->local_port, sess->peer_node, sess->peer_port, 2u, "Read error");
++			sess->active = false;
++			return;
++		}
++		(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, sess->local_port,
++		    sess->peer_node, sess->peer_port, s_5b_tftp_tx_buf, 4u + chunk);
++		sess->last_sent_block++;
++		sess->win_bytes_sent += chunk;
++		if (chunk < sess->blksize) {
++			sess->eof_sent = true;
++			break;
++		}
++	}
++}
++
++static void
++s5b_handle_tftp_pkt(uint32_t local_port, uint32_t src_node, uint32_t src_port,
++    const uint8_t *pkt, uint32_t len)
++{
++	if (len < 2u) {
++		return;
++	}
++	uint16_t op = s5b_rd_be16(pkt);
++
++	if (local_port == QRTR_LOCAL_PORT_TFTP && (op == TFTP_OP_RRQ || op == TFTP_OP_WRQ)) {
++		int free_idx = -1;
++		for (unsigned i = 0u; i < TFTP_MAX_SESS; i++) {
++			if (!s5b.tftp[i].active) {
++				free_idx = (int)i;
++				break;
++			}
++		}
++		if (free_idx < 0) {
++			free_idx = 0; /* reclaim oldest slot */
++		}
++
++		struct tftp_session *sess = &s5b.tftp[free_idx];
++		memset(sess, 0, sizeof(*sess));
++		sess->local_port = QRTR_LOCAL_PORT_TFTP_SESS0 + (uint32_t)free_idx;
++		sess->peer_node  = src_node;
++		sess->peer_port  = src_port;
++		sess->is_wrq     = (op == TFTP_OP_WRQ);
++		sess->blksize    = 512u;
++		sess->wsize      = 1u;
++
++		/* Parse filename, mode, and extended options */
++		uint32_t pos = 2u;
++		char fname[96];
++		memset(fname, 0, sizeof(fname));
++		uint32_t fn_i = 0u;
++		while (pos < len && pkt[pos] != 0u) {
++			if (fn_i + 1u < sizeof(fname)) {
++				fname[fn_i++] = (char)pkt[pos];
++			}
++			pos++;
++		}
++		if (pos < len) pos++;
++		while (pos < len && pkt[pos] != 0u) {
++			pos++; /* skip mode string */
++		}
++		if (pos < len) pos++;
++
++		struct { char key[24]; char val[24]; } opts[12];
++		unsigned n_opts = 0u;
++		while (pos < len && n_opts < 12u) {
++			unsigned klen = 0u, vlen = 0u;
++			memset(opts[n_opts].key, 0, sizeof(opts[n_opts].key));
++			memset(opts[n_opts].val, 0, sizeof(opts[n_opts].val));
++			while (pos < len && pkt[pos] != 0u) {
++				if (klen + 1u < sizeof(opts[n_opts].key)) {
++					opts[n_opts].key[klen++] = (char)pkt[pos];
++				}
++				pos++;
++			}
++			if (pos < len) pos++;
++			while (pos < len && pkt[pos] != 0u) {
++				if (vlen + 1u < sizeof(opts[n_opts].val)) {
++					opts[n_opts].val[vlen++] = (char)pkt[pos];
++				}
++				pos++;
++			}
++			if (pos < len) pos++;
++			if (klen > 0u) {
++				n_opts++;
++			}
++		}
++
++		if (op == TFTP_OP_WRQ) {
++			printf("WIFI PROBE: [5B.3] TFTP WRQ '%s' (%u opts) from [%u:%u] -> stub OACK\n",
++			    fname, n_opts, src_node, src_port);
++			sess->active = true;
++			if (n_opts == 0u) {
++				s5b_tftp_send_ack(sess->local_port, src_node, src_port, 0u);
++			} else {
++				uint8_t oack[256];
++				s5b_wr_be16(oack, TFTP_OP_OACK);
++				uint32_t oo = 2u;
++				for (unsigned k = 0u; k < n_opts; k++) {
++					unsigned kl = sweet_str_len(opts[k].key) + 1u;
++					unsigned vl = sweet_str_len(opts[k].val) + 1u;
++					if (oo + kl + vl <= sizeof(oack)) {
++						memcpy(oack + oo, opts[k].key, kl); oo += kl;
++						memcpy(oack + oo, opts[k].val, vl); oo += vl;
++					}
++				}
++				(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, sess->local_port, src_node, src_port, oack, oo);
++			}
++			return;
++		}
++
++		uint32_t fclus = 0u, fsize = 0u;
++		if (!sweet_modem_fat16_lookup_filename(fname, &fclus, &fsize)) {
++			printf("WIFI PROBE: [5B.3] TFTP RRQ '%s' -> NOT FOUND in /IMAGE/\n", fname);
++			s5b_tftp_send_error(sess->local_port, src_node, src_port, 1u, "File not found");
++			return;
++		}
++
++		for (unsigned k = 0u; k < n_opts; k++) {
++			bool ok = false;
++			uint32_t v = s5b_parse_dec(opts[k].val, &ok);
++			if (!ok) continue;
++			if (s5b_str_eq_ci(opts[k].key, "blksize")) {
++				uint32_t max_blk = s5b_max_rem_intent_size();
++				max_blk = (max_blk > 64u) ? (max_blk - 64u) : 512u;
++				if (max_blk > 4096u) max_blk = 4096u;
++				if (v < 1u) v = 1u;
++				if (v > max_blk) v = max_blk;
++				sess->blksize = v;
++				(void)s5b_fmt_u32_dec(v, opts[k].val, sizeof(opts[k].val));
++			} else if (s5b_str_eq_ci(opts[k].key, "wsize")) {
++				if (v < 1u) v = 1u;
++				if (v > 8u) v = 8u;
++				sess->wsize = v;
++				(void)s5b_fmt_u32_dec(v, opts[k].val, sizeof(opts[k].val));
++			} else if (s5b_str_eq_ci(opts[k].key, "seek")) {
++				sess->seek = v;
++			} else if (s5b_str_eq_ci(opts[k].key, "rsize")) {
++				sess->has_rsize = true;
++				sess->rsize = v;
++			} else if (s5b_str_eq_ci(opts[k].key, "tsize")) {
++				(void)s5b_fmt_u32_dec(fsize, opts[k].val, sizeof(opts[k].val));
++			}
++		}
++
++		uint32_t avail = (sess->seek < fsize) ? (fsize - sess->seek) : 0u;
++		sess->clus     = fclus;
++		sess->fsize    = fsize;
++		sess->xfer_len = (sess->has_rsize && sess->rsize < avail) ? sess->rsize : avail;
++		sess->active   = true;
++
++		printf("WIFI PROBE: [5B.3] TFTP RRQ '%s' (fsize=%u seek=%u rsize=%u%s blk=%u win=%u)\n",
++		    fname, fsize, sess->seek, sess->rsize, sess->has_rsize ? "" : "*",
++		    sess->blksize, sess->wsize);
++
++		if (n_opts > 0u) {
++			uint8_t oack[256];
++			s5b_wr_be16(oack, TFTP_OP_OACK);
++			uint32_t oo = 2u;
++			for (unsigned k = 0u; k < n_opts; k++) {
++				unsigned kl = sweet_str_len(opts[k].key) + 1u;
++				unsigned vl = sweet_str_len(opts[k].val) + 1u;
++				if (oo + kl + vl <= sizeof(oack)) {
++					memcpy(oack + oo, opts[k].key, kl); oo += kl;
++					memcpy(oack + oo, opts[k].val, vl); oo += vl;
++				}
++			}
++			sess->oack_pending = true;
++			(void)s5b_ipcrtr_send(QRTR_TYPE_DATA, sess->local_port, src_node, src_port, oack, oo);
++		} else {
++			s5b_tftp_send_window(sess);
++		}
++		return;
++	}
++
++	if (local_port < QRTR_LOCAL_PORT_TFTP_SESS0 ||
++	    local_port >= QRTR_LOCAL_PORT_TFTP_SESS0 + TFTP_MAX_SESS) {
++		return;
++	}
++	struct tftp_session *sess = &s5b.tftp[local_port - QRTR_LOCAL_PORT_TFTP_SESS0];
++	if (!sess->active) {
++		return;
++	}
++
++	if (op == TFTP_OP_ACK && len >= 4u) {
++		uint16_t ack_blk = s5b_rd_be16(pkt + 2);
++		if (sess->is_wrq) {
++			return;
++		}
++		if (sess->oack_pending && ack_blk == 0u) {
++			sess->oack_pending = false;
++			if (sess->has_rsize && sess->rsize == 0u) {
++				sess->active = false;
++				return;
++			}
++			s5b_tftp_send_window(sess);
++			return;
++		}
++		if (ack_blk == sess->last_sent_block) {
++			sess->base_offset += sess->win_bytes_sent;
++			if (sess->eof_sent) {
++				sess->active = false;
++			} else {
++				s5b_tftp_send_window(sess);
++			}
++		} else if ((uint16_t)(ack_blk - sess->win_start_block) <
++		           (uint16_t)(sess->last_sent_block - sess->win_start_block)) {
++			uint16_t step = (uint16_t)(ack_blk - sess->win_start_block);
++			sess->base_offset += (uint32_t)step * sess->blksize;
++			sess->last_sent_block = ack_blk;
++			sess->eof_sent = false;
++			s5b_tftp_send_window(sess);
++		}
++	} else if (op == TFTP_OP_DATA && len >= 4u && sess->is_wrq) {
++		uint16_t blk = s5b_rd_be16(pkt + 2);
++		s5b_tftp_send_ack(sess->local_port, src_node, src_port, blk);
++		if (len - 4u < sess->blksize) {
++			sess->active = false;
++		}
++	} else if (op == TFTP_OP_ERROR) {
++		uint16_t ecode = (len >= 4u) ? s5b_rd_be16(pkt + 2) : 0u;
++		if (ecode != 0u && ecode != 8u) {
++			printf("WIFI PROBE: [5B.3] TFTP session[%u] ERR=%u\n",
++			    local_port - QRTR_LOCAL_PORT_TFTP_SESS0, ecode);
++		}
++		sess->active = false;
++	}
++}
++
++static void
++s5b_handle_wlfw_qmi(uint8_t msg_type, uint16_t txn, uint16_t msg_id,
++    const uint8_t *sdu, uint32_t sdu_len)
++{
++	if (msg_type == QMI_MSG_RESPONSE) {
++		if (sdu_len <= sizeof(s_5b_qmi_resp_buf)) {
++			memcpy(s_5b_qmi_resp_buf, sdu, sdu_len);
++			s5b.qmi_resp_txn = txn;
++			s5b.qmi_resp_msg = msg_id;
++			s5b.qmi_resp_len = sdu_len;
++			s5b.qmi_resp_ready = true;
++		}
++	} else if (msg_type == QMI_MSG_INDICATION) {
++		if (msg_id == WLFW_FW_READY_IND) {
++			s5b.wlfw_fw_ready = true;
++			printf("WIFI PROBE: [5B.4] *** WCN3990 WLAN FIRMWARE READY (QMI_WLFW_FW_READY_IND 0x0021)! ***\n");
++		} else if (msg_id == WLFW_MSA_READY_IND_ALT1 || msg_id == WLFW_MSA_READY_IND_ALT2) {
++			s5b.wlfw_msa_ready_ind = true;
++			printf("WIFI PROBE: [5B.4] WLFW MSA_READY_IND (0x%04x) received.\n", msg_id);
++		} else if (msg_id == WLFW_PIN_CONNECT_IND) {
++			uint16_t l0 = 0u, l1 = 0u, l2 = 0u;
++			const uint8_t *v0 = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &l0);
++			const uint8_t *v1 = s5b_qmi_find_tlv(sdu, sdu_len, 0x11u, &l1);
++			const uint8_t *v2 = s5b_qmi_find_tlv(sdu, sdu_len, 0x12u, &l2);
++			printf("WIFI PROBE: [5B.4] WLFW PIN_CONNECT_RESULT: pwr=0x%x phy_io=0x%x rf=0x%x\n",
++			    (v0 && l0 >= 4u) ? s5b_rd_le32(v0) : 0u,
++			    (v1 && l1 >= 4u) ? s5b_rd_le32(v1) : 0u,
++			    (v2 && l2 >= 4u) ? s5b_rd_le32(v2) : 0u);
++		} else {
++			printf("WIFI PROBE: [5B.4] WLFW IND msg_id=0x%04x len=%u\n", msg_id, sdu_len);
++		}
++	}
++}
++
++static void
++s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len)
++{
++	if (len < 32u) {
++		return;
++	}
++	uint32_t ver        = s5b_rd_le32(pkt + 0);
++	uint32_t type       = s5b_rd_le32(pkt + 4);
++	uint32_t src_node   = s5b_rd_le32(pkt + 8);
++	uint32_t src_port   = s5b_rd_le32(pkt + 12);
++	uint32_t confirm_rx = s5b_rd_le32(pkt + 16);
++	uint32_t size       = s5b_rd_le32(pkt + 20);
++	uint32_t dst_node   = s5b_rd_le32(pkt + 24);
++	uint32_t dst_port   = s5b_rd_le32(pkt + 28);
++
++	if (ver != QRTR_PROTO_VER_1 || size > len - 32u) {
++		return;
++	}
++	const uint8_t *body = pkt + 32u;
++
++	if (confirm_rx != 0u) {
++		s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_RESUME_TX, dst_node, dst_port, 0u, 0u);
++	}
++
++	if (dst_port == QRTR_PORT_CTRL || type != QRTR_TYPE_DATA) {
++		uint32_t cmd = (size >= 4u) ? s5b_rd_le32(body + 0) : type;
++		if (cmd == QRTR_TYPE_HELLO) {
++			if (!s5b.hello_recvd || s5b.mpss_node_id != src_node) {
++				printf("WIFI PROBE: [5B.3] IPCRTR HELLO from node=%u port=0x%x size=%u\n",
++				    src_node, src_port, size);
++			}
++			s5b.hello_recvd = true;
++			s5b.mpss_node_id = src_node;
++			if (!s5b.hello_sent) {
++				s5b.hello_sent = true;
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_HELLO, 0u, 0u, 0u, 0u);
++				s5b_advertise_apps_servers(src_node);
++			}
++		} else if (cmd == QRTR_TYPE_NEW_SERVER && size >= 20u) {
++			uint32_t svc  = s5b_rd_le32(body + 4);
++			uint32_t inst = s5b_rd_le32(body + 8);
++			uint32_t snode = s5b_rd_le32(body + 12);
++			uint32_t sport = s5b_rd_le32(body + 16);
++			printf("WIFI PROBE: [5B.3]   NEW_SERVER: svc=0x%04x ver=%u inst=%u node=%u port=%u\n",
++			    svc, inst & 0xffu, inst >> 8, snode, sport);
++			if (svc == QRTR_SVC_WLFW && !s5b.wlfw_up) {
++				s5b.wlfw_up   = true;
++				s5b.wlfw_node = snode;
++				s5b.wlfw_port = sport;
++			}
++		} else if (cmd == QRTR_TYPE_NEW_LOOKUP && size >= 12u) {
++			uint32_t svc  = s5b_rd_le32(body + 4);
++			uint32_t inst = s5b_rd_le32(body + 8);
++			if (svc == QRTR_SVC_TFTP) {
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,
++				    inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
++			} else if (svc == QRTR_SVC_SERVREG_LOC) {
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC,
++				    inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_SERVREG_1);
++			} else if (svc == QRTR_SVC_RMTFS) {
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_RMTFS,
++				    inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_RMTFS);
++			}
++		}
++		return;
++	}
++
++	if (dst_port == QRTR_LOCAL_PORT_TFTP ||
++	    (dst_port >= QRTR_LOCAL_PORT_TFTP_SESS0 && dst_port < QRTR_LOCAL_PORT_TFTP_SESS0 + TFTP_MAX_SESS)) {
++		s5b_handle_tftp_pkt(dst_port, src_node, src_port, body, size);
++		return;
++	}
++
++	if (size < 7u) {
++		return;
++	}
++	uint8_t  qtype = body[0];
++	uint16_t qtxn  = s5b_rd_le16(body + 1);
++	uint16_t qmsg  = s5b_rd_le16(body + 3);
++	uint16_t qlen  = s5b_rd_le16(body + 5);
++	if ((uint32_t)qlen > size - 7u) {
++		return;
++	}
++	const uint8_t *qsdu = body + 7u;
++
++	if (dst_port == QRTR_LOCAL_PORT_SERVREG_1 || dst_port == QRTR_LOCAL_PORT_SERVREG_0) {
++		if (qtype == QMI_MSG_REQUEST) {
++			s5b_handle_servreg_qmi(dst_port, src_node, src_port, qtxn, qmsg, qsdu, qlen);
++		}
++	} else if (dst_port == QRTR_LOCAL_PORT_RMTFS) {
++		if (qtype == QMI_MSG_REQUEST) {
++			s5b_handle_rmtfs_qmi(src_node, src_port, qtxn, qmsg, qsdu, qlen);
++		}
++	} else if (dst_port == QRTR_LOCAL_PORT_WLFW_CLNT) {
++		s5b_handle_wlfw_qmi(qtype, qtxn, qmsg, qsdu, qlen);
++	}
++}
++
++static bool
++s5b_wlfw_qmi_sync(uint16_t msg_id, const uint8_t *req_sdu, uint16_t req_len,
++    uint16_t *out_result, uint16_t *out_error)
++{
++	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (txn == 0u) {
++		txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	s5b.qmi_resp_ready = false;
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, msg_id, QRTR_LOCAL_PORT_WLFW_CLNT,
++	    s5b.wlfw_node, s5b.wlfw_port, req_sdu, req_len);
++
++	for (unsigned ms = 0u; ms < 5000u; ms++) {
++		s5b_pump_all();
++		if (s5b.qmi_resp_ready && s5b.qmi_resp_msg == msg_id && s5b.qmi_resp_txn == txn) {
++			uint16_t rlen = 0u;
++			const uint8_t *rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x02u, &rlen);
++			uint16_t res = (rv && rlen >= 4u) ? s5b_rd_le16(rv + 0) : 0xffffu;
++			uint16_t err = (rv && rlen >= 4u) ? s5b_rd_le16(rv + 2) : 0xffffu;
++			if (out_result) *out_result = res;
++			if (out_error)  *out_error  = err;
++			return (res == 0u);
++		}
++		delay(1000);
++	}
++	if (out_result) *out_result = 0xfffeu;
++	if (out_error)  *out_error  = 0xfffeu;
++	printf("WIFI PROBE: [5B.4] ERROR: WLFW QMI 0x%04x timeout\n", msg_id);
++	return false;
++}
++
++static void
++s5b_anoc2_smmu_bypass(void)
++{
++	vm_offset_t smmu = ml_io_map(POPLAR_SMMU_ANOC2_PA, POPLAR_SMMU_ANOC2_SIZE);
++	if (!smmu) {
++		printf("WIFI PROBE: [5B.1] ERROR: failed to map ANOC2 SMMU\n");
++		return;
++	}
++	uint32_t idr0 = probe_rd32(smmu, ARM_SMMU_GR0_IDR0);
++	uint32_t num_smr = idr0 & SMMU_IDR0_NUMSMRG_MASK;
++	if (num_smr > 64u) {
++		num_smr = 64u;
++	}
++
++	uint32_t sids[2] = { WLAN_STREAM_ID_PRIMARY, WLAN_STREAM_ID_SECONDARY };
++	const char *names[2] = { "CE", "MSA" };
++	bool changed = false;
++
++	for (unsigned t = 0u; t < 2u; t++) {
++		bool found = false;
++		int free_slot = -1;
++		for (uint32_t i = 0u; i < num_smr; i++) {
++			uint32_t smr = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + i * 4u);
++			if ((smr & SMMU_SMR_VALID) != 0u) {
++				uint32_t id = smr & SMMU_SMR_ID_MASK;
++				uint32_t mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
++				if (((sids[t] ^ id) & ~mask) == 0u) {
++					found = true;
++					uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
++					printf("WIFI PROBE: [5B.1] ANOC2 %s SID=0x%04x already in SMR[%02u] S2CR=0x%08x\n",
++					    names[t], sids[t], i, s2cr);
++					break;
++				}
++			} else if (free_slot < 0) {
++				free_slot = (int)i;
++			}
++		}
++		if (!found && free_slot >= 0) {
++			uint32_t s = (uint32_t)free_slot;
++			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u, (2u << 16) | 0xffu);
++			probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE  + s * 4u, SMMU_SMR_VALID | sids[t]);
++			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u, (1u << 16));
++			uint32_t s2 = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u);
++			printf("WIFI PROBE: [5B.1] Programmed ANOC2 %s SID=0x%04x -> SMR[%02u] BYPASS S2CR=0x%08x\n",
++			    names[t], sids[t], s, s2);
++			changed = true;
++		}
++	}
++	if (changed) {
++		probe_wr32(smmu, ARM_SMMU_GR0_sTLBIALL, 0u);
++		probe_wr32(smmu, ARM_SMMU_GR0_sTLBGSYNC, 0u);
++		for (unsigned i = 0u; i < 200u; i++) {
++			if ((probe_rd32(smmu, ARM_SMMU_GR0_sTLBGSTATUS) & 1u) == 0u) {
++				break;
++			}
++			delay(5);
++		}
++	}
++	uint32_t gfsr = probe_rd32(smmu, ARM_SMMU_GR0_sGFSR);
++	printf("WIFI PROBE: [5B.1] ANOC2 post-config sGFSR=0x%08x\n", gfsr);
++}
++
++static bool
++s5b_setup_smem_glink(void)
++{
++	s5b.hwlock_va = ml_io_map(POPLAR_SMEM_HWLOCK_PA, 0x1000u);
++	s5b.ipc_va    = ml_io_map(POPLAR_APCS_IPC_PAGE_PA, 0x1000u);
++	s5b.unc_va    = ml_io_map(s_smem_p07_pa, 0x4000u);
++	if (!s5b.hwlock_va || !s5b.ipc_va || !s5b.unc_va) {
++		printf("WIFI PROBE: [5B.2] ERROR: SMEM/IPC map failed\n");
++		return false;
++	}
++
++	uint32_t free_unc = probe_rd32(s5b.unc_va, 0x0cu);
++	uint32_t free_cac = probe_rd32(s5b.unc_va, 0x10u);
++	uint32_t want_win = (free_cac <= s_smem_p07_sz && s_smem_p07_sz - free_cac + 0x5000u > 0xb000u) ?
++	    (s_smem_p07_sz - free_cac + 0x5000u) : 0xb000u;
++	if (want_win > s_smem_p07_sz - 0x4000u) {
++		want_win = s_smem_p07_sz - 0x4000u;
++	}
++	uint32_t cac_pa = (s_smem_p07_pa + s_smem_p07_sz - want_win) & ~0xfffu;
++	s5b.cac_win_off = cac_pa - s_smem_p07_pa;
++	s5b.cac_win_sz  = s_smem_p07_sz - s5b.cac_win_off;
++	s5b.cac_va      = ml_io_map(cac_pa, s5b.cac_win_sz);
++	if (!s5b.cac_va) {
++		printf("WIFI PROBE: [5B.2] ERROR: SMEM cached window map failed\n");
++		return false;
++	}
++
++	/* Walk uncached heap (upward from +0x20) to locate id=428, id=435, id=478 */
++	uint32_t smp_in_off = 0u, smp_out_off = 0u, descs_off = 0u;
++	uint32_t off = 0x20u;
++	while (off + 16u <= free_unc && off < 0x3800u) {
++		uint32_t w0 = probe_rd32(s5b.unc_va, off);
++		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++		uint16_t id   = (uint16_t)(w0 >> 16);
++		uint32_t sz   = probe_rd32(s5b.unc_va, off + 4u);
++		uint32_t w2   = probe_rd32(s5b.unc_va, off + 8u);
++		uint16_t pdat = (uint16_t)w2;
++		uint16_t phdr = (uint16_t)(w2 >> 16);
++		uint32_t poff = off + 16u + (uint32_t)phdr;
++		if (id == SMEM_SMP2P_IN_MODEM_ID)  smp_in_off  = poff;
++		if (id == SMEM_SMP2P_OUT_MODEM_ID) smp_out_off = poff;
++		if (id == SMEM_GLINK_XPRT_DESC_ID) descs_off   = poff;
++		uint32_t step = (16u + (uint32_t)phdr + sz + (uint32_t)pdat + 7u) & ~7u;
++		if (step == 0u || off + step <= off) {
++			break;
++		}
++		off += step;
++	}
++
++	uint32_t in_vf = 1u, in_fl = 0u;
++	if (smp_in_off != 0u) {
++		in_vf = probe_rd32(s5b.unc_va, smp_in_off + 4u);
++		in_fl = probe_rd32(s5b.unc_va, smp_in_off + 16u);
++		printf("WIFI PROBE: [5B.2] SMP2P-in(435) ver_feat=0x%08x flags=0x%08x valid_ent=%u\n",
++		    in_vf, in_fl, probe_rd32(s5b.unc_va, smp_in_off + 12u) >> 16);
++	}
++
++	/* Allocate APPS->Modem SMP2P outbound item (id=428, 344 B) if absent */
++	if (smp_out_off == 0u && s5b_smem_lock()) {
++		free_unc = probe_rd32(s5b.unc_va, 0x0cu);
++		free_cac = probe_rd32(s5b.unc_va, 0x10u);
++		if (free_unc + 16u + 344u + 0x100u < free_cac && free_unc + 16u + 344u < 0x3f00u) {
++			uint32_t e = free_unc;
++			probe_wr32(s5b.unc_va, e + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | (SMEM_SMP2P_OUT_MODEM_ID << 16));
++			probe_wr32(s5b.unc_va, e + 4u,  344u);
++			probe_wr32(s5b.unc_va, e + 8u,  0u);
++			probe_wr32(s5b.unc_va, e + 12u, 0u);
++			uint32_t p = e + 16u;
++			for (uint32_t k = 0u; k < 344u; k += 4u) {
++				probe_wr32(s5b.unc_va, p + k, 0u);
++			}
++			probe_wr32(s5b.unc_va, p + 0u,  0x504d5324u); /* "$SMP" */
++			probe_wr32(s5b.unc_va, p + 4u,  1u | (in_vf & 0x0100u));
++			probe_wr32(s5b.unc_va, p + 8u,  (1u << 16) | 0u); /* local=0, remote=1 */
++			probe_wr32(s5b.unc_va, p + 12u, (2u << 16) | 16u);
++			probe_wr32(s5b.unc_va, p + 16u, in_fl & 1u);
++			s5b_unc_wr_ascii4(p + 20u, "master-kernel", 16u);
++			s5b_unc_wr_ascii4(p + 40u, "smp2p", 16u);
++			__asm__ volatile("dsb sy" ::: "memory");
++			probe_wr32(s5b.unc_va, 0x0cu, e + 16u + 344u);
++			smp_out_off = p;
++			printf("WIFI PROBE: [5B.2] Allocated SMP2P-out(428) @ +0x%04x\n", smp_out_off);
++		}
++		s5b_smem_unlock();
++		probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_SMP2P_MASK);
++	}
++
++	if (descs_off == 0u) {
++		printf("WIFI PROBE: [5B.2] ERROR: GLINK_XPRT_DESC(478) not found\n");
++		return false;
++	}
++	s5b.descs_off = descs_off;
++
++	/* Walk cached heap downward from top of p[07] to find FIFO_0 (479) and FIFO_1 (480) */
++	uint32_t cl = (s_smem_p07_cacheline >= 16u) ? s_smem_p07_cacheline : 32u;
++	uint32_t hdr_stride = (16u + cl - 1u) & ~(cl - 1u);
++	uint32_t fifo0_off = 0u, fifo0_len = 0u, fifo1_off = 0u, fifo1_len = 0u;
++	free_cac = probe_rd32(s5b.unc_va, 0x10u);
++
++	uint32_t ce = s_smem_p07_sz - hdr_stride;
++	while (ce > free_cac && ce >= s5b.cac_win_off) {
++		uint32_t w0 = s5b_cac_rd32(ce + 0u);
++		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++		uint16_t cid  = (uint16_t)(w0 >> 16);
++		uint32_t csz  = s5b_cac_rd32(ce + 4u);
++		uint16_t cpad = (uint16_t)s5b_cac_rd32(ce + 8u);
++		uint32_t ulen = (cpad < csz) ? (csz - cpad) : csz;
++		uint32_t doff = ce - csz;
++		printf("WIFI PROBE: [5B.2]   cached item @ +0x%05x: id=%u sz=0x%x (usable=0x%x)\n",
++		    doff, cid, csz, ulen);
++		if (cid == SMEM_GLINK_FIFO_0_ID) { fifo0_off = doff; fifo0_len = ulen; }
++		if (cid == SMEM_GLINK_FIFO_1_ID) { fifo1_off = doff; fifo1_len = ulen; }
++		if (doff < hdr_stride) {
++			break;
++		}
++		ce = doff - hdr_stride;
++	}
++
++	if (fifo0_off == 0u) {
++		printf("WIFI PROBE: [5B.2] ERROR: GLINK FIFO_0(479) not found\n");
++		return false;
++	}
++
++	if (fifo1_off == 0u && s5b_smem_lock()) {
++		free_unc = probe_rd32(s5b.unc_va, 0x0cu);
++		free_cac = probe_rd32(s5b.unc_va, 0x10u);
++		uint32_t new_hdr  = free_cac - hdr_stride;
++		uint32_t new_data = new_hdr - SMEM_GLINK_FIFO_SIZE;
++		if (new_hdr >= s5b.cac_win_off + SMEM_GLINK_FIFO_SIZE &&
++		    new_data >= s5b.cac_win_off &&
++		    new_data > free_unc + 0x1000u) {
++			for (uint32_t k = 0u; k < SMEM_GLINK_FIFO_SIZE; k += 4u) {
++				s5b_cac_wr32(new_data + k, 0u);
++			}
++			uint32_t pad_hdr = hdr_stride - 16u;
++			s5b_cac_wr32(new_hdr + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | (SMEM_GLINK_FIFO_1_ID << 16));
++			s5b_cac_wr32(new_hdr + 4u,  SMEM_GLINK_FIFO_SIZE);
++			s5b_cac_wr32(new_hdr + 8u,  (pad_hdr << 16));
++			s5b_cac_wr32(new_hdr + 12u, 0u);
++			__asm__ volatile("dsb sy" ::: "memory");
++			probe_wr32(s5b.unc_va, 0x10u, new_data);
++			fifo1_off = new_data;
++			fifo1_len = SMEM_GLINK_FIFO_SIZE;
++			printf("WIFI PROBE: [5B.2] Allocated GLINK FIFO_1(480) @ +0x%05x (16 KiB cached)\n",
++			    fifo1_off);
++		}
++		s5b_smem_unlock();
++	}
++
++	if (fifo1_off == 0u) {
++		printf("WIFI PROBE: [5B.2] ERROR: unable to allocate GLINK FIFO_1(480)\n");
++		return false;
++	}
++
++	/* Auto-detect FIFO / descriptor direction after ringing APCS GLINK doorbell */
++	s5b_glink_kick();
++	for (unsigned ms = 0u; ms < 50u; ms++) {
++		uint32_t d1 = probe_rd32(s5b.unc_va, descs_off + 4u);
++		uint32_t d3 = probe_rd32(s5b.unc_va, descs_off + 12u);
++		if (d1 != 0u || d3 != 0u) {
++			break;
++		}
++		delay(1000);
++	}
++
++	uint32_t d0 = probe_rd32(s5b.unc_va, descs_off + 0u);
++	uint32_t d1 = probe_rd32(s5b.unc_va, descs_off + 4u);
++	uint32_t d2 = probe_rd32(s5b.unc_va, descs_off + 8u);
++	uint32_t d3 = probe_rd32(s5b.unc_va, descs_off + 12u);
++	printf("WIFI PROBE: [5B.2] Post-doorbell desc[0..3] = {%u, %u, %u, %u} f0=%08x f1=%08x\n",
++	    d0, d1, d2, d3, s5b_cac_rd32(fifo0_off), s5b_cac_rd32(fifo1_off));
++
++	if (d3 != 0u && d1 == 0u && s5b_cac_rd32(fifo1_off) != 0u) {
++		s5b.rx_tail_idx = 2u; s5b.rx_head_idx = 3u;
++		s5b.rx_fifo_off = fifo1_off; s5b.rx_fifo_len = fifo1_len;
++		s5b.tx_tail_idx = 0u; s5b.tx_head_idx = 1u;
++		s5b.tx_fifo_off = fifo0_off; s5b.tx_fifo_len = fifo0_len;
++	} else {
++		s5b.rx_tail_idx = 0u; s5b.rx_head_idx = 1u;
++		s5b.rx_fifo_off = fifo0_off; s5b.rx_fifo_len = fifo0_len;
++		s5b.tx_tail_idx = 2u; s5b.tx_head_idx = 3u;
++		s5b.tx_fifo_off = fifo1_off; s5b.tx_fifo_len = fifo1_len;
++	}
++	s5b.bound = true;
++	s5b.next_liid = 1u;
++
++	if (s5b_fifo_avail_rx() == 0u) {
++		(void)s5b_glink_send_cmd(GLINK_CMD_VERSION, 1u, 1u);
++		for (unsigned ms = 0u; ms < 120u; ms++) {
++			s5b_pump_all();
++			if (s5b.link_up) {
++				break;
++			}
++			delay(1000);
++		}
++		if (!s5b.link_up &&
++		    probe_rd32(s5b.unc_va, descs_off + 0u) == 0u &&
++		    probe_rd32(s5b.unc_va, descs_off + 4u) == 0u &&
++		    probe_rd32(s5b.unc_va, descs_off + 8u) == 0u) {
++			/* Fallback: swap FIFO direction if MPSS bound FIFO_0 as Host0 TX */
++			probe_wr32(s5b.unc_va, descs_off + 12u, 0u);
++			for (uint32_t k = 0u; k < 16u; k += 4u) {
++				s5b_cac_wr32(fifo1_off + k, 0u);
++			}
++			s5b.rx_tail_idx = 2u; s5b.rx_head_idx = 3u;
++			s5b.rx_fifo_off = fifo1_off; s5b.rx_fifo_len = fifo1_len;
++			s5b.tx_tail_idx = 0u; s5b.tx_head_idx = 1u;
++			s5b.tx_fifo_off = fifo0_off; s5b.tx_fifo_len = fifo0_len;
++			(void)s5b_glink_send_cmd(GLINK_CMD_VERSION, 1u, 1u);
++		}
++	}
++
++	for (unsigned ms = 0u; ms < 1000u; ms++) {
++		s5b_pump_all();
++		if (s5b.ipcrtr_open_acked && s5b.ipcrtr_rem_open) {
++			break;
++		}
++		delay(1000);
++	}
++
++	printf("WIFI PROBE: [5B.2] GLINK link=%d rem_open=%d open_acked=%d rx_fifo=0x%x tx_fifo=0x%x reuse=%d\n",
++	    s5b.link_up ? 1 : 0, s5b.ipcrtr_rem_open ? 1 : 0,
++	    s5b.ipcrtr_open_acked ? 1 : 0, s5b.rx_fifo_off, s5b.tx_fifo_off,
++	    s5b.glink_reuse ? 1 : 0);
++
++	return (s5b.ipcrtr_open_acked && s5b.ipcrtr_rem_open);
++}
++
++static bool
++s5b_wlfw_download_bdf(uint32_t board_id)
++{
++	char bdf_name[24];
++	const char *hex = "0123456789abcdef";
++	uint32_t bclus = 0u, bsize = 0u;
++	bool found = false;
++
++	if (board_id >= 0x100u && board_id <= 0xfffu) {
++		memcpy(bdf_name, "bdwlan.", 7);
++		bdf_name[7]  = hex[(board_id >> 8) & 0xfu];
++		bdf_name[8]  = hex[(board_id >> 4) & 0xfu];
++		bdf_name[9]  = hex[board_id & 0xfu];
++		bdf_name[10] = '\0';
++		found = sweet_modem_fat16_lookup_filename(bdf_name, &bclus, &bsize);
++	} else if (board_id > 0u && board_id < 0xffu) {
++		memcpy(bdf_name, "bdwlan.b", 8);
++		bdf_name[8]  = hex[(board_id >> 4) & 0xfu];
++		bdf_name[9]  = hex[board_id & 0xfu];
++		bdf_name[10] = '\0';
++		found = sweet_modem_fat16_lookup_filename(bdf_name, &bclus, &bsize);
++	}
++	if (!found) {
++		memcpy(bdf_name, "bdwlan.bin", 11);
++		found = sweet_modem_fat16_lookup_filename(bdf_name, &bclus, &bsize);
++	}
++	if (!found || bsize == 0u || bsize > sizeof(s_5b_bdf_buf)) {
++		printf("WIFI PROBE: [5B.4] ERROR: BDF '%s' missing or oversized (%u B)\n", bdf_name, bsize);
++		return false;
++	}
++	if (sweet_modem_fat16_read_slice(bclus, bsize, 0u, bsize, s_5b_bdf_buf) != 0) {
++		printf("WIFI PROBE: [5B.4] ERROR: failed reading BDF '%s'\n", bdf_name);
++		return false;
++	}
++
++	printf("WIFI PROBE: [5B.4] Streaming BDF '%s' (%u B) via QMI_WLFW_BDF_DOWNLOAD_REQ...\n",
++	    bdf_name, bsize);
++
++	uint32_t seg_id = 0u;
++	uint32_t off = 0u;
++	while (off < bsize) {
++		uint32_t chunk = bsize - off;
++		if (chunk > 1024u) {
++			chunk = 1024u;
++		}
++		bool is_end = (off + chunk >= bsize);
++		uint8_t sdu[1120];
++		uint32_t sl = 0u;
++		uint8_t one = 1u, end_b = is_end ? 1u : 0u;
++		uint8_t u32v[4];
++
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x01u, 1u, &one);
++		s5b_wr_le32(u32v, 0u);     sl = s5b_qmi_put_tlv(sdu, sl, 0x10u, 4u, u32v);
++		s5b_wr_le32(u32v, bsize);  sl = s5b_qmi_put_tlv(sdu, sl, 0x11u, 4u, u32v);
++		s5b_wr_le32(u32v, seg_id); sl = s5b_qmi_put_tlv(sdu, sl, 0x12u, 4u, u32v);
++		/* Variable byte array TLV 0x13: u16 count + chunk bytes */
++		sdu[sl + 0] = 0x13u;
++		s5b_wr_le16(sdu + sl + 1, (uint16_t)(2u + chunk));
++		s5b_wr_le16(sdu + sl + 3, (uint16_t)chunk);
++		memcpy(sdu + sl + 5, s_5b_bdf_buf + off, chunk);
++		sl += 5u + chunk;
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x14u, 1u, &end_b);
++
++		uint16_t res = 0u, err = 0u;
++		if (!s5b_wlfw_qmi_sync(WLFW_BDF_DOWNLOAD_REQ, sdu, (uint16_t)sl, &res, &err)) {
++			printf("WIFI PROBE: [5B.4] ERROR: BDF seg=%u rejected res=%u err=%u\n", seg_id, res, err);
++			return false;
++		}
++		off += chunk;
++		seg_id++;
++	}
++	printf("WIFI PROBE: [5B.4] BDF '%s' uploaded in %u segments OK.\n", bdf_name, seg_id);
++	return true;
++}
++
++static void
++probe_stage5b_wlfw_bringup(void)
++{
++	int wlan_stage5b_wlfw = 0;
++	(void)PE_parse_boot_argn("wlan_stage5b_wlfw", &wlan_stage5b_wlfw, sizeof(wlan_stage5b_wlfw));
++
++	printf("WIFI PROBE: [5B] === STAGE 5B: SMMU, RAILS, GLINK/IPCRTR, PD/TFTP/RMTFS & WLFW QMI ===\n");
++
++	if (wlan_stage5b_wlfw <= 0) {
++		printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=0 (dormant default).\n");
++		printf("WIFI PROBE: [5B] Stage 5B skipped. To activate, set wlan_stage5b_wlfw=1.\n\n");
++		return;
++	}
++
++	if (!s_mpss_boot_ok || !s_fat16_valid || !s_fw_wlanmdsp.found ||
++	    s_smem_p07_pa == 0u || s_smem_p07_sz == 0u || s_mba_va == 0u) {
++		printf("WIFI PROBE: [5B] ABORT: Preconditions unmet (mpss=%d fat16=%d wlanmdsp=%d p07=0x%x).\n\n",
++		    s_mpss_boot_ok ? 1 : 0, s_fat16_valid ? 1 : 0,
++		    s_fw_wlanmdsp.found ? 1 : 0, s_smem_p07_pa);
++		return;
++	}
++
++	memset(&s5b, 0, sizeof(s5b));
++	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u).\n",
++	    s_fw_wlanmdsp.size, s_img_dir_cnt);
++
++	/* 5B.1: ANOC2 SMMU S1-Bypass + PM8998 WLAN Rails + clk_rf_clk2_pin + RMTFS/MSA prep */
++	s5b_anoc2_smmu_bypass();
++
++	bool ok_l5  = poplar_rpm_ldoa(5, 800000u);
++	bool ok_l7  = poplar_rpm_ldoa(7, 1800000u);
++	bool ok_l17 = poplar_rpm_ldoa(17, 1304000u);
++	bool ok_l25 = poplar_rpm_ldoa(25, 3312000u);
++	bool ok_clk = poplar_rpm_clka(5, 1u);
++	delay(5000);
++	printf("WIFI PROBE: [5B.1] PM8998 WLAN Rails: L5=%d L7=%d L17=%d L25=%d RF_CLK2=%d\n",
++	    ok_l5 ? 1 : 0, ok_l7 ? 1 : 0, ok_l17 ? 1 : 0, ok_l25 ? 1 : 0, ok_clk ? 1 : 0);
++
++	vm_offset_t rmt_va = ml_io_map_unmappable(POPLAR_RMTFS_CARVEOUT_PA,
++	    POPLAR_RMTFS_CARVEOUT_SIZE, SWEET_VM_WIMG_WCOMB);
++	if (rmt_va) {
++		sweet_io_zero((void *)rmt_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
++		sweet_dcache_clean_poc(rmt_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
++		ml_io_unmap(rmt_va, POPLAR_RMTFS_CARVEOUT_SIZE);
++		uint32_t rsrc[1] = { QCOM_SCM_VMID_HLOS };
++		uint32_t rdst[2] = { QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA };
++		uint32_t rprm[2] = { QCOM_SCM_PERM_RW,  QCOM_SCM_PERM_RW };
++		(void)sweet_scm_assign_mem_multi(POPLAR_RMTFS_CARVEOUT_PA,
++		    POPLAR_RMTFS_CARVEOUT_SIZE, rsrc, 1u, rdst, rprm, 2u);
++	}
++	sweet_io_zero((void *)s_mba_va, (size_t)PIL_MBA_DP_SIZE);
++	sweet_dcache_clean_poc(s_mba_va, (size_t)PIL_MBA_DP_SIZE);
++
++	/* 5B.2 & 5B.3: SMEM GLINK 'mpss' + IPCRTR + PD-Mapper/RMTFS/TFTP servers */
++	if (!s5b_setup_smem_glink()) {
++		printf("WIFI PROBE: [5B] ABORT: SMEM GLINK setup failed.\n\n");
++		return;
++	}
++
++	/* Pump IPCRTR up to 8 seconds for PD/TFTP/RMTFS traffic & WLFW (0x45) server arrival */
++	printf("WIFI PROBE: [5B.3] Pumping IPCRTR up to 8000 ms for MPSS services & wlan_pd...\n");
++	for (unsigned ms = 0u; ms < 8000u; ms++) {
++		s5b_pump_all();
++		if (s5b.wlfw_up) {
++			break;
++		}
++		delay(1000);
++	}
++
++	if (!s5b.wlfw_up) {
++		printf("WIFI PROBE: [5B.4] NOTICE: WLFW (0x45) did not arrive within 8000 ms (hello_recvd=%d).\n\n",
++		    s5b.hello_recvd ? 1 : 0);
++		return;
++	}
++
++	printf("WIFI PROBE: [5B.4] *** WLFW QMI (0x45) CONNECTED @ node=%u port=%u ***\n",
++	    s5b.wlfw_node, s5b.wlfw_port);
++
++	/* 5B.4 Step 1: WLFW_IND_REGISTER_REQ (0x0020) */
++	{
++		uint8_t sdu[48], one = 1u, cid[4];
++		uint32_t sl = 0u;
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x10u, 1u, &one);
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x13u, 1u, &one);
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x14u, 1u, &one);
++		s5b_wr_le32(cid, WLFW_CLIENT_ID_KNEL);
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x15u, 4u, cid);
++		uint16_t res = 0u, err = 0u;
++		bool ok = s5b_wlfw_qmi_sync(WLFW_IND_REGISTER_REQ, sdu, (uint16_t)sl, &res, &err);
++		printf("WIFI PROBE: [5B.4] 1. IND_REGISTER (0x0020): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		if (!ok) return;
++	}
++
++	/* 5B.4 Step 2: WLFW_MSA_INFO_REQ (0x002d) & Multi-VMID wlan_msa MP_ASSIGN */
++	{
++		uint8_t sdu[32], pa8[8], sz4[4];
++		uint32_t sl = 0u;
++		s5b_wr_le64(pa8, PIL_MBA_PHYS_BASE);
++		s5b_wr_le32(sz4, (uint32_t)PIL_MBA_DP_SIZE);
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x01u, 8u, pa8);
++		sl = s5b_qmi_put_tlv(sdu, sl, 0x02u, 4u, sz4);
++		uint16_t res = 0u, err = 0u;
++		bool ok = s5b_wlfw_qmi_sync(WLFW_MSA_INFO_REQ, sdu, (uint16_t)sl, &res, &err);
++		printf("WIFI PROBE: [5B.4] 2. MSA_INFO (0x002d): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		if (!ok) return;
++
++		uint16_t rlen = 0u;
++		const uint8_t *rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x10u, &rlen);
++		if (!rv) {
++			rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x03u, &rlen);
++		}
++		if (rv && rlen >= 1u) {
++			uint8_t nr = rv[0];
++			if (nr > 2u) nr = 2u;
++			for (uint8_t i = 0u; i < nr && (uint32_t)(1u + (i + 1u) * 13u) <= rlen; i++) {
++				const uint8_t *re = rv + 1u + (uint32_t)i * 13u;
++				uint64_t raddr = s5b_rd_le64(re + 0);
++				uint32_t rsize = s5b_rd_le32(re + 8);
++				uint8_t  rsec  = re[12];
++				printf("WIFI PROBE: [5B.4]    MSA region[%u]: addr=0x%llx size=0x%x secure=%u\n",
++				    i, (unsigned long long)raddr, rsize, rsec);
++				uint32_t asize = (rsize + 0xfffu) & ~0xfffu;
++				if (raddr >= PIL_MBA_PHYS_BASE &&
++				    raddr < PIL_MBA_PHYS_BASE + PIL_MBA_DP_SIZE &&
++				    rsize > 0u && asize > 0u &&
++				    (uint64_t)asize <= PIL_MBA_PHYS_BASE + PIL_MBA_DP_SIZE - raddr &&
++				    (raddr & 0xfffULL) == 0u) {
++					uint32_t src_v[1] = { QCOM_SCM_VMID_HLOS };
++					uint32_t dst_s[2] = { QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_WLAN };
++					uint32_t prm_s[2] = { QCOM_SCM_PERM_RW, QCOM_SCM_PERM_RW };
++					uint32_t dst_u[3] = { QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_WLAN, QCOM_SCM_VMID_WLAN_CE };
++					uint32_t prm_u[3] = { QCOM_SCM_PERM_RW, QCOM_SCM_PERM_RW, QCOM_SCM_PERM_RW };
++					(void)sweet_scm_assign_mem_multi(raddr, asize, src_v, 1u,
++					    rsec ? dst_s : dst_u, rsec ? prm_s : prm_u, rsec ? 2u : 3u);
++				}
++			}
++		}
++	}
++
++	/* 5B.4 Step 3: WLFW_MSA_READY_REQ (0x002e) */
++	{
++		uint16_t res = 0u, err = 0u;
++		bool ok = s5b_wlfw_qmi_sync(WLFW_MSA_READY_REQ, NULL, 0u, &res, &err);
++		printf("WIFI PROBE: [5B.4] 3. MSA_READY (0x002e): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		if (!ok) return;
++		for (unsigned ms = 0u; ms < 200u && !s5b.wlfw_msa_ready_ind; ms++) {
++			s5b_pump_all();
++			delay(1000);
++		}
++	}
++
++	/* 5B.4 Step 4: WLFW_CAP_REQ (0x0024) */
++	uint32_t board_id = 0xffu;
++	{
++		uint16_t res = 0u, err = 0u;
++		bool ok = s5b_wlfw_qmi_sync(WLFW_CAP_REQ, NULL, 0u, &res, &err);
++		printf("WIFI PROBE: [5B.4] 4. CAP_REQ (0x0024): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		if (!ok) return;
++
++		uint16_t l10 = 0u, l11 = 0u, l12 = 0u, l13 = 0u, l14 = 0u;
++		const uint8_t *v10 = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x10u, &l10);
++		const uint8_t *v11 = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x11u, &l11);
++		const uint8_t *v12 = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x12u, &l12);
++		const uint8_t *v13 = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x13u, &l13);
++		const uint8_t *v14 = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x14u, &l14);
++		uint32_t chip_id = (v10 && l10 >= 4u) ? s5b_rd_le32(v10) : 0u;
++		uint32_t chip_fm = (v10 && l10 >= 8u) ? s5b_rd_le32(v10 + 4) : 0u;
++		if (v11 && l11 >= 4u) board_id = s5b_rd_le32(v11);
++		uint32_t soc_id  = (v12 && l12 >= 4u) ? s5b_rd_le32(v12) : 0u;
++		uint32_t fw_ver  = (v13 && l13 >= 4u) ? s5b_rd_le32(v13) : 0u;
++		char build_id[64];
++		memset(build_id, 0, sizeof(build_id));
++		if (v14 && l14 > 0u) {
++			uint32_t cn = (l14 < sizeof(build_id) - 1u) ? l14 : (uint32_t)(sizeof(build_id) - 1u);
++			memcpy(build_id, v14, cn);
++		}
++		printf("WIFI PROBE: [5B.4]    CAP: chip=0x%x fam=0x%x board_id=0x%x soc=0x%x fw_ver=0x%x build='%s'\n",
++		    chip_id, chip_fm, board_id, soc_id, fw_ver, build_id);
++	}
++
++	/* 5B.4 Step 5: Brief wait for autonomous FW_READY_IND or send BDF_DOWNLOAD + CAL_REPORT */
++	for (unsigned ms = 0u; ms < 100u && !s5b.wlfw_fw_ready; ms++) {
++		s5b_pump_all();
++		delay(1000);
++	}
++	if (!s5b.wlfw_fw_ready) {
++		if (s5b_wlfw_download_bdf(board_id)) {
++			uint8_t cal_sdu[8];
++			uint8_t meta_cnt = 0u;
++			uint32_t csl = s5b_qmi_put_tlv(cal_sdu, 0u, 0x01u, 1u, &meta_cnt);
++			uint16_t res = 0u, err = 0u;
++			bool ok = s5b_wlfw_qmi_sync(WLFW_CAL_REPORT_REQ, cal_sdu, (uint16_t)csl, &res, &err);
++			printf("WIFI PROBE: [5B.4] 5. CAL_REPORT (0x0026): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		}
++	}
++
++	/* 5B.4 Step 6: Wait up to 5000 ms for QMI_WLFW_FW_READY_IND_V01 (0x0021) */
++	for (unsigned ms = 0u; ms < 5000u && !s5b.wlfw_fw_ready; ms++) {
++		s5b_pump_all();
++		delay(1000);
++	}
++
++	printf("WIFI PROBE: [5B] Stage 5B complete (wlfw_fw_ready=%d).\n\n", s5b.wlfw_fw_ready ? 1 : 0);
 +}
 +
 +void
@@ -3324,6 +5793,7 @@ new file mode 100644
 +	probe_stage4_4_passive_audit();
 +	probe_stage4_5_active_mba_load();
 +	probe_stage5a_mpss_boot();
++	probe_stage5b_wlfw_bringup();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

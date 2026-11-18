@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6054 @@
+@@ -0,0 +1,6255 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3795,6 +3795,10 @@ new file mode 100644
 +	bool        wlan_pd_registered;
 +	bool        wlan_pd_started;
 +	uint32_t    wlan_pd_state;
++	uint16_t    servreg_wlan_pd_txn;
++	uint16_t    servreg_root_pd_txn;
++	uint16_t    servreg_restart_txn;
++	bool        mpss_err_fatal_dumped;
 +	uint32_t    rmtfs_read_count;
 +	uint32_t    tftp_req_count;
 +
@@ -4152,6 +4156,134 @@ new file mode 100644
 +}
 +
 +static void
++s5b_dump_mpss_crash_reason(void)
++{
++	if (s5b.mpss_err_fatal_dumped) {
++		return;
++	}
++	s5b.mpss_err_fatal_dumped = true;
++
++	printf("WIFI PROBE: [5B.2] =======================================================\n");
++	printf("WIFI PROBE: [5B.2] *** MPSS ASSERTED ERR-FATAL (CRASH ANALYSIS) ***\n");
++	printf("WIFI PROBE: [5B.2] =======================================================\n");
++
++	if (s_rmb_va) {
++		probe_dump_rmb_regs("5B-CRASH", s_rmb_va);
++	}
++
++	if (s5b.part_va != 0u) {
++		uint32_t free_unc = s5b_part_rd32(0x0cu);
++		uint32_t free_cac = s5b_part_rd32(0x10u);
++		printf("WIFI PROBE: [5B.2] SMEM p[07] state: free_unc=0x%x free_cac=0x%x\n", free_unc, free_cac);
++
++		/* 1. Walk uncached items in p[07] */
++		uint32_t off = 0x20u;
++		uint32_t item_idx = 0u;
++		while (off + 16u <= free_unc && off <= s_smem_p07_sz - 16u && item_idx < 32u) {
++			uint32_t w0 = s5b_part_rd32(off);
++			if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++				break;
++			}
++			uint16_t it   = (uint16_t)(w0 >> 16);
++			uint32_t sz   = s5b_part_rd32(off + 4u);
++			uint32_t w2   = s5b_part_rd32(off + 8u);
++			uint16_t pdat = (uint16_t)w2;
++			uint16_t phdr = (uint16_t)(w2 >> 16);
++			if ((uint32_t)phdr > s_smem_p07_sz - (off + 16u) ||
++			    sz > s_smem_p07_sz - (off + 16u + (uint32_t)phdr)) {
++				break;
++			}
++			uint32_t poff = off + 16u + (uint32_t)phdr;
++			uint32_t usz  = (pdat < sz) ? (sz - pdat) : sz;
++
++			printf("WIFI PROBE: [5B.2]   p[07] uncached item[%u]: id=%u off=0x%x sz=%u (usable=%u)\n",
++			    item_idx, it, poff, sz, usz);
++
++			if (it == 421u || it == 134u || it == 133u || it == 424u || (it != 435u && it != 428u && it != 478u)) {
++				char cstr[128];
++				for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++				uint32_t max_c = (usz < sizeof(cstr) - 1u) ? usz : (uint32_t)(sizeof(cstr) - 1u);
++				for (uint32_t k = 0u; k < max_c; k++) {
++					uint32_t cw = s5b_part_rd32(poff + (k & ~3u));
++					char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++					cstr[k] = (ch >= 32 && ch <= 126) ? ch : '.';
++				}
++				cstr[max_c] = '\0';
++				printf("WIFI PROBE: [5B.2]     id=%u data: '%s'\n", it, cstr);
++			}
++
++			off = poff + sz;
++			item_idx++;
++		}
++
++		/* 2. Check crash items explicitly via s5b_smem_get_item (including cached region) */
++		static const uint16_t crash_items[] = { 421u, 134u, 133u, 424u };
++		for (unsigned ci = 0u; ci < sizeof(crash_items)/sizeof(crash_items[0]); ci++) {
++			uint32_t coff = 0u, csz = 0u;
++			if (s5b_smem_get_item(crash_items[ci], &coff, &csz)) {
++				char cstr[256];
++				for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++				uint32_t max_c = (csz < sizeof(cstr) - 1u) ? csz : (uint32_t)(sizeof(cstr) - 1u);
++				for (uint32_t k = 0u; k < max_c; k++) {
++					uint32_t cw = s5b_part_rd32(coff + (k & ~3u));
++					char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++					cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++					if (ch == '\0') break;
++				}
++				cstr[sizeof(cstr) - 1u] = '\0';
++				printf("WIFI PROBE: [5B.2] *** MPSS SMEM CRASH ITEM %u: '%s' ***\n",
++				    crash_items[ci], cstr);
++			}
++		}
++	}
++
++	/* 3. Check global SMEM partition p[11] @ POPLAR_SMEM_BASE_PA */
++	vm_offset_t p11_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
++	if (p11_va) {
++		uint32_t magic = probe_rd32(p11_va, 0u);
++		if (magic == 0x54525024u) { /* "$PRT" */
++			uint32_t p11_free_unc = probe_rd32(p11_va, 0x0cu);
++			printf("WIFI PROBE: [5B.2] SMEM p[11] (global partition) free_unc=0x%x:\n", p11_free_unc);
++			uint32_t off = 0x20u;
++			uint32_t item_idx = 0u;
++			while (off + 16u <= p11_free_unc && off <= 0x40000u - 16u && item_idx < 32u) {
++				uint32_t w0 = probe_rd32(p11_va, off);
++				if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++					break;
++				}
++				uint16_t it   = (uint16_t)(w0 >> 16);
++				uint32_t sz   = probe_rd32(p11_va, off + 4u);
++				uint32_t w2   = probe_rd32(p11_va, off + 8u);
++				uint16_t pdat = (uint16_t)w2;
++				uint16_t phdr = (uint16_t)(w2 >> 16);
++				uint32_t poff = off + 16u + (uint32_t)phdr;
++				uint32_t usz  = (pdat < sz) ? (sz - pdat) : sz;
++				if (it == 421u || it == 134u || it == 133u || it == 424u) {
++					char cstr[256];
++					for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++					uint32_t max_c = (usz < sizeof(cstr) - 1u) ? usz : (uint32_t)(sizeof(cstr) - 1u);
++					for (uint32_t k = 0u; k < max_c; k++) {
++						uint32_t cw = probe_rd32(p11_va, poff + (k & ~3u));
++						char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++						cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++						if (ch == '\0') break;
++					}
++					cstr[sizeof(cstr) - 1u] = '\0';
++					printf("WIFI PROBE: [5B.2] *** GLOBAL SMEM CRASH ITEM %u: '%s' ***\n",
++					    it, cstr);
++				}
++				off = poff + sz;
++				item_idx++;
++			}
++		} else {
++			printf("WIFI PROBE: [5B.2] SMEM base magic=0x%08x (legacy table mode)\n", magic);
++		}
++		ml_io_unmap(p11_va, 0x40000u);
++	}
++	printf("WIFI PROBE: [5B.2] =======================================================\n");
++}
++
++static void
 +s5b_smp2p_service(void)
 +{
 +	if (s5b.smp2p_in_off == 0u) {
@@ -4196,6 +4328,9 @@ new file mode 100644
 +				    (v & 2u) ? " ready" : "",
 +				    (v & 4u) ? " handover" : "",
 +				    (v & 8u) ? " stop-ack" : "");
++				if (v & 1u) {
++					s5b_dump_mpss_crash_reason();
++				}
 +			}
 +			break;
 +		}
@@ -4829,7 +4964,8 @@ new file mode 100644
 +		printf("WIFI PROBE: [5B.3] SERVREG PD FAILURE '%s': %s\n", s_svc, s_why);
 +		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
 +	} else {
-+		printf("WIFI PROBE: [5B.3] SERVREG_LOC unsupported msg=0x%04x\n", msg_id);
++		printf("WIFI PROBE: [5B.3] SERVREG_LOC unsupported msg=0x%04x txn=%u port=%u len=%u\n",
++		    msg_id, txn, local_port, sdu_len);
 +		roff = s5b_qmi_put_result(resp, roff, 1u, 0x47u);
 +	}
 +	s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
@@ -4894,6 +5030,7 @@ new file mode 100644
 +		uint16_t sl = 0u;
 +		const uint8_t *sv = s5b_qmi_find_tlv(sdu, sdu_len, 0x02u, &sl);
 +		uint32_t req_sz = (sv && sl >= 4u) ? s5b_rd_le32(sv) : 0u;
++		printf("WIFI PROBE: [5B.3] RMTFS ALLOC_BUFF req_sz=%u\n", req_sz);
 +		if (req_sz <= POPLAR_RMTFS_CARVEOUT_SIZE) {
 +			uint8_t addr_le[8];
 +			s5b_wr_le64(addr_le, POPLAR_RMTFS_CARVEOUT_PA);
@@ -4969,10 +5106,12 @@ new file mode 100644
 +		}
 +		roff = s5b_qmi_put_result(resp, roff, rw_err == 0 ? 0u : 1u, rw_err == 0 ? 0u : 3u);
 +	} else if (msg_id == 0x0005u) { /* GET_DEV_ERROR_REQ */
++		printf("WIFI PROBE: [5B.3] RMTFS GET_DEV_ERROR\n");
 +		uint8_t zero = 0u;
 +		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
 +		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 1u, &zero);
 +	} else {
++		printf("WIFI PROBE: [5B.3] RMTFS unsupported msg=0x%04x txn=%u len=%u\n", msg_id, txn, sdu_len);
 +		roff = s5b_qmi_put_result(resp, roff, 1u, 0x47u);
 +	}
 +
@@ -5314,7 +5453,7 @@ new file mode 100644
 +}
 +
 +static void
-+s5b_servreg_register_listener(uint32_t snode, uint32_t sport, const char *domain)
++s5b_servreg_register_listener(uint32_t snode, uint32_t sport, const char *domain, uint16_t *out_txn)
 +{
 +	uint8_t req[128];
 +	uint32_t roff = 0u;
@@ -5331,11 +5470,37 @@ new file mode 100644
 +	if (txn == 0u) {
 +		txn = (uint16_t)(++s5b.next_qmi_txn);
 +	}
++	if (out_txn) {
++		*out_txn = txn;
++	}
 +
 +	printf("WIFI PROBE: [5B.3] SERVREG register listener for '%s' (txn=%u -> node=%u port=%u)\n",
 +	    domain, txn, snode, sport);
 +
 +	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, 0x0020u /* SERVREG_REGISTER_LISTENER_REQ */,
++	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, req, (uint16_t)roff);
++}
++
++static void
++s5b_servreg_restart_pd(uint32_t snode, uint32_t sport, const char *domain)
++{
++	uint8_t req[128];
++	uint32_t roff = 0u;
++	unsigned dom_len = sweet_str_len(domain);
++
++	/* TLV 0x01: service_path (string) */
++	roff = s5b_qmi_put_tlv(req, roff, 0x01u, (uint16_t)dom_len, domain);
++
++	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (txn == 0u) {
++		txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	s5b.servreg_restart_txn = txn;
++
++	printf("WIFI PROBE: [5B.3] SERVREG send RESTART_PD_REQ for '%s' (txn=%u -> node=%u port=%u)\n",
++	    domain, txn, snode, sport);
++
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, 0x0024u /* SERVREG_RESTART_PD_REQ */,
 +	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, req, (uint16_t)roff);
 +}
 +
@@ -5346,8 +5511,9 @@ new file mode 100644
 +		return;
 +	}
 +	s5b.wlan_pd_registered = true;
-+	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd");
-+	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd");
++	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
++	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
++	s5b_servreg_restart_pd(snode, sport, "msm/modem/wlan_pd");
 +}
 +
 +static void
@@ -5364,17 +5530,26 @@ new file mode 100644
 +			uint16_t slen = 0u;
 +			const uint8_t *sv = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &slen);
 +			uint32_t curr_st = (sv && slen >= 4u) ? s5b_rd_le32(sv) : 0u;
-+			printf("WIFI PROBE: [5B.3] SERVREG REGISTER_LISTENER resp: res=%u err=%u curr_state=0x%08x\n",
-+			    res, err, curr_st);
-+			if (curr_st == 0x1fffffffu) {
-+				s5b.wlan_pd_started = true;
++			printf("WIFI PROBE: [5B.3] SERVREG REGISTER_LISTENER resp: txn=%u res=%u err=%u curr_state=0x%08x\n",
++			    txn, res, err, curr_st);
++			if (txn == s5b.servreg_wlan_pd_txn) {
 +				s5b.wlan_pd_state = curr_st;
++				if (curr_st == 0x1fffffffu) {
++					s5b.wlan_pd_started = true;
++				} else if (curr_st == 0x7fffffffu) {
++					printf("WIFI PROBE: [5B.3] wlan_pd UNINIT -> triggering SERVREG_RESTART_PD_REQ\n");
++					s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd");
++				}
++			} else if (txn == s5b.servreg_root_pd_txn) {
++				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
 +			}
++		} else if (msg_id == 0x0024u) { /* RESTART_PD_RESP */
++			printf("WIFI PROBE: [5B.3] SERVREG RESTART_PD resp: txn=%u res=%u err=%u\n", txn, res, err);
 +		} else if (msg_id == 0x0023u) { /* SET_ACK_RESP */
-+			printf("WIFI PROBE: [5B.3] SERVREG SET_ACK resp: res=%u err=%u\n", res, err);
++			printf("WIFI PROBE: [5B.3] SERVREG SET_ACK resp: txn=%u res=%u err=%u\n", txn, res, err);
 +		} else {
-+			printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled resp msg=0x%04x res=%u err=%u\n",
-+			    msg_id, res, err);
++			printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled resp msg=0x%04x txn=%u res=%u err=%u\n",
++			    msg_id, txn, res, err);
 +		}
 +	} else if (qtype == QMI_MSG_INDICATION) {
 +		if (msg_id == 0x0022u || msg_id == 0x0021u) { /* STATE_UPDATED_IND */
@@ -5385,7 +5560,7 @@ new file mode 100644
 +
 +			uint32_t curr_st = (sv && slen >= 4u) ? s5b_rd_le32(sv) : 0u;
 +			char svc_path[80];
-+			memset(svc_path, 0, sizeof(svc_path));
++			for (unsigned i = 0u; i < sizeof(svc_path); i++) svc_path[i] = '\0';
 +			if (nv && nlen > 0u) {
 +				uint32_t cn = (nlen < sizeof(svc_path) - 1u) ? nlen : (uint32_t)(sizeof(svc_path) - 1u);
 +				memcpy(svc_path, nv, cn);
@@ -5395,9 +5570,11 @@ new file mode 100644
 +			printf("WIFI PROBE: [5B.3] SERVREG STATE_UPDATED_IND: '%s' state=0x%08x txn_id=%u\n",
 +			    svc_path, curr_st, ind_txn);
 +
-+			s5b.wlan_pd_state = curr_st;
-+			if (curr_st == 0x1fffffffu && s5b_str_contains(svc_path, "wlan")) {
-+				s5b.wlan_pd_started = true;
++			if (s5b_str_contains(svc_path, "wlan")) {
++				s5b.wlan_pd_state = curr_st;
++				if (curr_st == 0x1fffffffu) {
++					s5b.wlan_pd_started = true;
++				}
 +			}
 +
 +			/* Reply with SERVREG_SET_ACK_REQ (msg_id 0x0023) */
@@ -5417,8 +5594,12 @@ new file mode 100644
 +			s5b_qmi_send_sdu(QMI_MSG_REQUEST, my_txn, 0x0023u /* SERVREG_SET_ACK_REQ */,
 +			    QRTR_LOCAL_PORT_SERVREG_CLNT, src_node, src_port, ack_req, (uint16_t)aoff);
 +		} else {
-+			printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled ind msg=0x%04x\n", msg_id);
++			printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled ind msg=0x%04x sdu_len=%u\n",
++			    msg_id, sdu_len);
 +		}
++	} else {
++		printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled qtype=%u msg=0x%04x txn=%u\n",
++		    qtype, msg_id, txn);
 +	}
 +}
 +
@@ -5426,6 +5607,7 @@ new file mode 100644
 +s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len)
 +{
 +	if (len < 32u) {
++		printf("WIFI PROBE: [5B.3] IPCRTR packet too short: len=%u\n", len);
 +		return;
 +	}
 +	uint32_t ver        = s5b_rd_le32(pkt + 0);
@@ -5438,6 +5620,7 @@ new file mode 100644
 +	uint32_t dst_port   = s5b_rd_le32(pkt + 28);
 +
 +	if (ver != QRTR_PROTO_VER_1 || size > len - 32u) {
++		printf("WIFI PROBE: [5B.3] IPCRTR bad ver=%u or size=%u > len=%u\n", ver, size, len);
 +		return;
 +	}
 +	const uint8_t *body = pkt + 32u;
@@ -5494,7 +5677,13 @@ new file mode 100644
 +			} else if (svc == QRTR_SVC_RMTFS) {
 +				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_RMTFS,
 +				    resp_inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_RMTFS);
++			} else {
++				printf("WIFI PROBE: [5B.3] IPCRTR unhandled LOOKUP: svc=0x%04x inst=%u from %u:%u\n",
++				    svc, inst, src_node, src_port);
 +			}
++		} else {
++			printf("WIFI PROBE: [5B.3] IPCRTR CTRL cmd=%u type=%u src=%u:%u dst=%u:%u sz=%u\n",
++			    cmd, type, src_node, src_port, dst_node, dst_port, size);
 +		}
 +		return;
 +	}
@@ -5506,6 +5695,8 @@ new file mode 100644
 +	}
 +
 +	if (size < 7u) {
++		printf("WIFI PROBE: [5B.3] IPCRTR DATA short size=%u dst_port=%u src=%u:%u\n",
++		    size, dst_port, src_node, src_port);
 +		return;
 +	}
 +	uint8_t  qtype = body[0];
@@ -5513,6 +5704,7 @@ new file mode 100644
 +	uint16_t qmsg  = s5b_rd_le16(body + 3);
 +	uint16_t qlen  = s5b_rd_le16(body + 5);
 +	if ((uint32_t)qlen > size - 7u) {
++		printf("WIFI PROBE: [5B.3] IPCRTR QMI bad qlen=%u > size-7=%u\n", qlen, size - 7u);
 +		return;
 +	}
 +	const uint8_t *qsdu = body + 7u;
@@ -5520,15 +5712,24 @@ new file mode 100644
 +	if (dst_port == QRTR_LOCAL_PORT_SERVREG_1 || dst_port == QRTR_LOCAL_PORT_SERVREG_0) {
 +		if (qtype == QMI_MSG_REQUEST) {
 +			s5b_handle_servreg_qmi(dst_port, src_node, src_port, qtxn, qmsg, qsdu, qlen);
++		} else {
++			printf("WIFI PROBE: [5B.3] SERVREG_LOC unhandled qtype=%u msg=0x%04x txn=%u\n",
++			    qtype, qmsg, qtxn);
 +		}
 +	} else if (dst_port == QRTR_LOCAL_PORT_SERVREG_CLNT) {
 +		s5b_handle_servreg_notif_client(src_node, src_port, qtype, qtxn, qmsg, qsdu, qlen);
 +	} else if (dst_port == QRTR_LOCAL_PORT_RMTFS) {
 +		if (qtype == QMI_MSG_REQUEST) {
 +			s5b_handle_rmtfs_qmi(src_node, src_port, qtxn, qmsg, qsdu, qlen);
++		} else {
++			printf("WIFI PROBE: [5B.3] RMTFS unhandled qtype=%u msg=0x%04x txn=%u\n",
++			    qtype, qmsg, qtxn);
 +		}
 +	} else if (dst_port == QRTR_LOCAL_PORT_WLFW_CLNT) {
 +		s5b_handle_wlfw_qmi(qtype, qtxn, qmsg, qsdu, qlen);
++	} else {
++		printf("WIFI PROBE: [5B.3] IPCRTR UNHANDLED: dst_port=%u src=%u:%u type=%u size=%u qtype=%u txn=%u msg=0x%04x qlen=%u\n",
++		    dst_port, src_node, src_port, type, size, qtype, qtxn, qmsg, qlen);
 +	}
 +}
 +
@@ -5996,17 +6197,17 @@ new file mode 100644
 +			break;
 +		}
 +		if ((ms % 2000u) == 0u && ms > 0u) {
-+			printf("WIFI PROBE: [5B.3] Heartbeat (%u ms): hello=%d notif=%d wlan_pd=%d wlfw=%d rmtfs_reads=%u tftp_reqs=%u\n",
++			printf("WIFI PROBE: [5B.3] Heartbeat (%u ms): hello=%d notif=%d wlan_pd=%d (st=0x%x) wlfw=%d rmtfs_reads=%u tftp_reqs=%u\n",
 +			    ms, s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0,
-+			    s5b.wlan_pd_started ? 1 : 0, s5b.wlfw_up ? 1 : 0,
++			    s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state, s5b.wlfw_up ? 1 : 0,
 +			    s5b.rmtfs_read_count, s5b.tftp_req_count);
 +		}
 +		delay(1000);
 +	}
 +
 +	if (!s5b.wlfw_up) {
-+		printf("WIFI PROBE: [5B.4] NOTICE: WLFW (0x45) did not arrive within 25000 ms (hello=%d notif=%d wlan_pd=%d).\n\n",
-+		    s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0, s5b.wlan_pd_started ? 1 : 0);
++		printf("WIFI PROBE: [5B.4] NOTICE: WLFW (0x45) did not arrive within 25000 ms (hello=%d notif=%d wlan_pd=%d st=0x%x).\n\n",
++		    s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0, s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state);
 +		return;
 +	}
 +

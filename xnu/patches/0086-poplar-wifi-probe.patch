@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2639 @@
+@@ -0,0 +1,3189 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -171,6 +171,9 @@ new file mode 100644
 +#include <stdint.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void ml_io_unmap(vm_offset_t virt_addr, vm_size_t size);
++#define SWEET_VM_WIMG_WCOMB 6u
 +extern void delay(int usec);
 +extern int printf(const char *format, ...) __printflike(1, 2);
 +
@@ -1205,6 +1208,14 @@ new file mode 100644
 +		} else {
 +			printf("WIFI PROBE: [GATE] wlan_stage4_5_load=0 (default): Sub-Phase 4.5 MBA loader dormant.\n");
 +		}
++
++		int wlan_stage5a_mpss = 0;
++		(void)PE_parse_boot_argn("wlan_stage5a_mpss", &wlan_stage5a_mpss, sizeof(wlan_stage5a_mpss));
++		if (wlan_stage5a_mpss > 0) {
++			printf("WIFI PROBE: [GATE] wlan_stage5a_mpss=%d active: Stage 5A full MPSS ELF loader & SMEM 0:1 audit enabled.\n", wlan_stage5a_mpss);
++		} else {
++			printf("WIFI PROBE: [GATE] wlan_stage5a_mpss=0 (default): Stage 5A MPSS loader dormant.\n");
++		}
 +	}
 +
 +	/* 5B: Compile-time reference hardware specification (from Sony MSM8998 stock DTB) */
@@ -2067,21 +2078,22 @@ new file mode 100644
 +		}
 +	} while (res.status == -12 && ++retry < 20);
 +
-+	printf("WIFI PROBE: [4.5] MP_ASSIGN(0x%llx, %llu MiB) -> status=%lld, v1=0x%llx, v2=0x%llx (retries=%d)\n",
-+	    (unsigned long long)mem_addr, (unsigned long long)(mem_size >> 20),
++	printf("WIFI PROBE: [4.5] MP_ASSIGN(0x%llx, 0x%llx [%llu KiB]) -> status=%lld, v1=0x%llx, v2=0x%llx (retries=%d)\n",
++	    (unsigned long long)mem_addr, (unsigned long long)mem_size, (unsigned long long)(mem_size >> 10),
 +	    (long long)res.status, (unsigned long long)res.val1, (unsigned long long)res.val2, retry);
 +
-+	/* If SMC64 failed with non-zero and dest_perm == QCOM_SCM_PERM_RW, try RWX as fallback */
-+	if (res.status != 0 && dest_perm == QCOM_SCM_PERM_RW) {
-+		printf("WIFI PROBE: [4.5]   Retrying MP_ASSIGN with PERM_RWX (0x7)...\n");
-+		dest->perm = QCOM_SCM_PERM_RWX;
++	/* Fallback between PERM_RW (0x6) and PERM_RWX (0x7) if TrustZone rejects initial perm */
++	if (res.status != 0 && (dest_perm == QCOM_SCM_PERM_RW || dest_perm == QCOM_SCM_PERM_RWX)) {
++		uint32_t alt_perm = (dest_perm == QCOM_SCM_PERM_RW) ? QCOM_SCM_PERM_RWX : QCOM_SCM_PERM_RW;
++		printf("WIFI PROBE: [4.5]   Retrying MP_ASSIGN with perm=0x%x...\n", alt_perm);
++		dest->perm = alt_perm;
 +		for (uintptr_t p = (uintptr_t)s_scm_scratch_buf; p < (uintptr_t)s_scm_scratch_buf + 256; p += 64) {
 +			__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
 +		}
 +		__asm__ volatile("dsb sy\nisb" ::: "memory");
 +		res = sweet_scm_call6(fid, arginfo, mem_map_pa, sizeof(struct qcom_scm_mem_map_info), src_pa, ext_args_pa);
-+		printf("WIFI PROBE: [4.5]   MP_ASSIGN fallback (PERM_RWX): status=%lld, v1=0x%llx\n",
-+		    (long long)res.status, (unsigned long long)res.val1);
++		printf("WIFI PROBE: [4.5]   MP_ASSIGN fallback (0x%x): status=%lld, v1=0x%llx\n",
++		    alt_perm, (long long)res.status, (unsigned long long)res.val1);
 +	}
 +
 +	return (int)res.status;
@@ -2255,6 +2267,12 @@ new file mode 100644
 +#define STATUS_PBL_SUCCESS          0x1
 +#define STATUS_XPU_UNLOCKED         0x1
 +#define STATUS_XPU_UNLOCKED_SCRIBBLED 0x2
++#define STATUS_META_DATA_AUTH_SUCCESS 0x3
++#define STATUS_AUTH_COMPLETE        0x4
++
++#define CMD_META_DATA_READY         0x1
++#define CMD_LOAD_READY              0x2
++#define PIL_MDT_PHYS_BASE           0x94200000ULL /* Upper 1 MiB of pil_mba_region@94100000 */
 +
 +/* QDSP6SS Registers (MSM8998 DTB: 0x04080000, 0x100) */
 +#define QDSP6SS_PHYS_BASE           0x04080000ULL
@@ -2308,6 +2326,10 @@ new file mode 100644
 +#define GCC_MSS_RESTART_PHYS_BASE       0x00179000ULL
 +#define GCC_MSS_RESTART_SIZE            0x00001000ULL /* 4 KiB page covering GCC_MSS_RESTART */
 +
++static bool        s_mba_boot_ok = false;
++static vm_offset_t s_mba_va      = 0;
++static vm_offset_t s_rmb_va      = 0;
++
 +static void
 +probe_stage4_5_active_mba_load(void)
 +{
@@ -2315,6 +2337,7 @@ new file mode 100644
 +	(void)PE_parse_boot_argn("wlan_stage4_5_load", &wlan_stage4_5_load,
 +	    sizeof(wlan_stage4_5_load));
 +
++	s_mba_boot_ok = false;
 +	printf("\nWIFI PROBE: [4.5] === SUB-PHASE 4.5: ACTIVE MBA FIRMWARE LOAD & RMB BOOTSTRAP ===\n");
 +
 +	if (wlan_stage4_5_load <= 0) {
@@ -2333,6 +2356,7 @@ new file mode 100644
 +		printf("WIFI PROBE: [4.5] ERROR: Failed to map MBA carveout @ 0x%llx\n", (unsigned long long)PIL_MBA_PHYS_BASE);
 +		return;
 +	}
++	s_mba_va = mba_va;
 +
 +	/* 2. Stream mba.mbn directly from UFS into 0x94100000 (via FAT16 chain if audited, else raw offset) */
 +	int err = (s_fat16_valid && s_fw_mba.found) ?
@@ -2508,6 +2532,7 @@ new file mode 100644
 +		printf("WIFI PROBE: [4.5] ERROR: Failed to map RMB or QDSP6SS registers.\n");
 +		return;
 +	}
++	s_rmb_va = rmb_va;
 +
 +	uint32_t init_rmb_img = *(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG);
 +	uint32_t init_rmb_pbl = *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG);
@@ -2717,6 +2742,7 @@ new file mode 100644
 +		printf("WIFI PROBE: [4.5] Note: Polling cycle complete. Final: PBL=0x%08x MBA=0x%08x DBG=0x%08x\n",
 +		    last_pbl, last_mba, last_dbg);
 +	}
++	s_mba_boot_ok = success;
 +
 +	/*
 +	 * 25. Post-Poll Register Audit (RMB 0x00..0x20 & GCC ONLY).
@@ -2742,6 +2768,529 @@ new file mode 100644
 +	    *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF),
 +	    *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF));
 +	printf("WIFI PROBE: [4.5] Sub-Phase 4.5 active MBA load complete.\n\n");
++}
++
++/*
++ * Stage 5A: Full MPSS Self-Authenticating ELF Boot (modem.mdt + 28 PT_LOAD segments)
++ * and Post-Boot SMEM APPS:Modem (p[07], 0:1) GLINK / SMP2P Live Verification.
++ *
++ * Gated strictly behind opt-in boot-arg:
++ *   wlan_stage5a_mpss=1
++ */
++struct sweet_elf32_ehdr {
++	uint8_t  e_ident[16];
++	uint16_t e_type;
++	uint16_t e_machine;
++	uint32_t e_version;
++	uint32_t e_entry;
++	uint32_t e_phoff;
++	uint32_t e_shoff;
++	uint32_t e_flags;
++	uint16_t e_ehsize;
++	uint16_t e_phentsize;
++	uint16_t e_phnum;
++	uint16_t e_shentsize;
++	uint16_t e_shnum;
++	uint16_t e_shstrndx;
++};
++
++struct sweet_elf32_phdr {
++	uint32_t p_type;
++	uint32_t p_offset;
++	uint32_t p_vaddr;
++	uint32_t p_paddr;
++	uint32_t p_filesz;
++	uint32_t p_memsz;
++	uint32_t p_flags;
++	uint32_t p_align;
++};
++
++static uint8_t s_mdt_buf[16384] __attribute__((aligned(64)));
++
++/*
++ * Volatile zero helper: never uses memset/bzero (which lower to dc zva on XNU
++ * and fault with DFSC=0x21 on Non-Cacheable / Write-Combining WIMG=6 mappings).
++ */
++static void
++sweet_io_zero(void *dst, size_t len)
++{
++	uintptr_t addr = (uintptr_t)dst;
++	while (len > 0u && (addr & 7u) != 0u) {
++		*(volatile uint8_t *)addr = 0u;
++		addr++;
++		len--;
++	}
++	while (len >= 8u) {
++		*(volatile uint64_t *)addr = 0ULL;
++		addr += 8u;
++		len -= 8u;
++	}
++	while (len > 0u) {
++		*(volatile uint8_t *)addr = 0u;
++		addr++;
++		len--;
++	}
++	__asm__ volatile("dmb sy" ::: "memory");
++}
++
++static void
++sweet_dcache_clean_poc(vm_offset_t va, size_t len)
++{
++	uintptr_t start = ((uintptr_t)va) & ~(uintptr_t)63u;
++	uintptr_t end   = (uintptr_t)va + len;
++	for (uintptr_t p = start; p < end; p += 64u) {
++		__asm__ volatile("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy\nisb" ::: "memory");
++}
++
++static void
++probe_dump_rmb_regs(const char *tag, vm_offset_t rmb_va)
++{
++	printf("WIFI PROBE: [%s]   RMB:  IMG=0x%08x PBL=0x%08x CMD=0x%08x MBA=0x%08x\n",
++	    tag,
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_COMMAND_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG));
++	printf("WIFI PROBE: [%s]         META=0x%08x START=0x%08x LEN=0x%08x VER=0x%08x DBG=0x%08x\n",
++	    tag,
++	    *(volatile uint32_t *)(rmb_va + RMB_PMI_META_DATA_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_START_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_LENGTH_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_PROTOCOL_VERSION_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_DEBUG_INFO_REG));
++}
++
++static int
++probe_rmb_wait_status(const char *phase, uint32_t want_status, uint32_t timeout_ms, uint32_t *out_status)
++{
++	uint32_t iters = timeout_ms / 5u;
++	uint32_t last_st = 0xFFFFFFFFu;
++	uint32_t st = 0u;
++
++	for (uint32_t i = 0u; i <= iters; i++) {
++		st = *(volatile uint32_t *)(s_rmb_va + RMB_MBA_STATUS_REG);
++		if (st != last_st || i == 0u || i == iters || st == want_status || (int32_t)st < 0) {
++			printf("WIFI PROBE: [5A]   t=%4u ms | %s MBA_STATUS=0x%08x\n",
++			    i * 5u, phase, st);
++			last_st = st;
++		}
++		if (st == want_status || (int32_t)st < 0) {
++			break;
++		}
++		if (i < iters) {
++			delay(5000);
++		}
++	}
++
++	if (out_status) {
++		*out_status = st;
++	}
++	return (st == want_status) ? 0 : -1;
++}
++
++static void
++probe_stage5a_smem_modem_audit(void)
++{
++	printf("WIFI PROBE: [5A.3] Inspecting SMEM APPS:Modem (0:1) partition for SMP2P & GLINK...\n");
++
++	vm_offset_t toc = ml_io_map(POPLAR_SMEM_TOC_PA, 0x1000u);
++	if (!toc) {
++		printf("WIFI PROBE: [5A.3] ERROR: failed to map SMEM TOC @ 0x%08x\n", POPLAR_SMEM_TOC_PA);
++		return;
++	}
++
++	uint32_t magic = probe_rd32(toc, 0u);
++	uint32_t num_entries = probe_rd32(toc, 8u);
++	uint32_t max_entries = probe_rd32(toc, 12u);
++	if (magic != 0x434f5424u) {
++		printf("WIFI PROBE: [5A.3] ERROR: invalid TOC magic 0x%08x\n", magic);
++		return;
++	}
++	if (max_entries > 0u && num_entries > max_entries) {
++		num_entries = max_entries;
++	}
++	if (num_entries > 32u) {
++		num_entries = 32u;
++	}
++
++	uint32_t part_idx = 0xFFFFFFFFu;
++	uint32_t part_off = 0u, part_sz = 0u;
++	uint16_t part_h0 = 0u, part_h1 = 0u;
++	for (uint32_t i = 0u; i < num_entries; i++) {
++		uint32_t e_off = 32u + i * 48u;
++		uint32_t off   = probe_rd32(toc, e_off);
++		uint32_t sz    = probe_rd32(toc, e_off + 4u);
++		uint32_t hosts = probe_rd32(toc, e_off + 12u);
++		uint16_t h0 = (uint16_t)hosts;
++		uint16_t h1 = (uint16_t)(hosts >> 16);
++		if (((h0 == 0u && h1 == 1u) || (h0 == 1u && h1 == 0u)) &&
++		    sz > 0u && sz <= 0x200000u && off <= 0x200000u - sz) {
++			part_idx = i;
++			part_off = off;
++			part_sz  = sz;
++			part_h0  = h0;
++			part_h1  = h1;
++			break;
++		}
++	}
++
++	if (part_idx == 0xFFFFFFFFu) {
++		printf("WIFI PROBE: [5A.3] ERROR: APPS:Modem (0:1) partition not found in SMEM TOC.\n");
++		return;
++	}
++
++	uint32_t part_pa = POPLAR_SMEM_BASE_PA + part_off;
++	uint32_t map_len = (part_sz < 0x20000u) ? part_sz : 0x20000u;
++	printf("WIFI PROBE: [5A.3] Found p[%02u] off=0x%05x PA=0x%08x sz=%uKB hosts=%u:%u (mapping %uKB Device-nGnRnE)\n",
++	    part_idx, part_off, part_pa, part_sz / 1024u, part_h0, part_h1, map_len / 1024u);
++
++	vm_offset_t part_va = ml_io_map(part_pa, map_len);
++	if (!part_va) {
++		printf("WIFI PROBE: [5A.3] ERROR: failed to map SMEM p[%02u] @ 0x%08x\n", part_idx, part_pa);
++		return;
++	}
++
++	uint32_t pmagic = probe_rd32(part_va, 0x00u);
++	if (pmagic != SMEM_PART_MAGIC) {
++		printf("WIFI PROBE: [5A.3] ERROR: p[%02u] magic=0x%08x (expected '$PRT')\n", part_idx, pmagic);
++		return;
++	}
++
++	uint32_t free_uncached = probe_rd32(part_va, 0x0cu);
++	uint32_t free_cached   = probe_rd32(part_va, 0x10u);
++	for (uint32_t i = 0u; i < 400u; i++) {
++		free_uncached = probe_rd32(part_va, 0x0cu);
++		free_cached   = probe_rd32(part_va, 0x10u);
++		if (free_uncached > 0x20u) {
++			break;
++		}
++		delay(5000);
++	}
++	if (free_uncached > 0x20u) {
++		delay(400000); /* 400 ms settle window for initial SMP2P & GLINK channel creation */
++		free_uncached = probe_rd32(part_va, 0x0cu);
++		free_cached   = probe_rd32(part_va, 0x10u);
++	}
++
++	printf("WIFI PROBE: [5A.3] p[%02u] Heap after wait: free_uncached=0x%x free_cached=0x%x\n",
++	    part_idx, free_uncached, free_cached);
++
++	uint32_t limit = (free_uncached < map_len) ? free_uncached : map_len;
++	uint32_t off = 0x20u;
++	uint32_t items = 0u;
++
++	while (off + 12u <= limit && items < 32u) {
++		uint32_t w0      = probe_rd32(part_va, off);
++		uint16_t canary  = (uint16_t)w0;
++		uint16_t item_id = (uint16_t)(w0 >> 16);
++		uint32_t item_sz = probe_rd32(part_va, off + 4u);
++		uint32_t w2      = probe_rd32(part_va, off + 8u);
++		uint16_t pad_dat = (uint16_t)w2;
++		uint16_t pad_hdr = (uint16_t)(w2 >> 16);
++
++		if (canary != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++		uint32_t hdr_and_pad = 12u + (uint32_t)pad_hdr;
++		if (hdr_and_pad > map_len - off || item_sz > map_len - off - hdr_and_pad) {
++			break;
++		}
++		uint32_t payload_off = off + hdr_and_pad;
++		uint32_t rem_after = map_len - payload_off - item_sz;
++		uint32_t total_entry = hdr_and_pad + item_sz + (uint32_t)pad_dat;
++		total_entry = (total_entry + 7u) & ~7u;
++
++		printf("WIFI PROBE: [5A.3]   item[%u] @ +0x%04x: id=%u sz=%u\n",
++		    items, off, item_id, item_sz);
++
++		if (item_sz >= 20u && probe_rd32(part_va, payload_off) == 0x504d5324u) { /* "$SMP" */
++			uint32_t pids = probe_rd32(part_va, payload_off + 8u);
++			uint32_t cnts = probe_rd32(part_va, payload_off + 12u);
++			uint16_t loc_pid = (uint16_t)pids;
++			uint16_t rem_pid = (uint16_t)(pids >> 16);
++			uint16_t valid_e = (uint16_t)(cnts >> 16);
++			uint32_t max_fit = (item_sz - 20u) / 20u;
++			if (valid_e > 16u) {
++				valid_e = 16u;
++			}
++			if (valid_e > max_fit) {
++				valid_e = (uint16_t)max_fit;
++			}
++			printf("WIFI PROBE: [5A.3]     SMP2P: local_pid=%u rem_pid=%u valid_entries=%u\n",
++			    loc_pid, rem_pid, valid_e);
++			for (uint32_t e = 0u; e < valid_e; e++) {
++				uint32_t eoff = payload_off + 20u + e * 20u;
++				char ename[17];
++				for (uint32_t k = 0u; k < 4u; k++) {
++					uint32_t cw = probe_rd32(part_va, eoff + k * 4u);
++					ename[k * 4u + 0u] = (char)(cw & 0xffu);
++					ename[k * 4u + 1u] = (char)((cw >> 8) & 0xffu);
++					ename[k * 4u + 2u] = (char)((cw >> 16) & 0xffu);
++					ename[k * 4u + 3u] = (char)((cw >> 24) & 0xffu);
++				}
++				ename[16] = '\0';
++				for (uint32_t c = 0u; c < 16u && ename[c] != '\0'; c++) {
++					if ((unsigned char)ename[c] < 32u || (unsigned char)ename[c] > 126u) {
++						ename[c] = '?';
++					}
++				}
++				uint32_t bits = probe_rd32(part_va, eoff + 16u);
++				printf("WIFI PROBE: [5A.3]       entry[%u] '%s' bits=0x%08x\n", e, ename, bits);
++			}
++		} else if (item_id == 478u && item_sz >= 16u) {
++			uint32_t w_rx_tail = probe_rd32(part_va, payload_off + 0u);
++			uint32_t w_rx_head = probe_rd32(part_va, payload_off + 4u);
++			uint32_t w_tx_tail = probe_rd32(part_va, payload_off + 8u);
++			uint32_t w_tx_head = probe_rd32(part_va, payload_off + 12u);
++			printf("WIFI PROBE: [5A.3]     GLINK_XPRT_DESC(478): rx_tail=%u rx_head=%u tx_tail=%u tx_head=%u\n",
++			    w_rx_tail, w_rx_head, w_tx_tail, w_tx_head);
++		} else if ((item_id == 479u || item_id == 480u) && item_sz >= 4u) {
++			uint32_t dump_bytes = (item_sz < 64u) ? item_sz : 64u;
++			uint32_t nwords = dump_bytes / 4u;
++			printf("WIFI PROBE: [5A.3]     GLINK_FIFO(%u) first %u bytes:\n", item_id, nwords * 4u);
++			for (uint32_t w = 0u; w < nwords; w += 4u) {
++				uint32_t x0 = probe_rd32(part_va, payload_off + (w + 0u) * 4u);
++				uint32_t x1 = (w + 1u < nwords) ? probe_rd32(part_va, payload_off + (w + 1u) * 4u) : 0u;
++				uint32_t x2 = (w + 2u < nwords) ? probe_rd32(part_va, payload_off + (w + 2u) * 4u) : 0u;
++				uint32_t x3 = (w + 3u < nwords) ? probe_rd32(part_va, payload_off + (w + 3u) * 4u) : 0u;
++				printf("WIFI PROBE: [5A.3]       [+0x%02x] %08x %08x %08x %08x\n",
++				    w * 4u, x0, x1, x2, x3);
++			}
++		}
++
++		if (total_entry == 0u || (uint32_t)pad_dat > rem_after || off + total_entry <= off) {
++			break;
++		}
++		off += total_entry;
++		items++;
++	}
++
++	if (items == 0u) {
++		printf("WIFI PROBE: [5A.3]   No private items present in p[%02u] uncached heap.\n", part_idx);
++	}
++}
++
++static void
++probe_stage5a_mpss_boot(void)
++{
++	int wlan_stage5a_mpss = 0;
++	(void)PE_parse_boot_argn("wlan_stage5a_mpss", &wlan_stage5a_mpss,
++	    sizeof(wlan_stage5a_mpss));
++
++	printf("\nWIFI PROBE: [5A] === STAGE 5A: FULL MPSS SELF-AUTH ELF LOAD & SMEM 0:1 AUDIT ===\n");
++
++	if (wlan_stage5a_mpss <= 0) {
++		printf("WIFI PROBE: [5A] Gate: wlan_stage5a_mpss=0 (dormant default).\n");
++		printf("WIFI PROBE: [5A] MPSS ELF load skipped. To activate, set wlan_stage5a_mpss=1.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [5A] Gate: wlan_stage5a_mpss=1 ACTIVE.\n");
++
++	if (!s_mba_boot_ok || s_mba_va == 0 || s_rmb_va == 0 || !s_fat16_valid ||
++	    !s_fw_mdt.found || s_fw_mdt.size < sizeof(struct sweet_elf32_ehdr) ||
++	    s_fw_mdt.size > sizeof(s_mdt_buf)) {
++		printf("WIFI PROBE: [5A] ABORT: Preconditions unmet (mba_ok=%d mba_va=%p rmb_va=%p fat16=%d mdt_found=%d mdt_sz=%u).\n\n",
++		    s_mba_boot_ok ? 1 : 0, (void *)s_mba_va, (void *)s_rmb_va,
++		    s_fat16_valid ? 1 : 0, s_fw_mdt.found ? 1 : 0, s_fw_mdt.size);
++		return;
++	}
++
++	/* Step 5A.1: Read, validate, stage (0x94200000), and authenticate modem.mdt */
++	memset(s_mdt_buf, 0, sizeof(s_mdt_buf));
++	int err = sweet_modem_fat16_read(s_fw_mdt.start_clus, s_fw_mdt.size, s_mdt_buf);
++	if (err != 0) {
++		printf("WIFI PROBE: [5A.1] ERROR: failed reading modem.mdt from FAT16 (err=%d)\n\n", err);
++		return;
++	}
++
++	const struct sweet_elf32_ehdr *eh = (const struct sweet_elf32_ehdr *)(const void *)s_mdt_buf;
++	if (sizeof(*eh) != 52u ||
++	    eh->e_ident[0] != 0x7fu || eh->e_ident[1] != 'E' ||
++	    eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F' ||
++	    eh->e_ident[4] != 1u   || eh->e_phentsize != 32u ||
++	    eh->e_phnum == 0u || eh->e_phnum > 30u || (eh->e_phoff & 3u) != 0u ||
++	    (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * 32ULL > s_fw_mdt.size) {
++		printf("WIFI PROBE: [5A.1] ERROR: invalid modem.mdt ELF32 header (phoff=%u phentsz=%u phnum=%u)\n\n",
++		    eh->e_phoff, eh->e_phentsize, eh->e_phnum);
++		return;
++	}
++
++	uint64_t mdt_assign_sz = ((uint64_t)s_fw_mdt.size + 0xFFFULL) & ~0xFFFULL;
++	if (mdt_assign_sz > sizeof(s_mdt_buf)) {
++		printf("WIFI PROBE: [5A.1] ERROR: aligned mdt size 0x%llx exceeds buffer.\n\n",
++		    (unsigned long long)mdt_assign_sz);
++		return;
++	}
++
++	vm_offset_t mdt_va = s_mba_va + 0x100000ULL; /* PA = 0x94200000 */
++	const uint32_t *src_words = (const uint32_t *)(const void *)s_mdt_buf;
++	volatile uint32_t *dst_words = (volatile uint32_t *)mdt_va;
++	for (uint64_t w = 0u; w < (mdt_assign_sz / 4u); w++) {
++		dst_words[w] = src_words[w];
++	}
++	sweet_dcache_clean_poc(mdt_va, (size_t)mdt_assign_sz);
++
++	printf("WIFI PROBE: [5A.1] Staging modem.mdt (%u B -> aligned 0x%llx) @ 0x%08llx; assigning HLOS -> MSS_MSA...\n",
++	    s_fw_mdt.size, (unsigned long long)mdt_assign_sz, (unsigned long long)PIL_MDT_PHYS_BASE);
++	if (sweet_scm_assign_mem(PIL_MDT_PHYS_BASE, mdt_assign_sz,
++	        QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW) != 0) {
++		printf("WIFI PROBE: [5A.1] ERROR: MP_ASSIGN for modem.mdt failed.\n\n");
++		return;
++	}
++
++	*(volatile uint32_t *)(s_rmb_va + RMB_PMI_CODE_LENGTH_REG) = 0u;
++	__asm__ volatile("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(s_rmb_va + RMB_PMI_META_DATA_REG) = (uint32_t)PIL_MDT_PHYS_BASE;
++	__asm__ volatile("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(s_rmb_va + RMB_MBA_COMMAND_REG) = CMD_META_DATA_READY;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	uint32_t mdt_st = 0u;
++	int mdt_wait_rc = probe_rmb_wait_status("5A.1", STATUS_META_DATA_AUTH_SUCCESS, 10000u, &mdt_st);
++
++	/* Reclaim 0x94200000 back to HLOS regardless of outcome (pil-msa.c:761) */
++	(void)sweet_scm_assign_mem(PIL_MDT_PHYS_BASE, mdt_assign_sz,
++	    QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RWX);
++
++	if (mdt_wait_rc != 0) {
++		printf("WIFI PROBE: [5A.1] ERROR: modem.mdt auth failed (status=0x%08x (%d)).\n",
++		    mdt_st, (int32_t)mdt_st);
++		probe_dump_rmb_regs("5A", s_rmb_va);
++		printf("\n");
++		return;
++	}
++	printf("WIFI PROBE: [5A.1] *** MODEM.MDT METADATA AUTH SUCCESS (STATUS=0x%08x) ***\n", mdt_st);
++
++	/* Step 5A.2: Validate PT_LOAD layout and stream modem.b02..b28 into 0x8cc00000..0x93c00000 */
++	const struct sweet_elf32_phdr *phdrs =
++	    (const struct sweet_elf32_phdr *)(const void *)(s_mdt_buf + eh->e_phoff);
++	uint32_t min_paddr = 0xFFFFFFFFu;
++	uint32_t max_paddr = 0u;
++	uint32_t total_memsz = 0u;
++	uint32_t total_filesz = 0u;
++	unsigned load_seg_cnt = 0u, file_seg_cnt = 0u, bss_seg_cnt = 0u;
++	unsigned last_file_idx = 0u;
++
++	for (uint16_t i = 0u; i < eh->e_phnum; i++) {
++		const struct sweet_elf32_phdr *ph = &phdrs[i];
++		if (ph->p_type != 1u || ph->p_memsz == 0u || (ph->p_flags & 0x07000000u) == 0x02000000u) {
++			continue;
++		}
++		if (ph->p_filesz > ph->p_memsz ||
++		    ph->p_paddr < PIL_MPSS_PHYS_BASE ||
++		    (uint64_t)ph->p_paddr + ph->p_memsz > PIL_MPSS_PHYS_BASE + PIL_MPSS_SIZE) {
++			printf("WIFI PROBE: [5A.2] ERROR: phdr[%u] out of carveout (pa=0x%08x filesz=0x%x memsz=0x%x)\n\n",
++			    i, ph->p_paddr, ph->p_filesz, ph->p_memsz);
++			return;
++		}
++		if (ph->p_filesz > 0u) {
++			if (i >= 30u || !s_fw_modem_seg[i].found || s_fw_modem_seg[i].size < ph->p_filesz) {
++				printf("WIFI PROBE: [5A.2] ERROR: missing/short segment modem.b%02u (found=%d disk=%u need=%u)\n\n",
++				    i, (i < 30u && s_fw_modem_seg[i].found) ? 1 : 0,
++				    (i < 30u) ? s_fw_modem_seg[i].size : 0u, ph->p_filesz);
++				return;
++			}
++			file_seg_cnt++;
++			last_file_idx = i;
++		} else {
++			bss_seg_cnt++;
++		}
++		if (ph->p_paddr < min_paddr) {
++			min_paddr = ph->p_paddr;
++		}
++		if (ph->p_paddr + ph->p_memsz > max_paddr) {
++			max_paddr = ph->p_paddr + ph->p_memsz;
++		}
++		total_memsz  += ph->p_memsz;
++		total_filesz += ph->p_filesz;
++		load_seg_cnt++;
++	}
++
++	if (load_seg_cnt == 0u || min_paddr >= max_paddr || total_memsz == 0u) {
++		printf("WIFI PROBE: [5A.2] ERROR: empty PT_LOAD summary.\n\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [5A.2] PT_LOAD=%u [files=%u, pure_bss=%u] span=0x%08x..0x%08x total_memsz=0x%08x (%u B) total_filesz=0x%08x\n",
++	    load_seg_cnt, file_seg_cnt, bss_seg_cnt, min_paddr, max_paddr, total_memsz, total_memsz, total_filesz);
++
++	vm_offset_t mpss_va = ml_io_map_unmappable(PIL_MPSS_PHYS_BASE, PIL_MPSS_SIZE, SWEET_VM_WIMG_WCOMB);
++	if (!mpss_va) {
++		printf("WIFI PROBE: [5A.2] ERROR: ml_io_map_unmappable(0x%llx, 0x%llx, WCOMB) returned NULL.\n\n",
++		    (unsigned long long)PIL_MPSS_PHYS_BASE, (unsigned long long)PIL_MPSS_SIZE);
++		return;
++	}
++
++	printf("WIFI PROBE: [5A.2] Mapped 112 MiB MPSS carveout via WCOMB (zeroing without dc zva)...\n");
++	sweet_io_zero((void *)mpss_va, (size_t)PIL_MPSS_SIZE);
++
++	printf("WIFI PROBE: [5A.2] Streaming %u file-backed PT_LOAD segments into 0x8cc00000..0x93c00000...\n", file_seg_cnt);
++	bool first_logged = false;
++	for (uint16_t i = 0u; i < eh->e_phnum; i++) {
++		const struct sweet_elf32_phdr *ph = &phdrs[i];
++		if (ph->p_type != 1u || ph->p_memsz == 0u ||
++		    (ph->p_flags & 0x07000000u) == 0x02000000u || ph->p_filesz == 0u) {
++			continue;
++		}
++		uint64_t rel_off = (uint64_t)ph->p_paddr - PIL_MPSS_PHYS_BASE;
++		void *seg_dst = (void *)(mpss_va + (vm_offset_t)rel_off);
++		err = sweet_modem_fat16_read(s_fw_modem_seg[i].start_clus, ph->p_filesz, seg_dst);
++		if (err != 0) {
++			printf("WIFI PROBE: [5A.2] ERROR: modem.b%02u FAT16 read failed (err=%d, pa=0x%08x sz=%u)\n",
++			    i, err, ph->p_paddr, ph->p_filesz);
++			ml_io_unmap(mpss_va, PIL_MPSS_SIZE);
++			return;
++		}
++		if (!first_logged || i == last_file_idx || ph->p_filesz >= 0x100000u) {
++			first_logged = true;
++			printf("WIFI PROBE: [5A.2]   loaded modem.b%02u -> 0x%08x (%u B, memsz=0x%x)\n",
++			    i, ph->p_paddr, ph->p_filesz, ph->p_memsz);
++		}
++	}
++
++	sweet_dcache_clean_poc(mpss_va, (size_t)PIL_MPSS_SIZE);
++	ml_io_unmap(mpss_va, PIL_MPSS_SIZE);
++	mpss_va = 0;
++	printf("WIFI PROBE: [5A.2] D-cache cleaned to PoC and 112 MiB HLOS mapping removed; assigning HLOS -> MSS_MSA...\n");
++
++	if (sweet_scm_assign_mem(PIL_MPSS_PHYS_BASE, PIL_MPSS_SIZE,
++	        QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW) != 0) {
++		printf("WIFI PROBE: [5A.2] ERROR: MP_ASSIGN for 112 MiB MPSS region failed.\n\n");
++		return;
++	}
++
++	/* Trigger full MPSS segment authentication & Hexagon MPSS boot (pil-msa.c:807-812) */
++	*(volatile uint32_t *)(s_rmb_va + RMB_PMI_CODE_START_REG) = min_paddr;
++	__asm__ volatile("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(s_rmb_va + RMB_MBA_COMMAND_REG) = CMD_LOAD_READY;
++	__asm__ volatile("dmb sy" ::: "memory");
++	*(volatile uint32_t *)(s_rmb_va + RMB_PMI_CODE_LENGTH_REG) = total_memsz;
++	__asm__ volatile("dmb sy" ::: "memory");
++
++	uint32_t mpss_st = 0u;
++	int mpss_wait_rc = probe_rmb_wait_status("5A.2", STATUS_AUTH_COMPLETE, 10000u, &mpss_st);
++	if (mpss_wait_rc != 0) {
++		printf("WIFI PROBE: [5A.2] ERROR: MPSS image auth failed (status=0x%08x (%d)).\n",
++		    mpss_st, (int32_t)mpss_st);
++		probe_dump_rmb_regs("5A", s_rmb_va);
++		printf("\n");
++		return;
++	}
++
++	printf("WIFI PROBE: [5A.2] *** FULL MPSS AUTH COMPLETE & BOOTED (STATUS=0x%08x) ***\n", mpss_st);
++	probe_dump_rmb_regs("5A", s_rmb_va);
++
++	/* Reclaim MBA+DP 1 MiB carveout (0x94100000) back to HLOS for Stage 5B wlan_msa (pil-msa.c:848) */
++	printf("WIFI PROBE: [5A.2] Reclaiming MBA+DP (0x94100000, 1 MiB) MSS_MSA -> HLOS...\n");
++	(void)sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_DP_SIZE,
++	    QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RWX);
++
++	/* Step 5A.3: Audit SMEM APPS:Modem (0:1) live state */
++	probe_stage5a_smem_modem_audit();
++	printf("WIFI PROBE: [5A] Stage 5A MPSS boot & audit complete.\n\n");
 +}
 +
 +void
@@ -2774,6 +3323,7 @@ new file mode 100644
 +	probe_stage4_3_passive_audit();
 +	probe_stage4_4_passive_audit();
 +	probe_stage4_5_active_mba_load();
++	probe_stage5a_mpss_boot();
 +
 +	printf("=======================================================\n");
 +	printf("=== SWEET POPLAR WI-FI DIAGNOSTIC PROBE COMPLETE    ===\n");

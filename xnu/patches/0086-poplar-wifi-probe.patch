@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2572 @@
+@@ -0,0 +1,2648 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -2218,28 +2218,23 @@ new file mode 100644
 + * Gated strictly behind dedicated opt-in boot-arg:
 + *   wlan_stage4_5_load=1
 + *
-+ * Execution Steps:
-+ *   1. Map MBA physical carveout (0x94100000, 2 MiB).
++ * Execution Steps (aligned with Sony pil-msa.c / pil-q6v5.c qdsp6v62_1_2):
++ *   1. Map MBA physical carveout (0x94100000, 2 MiB; assign lower 1 MiB MBA+DP to MSS_MSA).
 + *   2. Stream mba.mbn directly from UFS 'modem' partition into pil_mba_region@94100000.
 + *   3. Flush CPU caches to Point of Coherence (PoC) for the MBA carveout.
-+ *   4. Map GCC MSS clock branch (0x0018a000), TCSR MSS Halt (0x01f63000), GCC MSS Restart (0x00179000).
-+ *   5. Dump initial safe clock/bus register states.
-+ *   6. Ungate MSS CFG AHB clock (0x0018a000 |= 1) and enable SNOC/MNOC AXI clocks.
-+ *   7. HARD SAFETY CHECK: Poll MSS_CFG_AHB_CBCR for CLK_OFF == 0. If gated, ABORT immediately to prevent SError panic!
++ *   4. Map discrete 4 KiB GCC MSS (0x0018a000), GCC BIMC MSS (0x00144000),
++ *      GCC APCS Vote (0x00152000), TCSR MSS Halt (0x01f63000), and GCC MSS Restart (0x00179000).
++ *      (NEVER map or touch XPU-fenced 0x00138000 / 0x00138004).
++ *   5. Release TCSR AXI halts (0) and deassert GCC_MSS_RESTART (0x0 only; never assert 1).
++ *   6. Enable all 6 pil_mss_enable_clks() branches in order: AHB -> BIMC Q6 AXI ->
++ *      APCS vote BOOT_ROM_AHB (BIT 10) -> APCS vote_1 GPLL0_MSSCC (BIT 2) -> SNOC/MNOC/Q6BIMC.
++ *   7. HARD SAFETY CHECK: Poll MSS_CFG_AHB_CBCR for CLK_OFF == 0. If gated, ABORT before Q6/RMB MMIO.
 + *   8. Once AHB clock is ACTIVE, map QDSP6SS (0x04080000) and RMB (0x04180000).
-+ *   9. Dump initial RMB and QDSP6SS register states safely.
-+ *  10. Assert core and bus resets in QDSP6SS_RESET_REG.
-+ *  11. Turn on Block HeadSwitch (BHS) in QDSP6SS_PWR_CTL_REG (BIT 24).
-+ *  12. Poll QDSP6V62SS_BHS_STATUS (0x0C4) for BHS_EN_REST_ACK (bit 0).
-+ *  13. Sequentially power up all 29 memory arrays in QDSP6V6SS_MEM_PWR_CTL (0x034).
-+ *  14. Wake L2 / L1 cache arrays from sleep in QDSP6SS_PWR_CTL_REG.
-+ *  15. Deassert compiler memory clamp, wordline clamp, and Q6SS I/O clamp in QDSP6SS_PWR_CTL_REG.
-+ *  16. Program RMB_MBA_IMAGE_REG = 0x94100000.
-+ *  17. Release TCSR MSS AXI Halt (0x01f63000 = 0).
-+ *  18. Deassert GCC MSS Restart if asserted.
-+ *  19. Enable Q6SS GFMUX clock (0x020 |= BIT(1)), deassert Q6 core reset (0x014 = 0),
-+ *      and trigger QDSP6SS_BOOT_CORE_START & QDSP6SS_BOOT_CMD.
-+ *  20. Poll RMB_MBA_STATUS_REG, RMB_PBL_STATUS_REG, and RMB_MBA_MSS_STATUS to capture boot progress.
++ *   9. Program RMB_MBA_IMAGE = 0x94100000 & DP length/start = 0 before pil_q6v5_reset().
++ *  10. Execute qdsp6v62_1_2 reset/power-up sequence (XO/SLEEP CBCRs, BHS_ON + 0x0C4 ack,
++ *      LDO_BYP, ~QMC, L2/SLP, 29-bank MEM_PWR_CTL, ~WL, ~IO).
++ *  11. Re-verify APCS vote bits & RMB_MBA_IMAGE readback, release core reset, enable GFMUX.
++ *  12. Poll RMB_PBL_STATUS_REG (0x04), RMB_MBA_STATUS_REG (0x0C), and RMB_MBA_MSS_STATUS (0x40).
 + */
 +#define PIL_MBA_PHYS_BASE           0x94100000ULL
 +#define PIL_MBA_SIZE                0x00200000ULL /* 2 MiB carveout */
@@ -2301,12 +2296,21 @@ new file mode 100644
 +#define TCSR_HALT_NC_OFFSET         0x1000
 +#define TCSR_HALT_MODEM_OFFSET      0x2000
 +
-+/* Discrete, verified-safe 4 KiB GCC / Reset control pages (zero access to 0x38004/0x4401C/0x5200C) */
-+#define PIL_MBA_DP_SIZE             0x00100000ULL /* 1 MiB MBA+DP per pil-msa.c SZ_1M; 0x94200000 kept in HLOS */
-+#define GCC_MSS_AHB_PHYS_BASE       0x0018a000ULL
-+#define GCC_MSS_AHB_SIZE            0x00001000ULL /* 4 KiB page covering MSS CBCRs */
-+#define GCC_MSS_RESTART_PHYS_BASE   0x00179000ULL
-+#define GCC_MSS_RESTART_SIZE        0x00001000ULL /* 4 KiB page covering GCC_MSS_RESTART */
++/* Discrete, verified-safe 4 KiB GCC / Reset control pages (ZERO access to XPU-fenced 0x00138004) */
++#define PIL_MBA_DP_SIZE                 0x00100000ULL /* 1 MiB MBA+DP per pil-msa.c SZ_1M; 0x94200000 kept in HLOS */
++#define GCC_MSS_AHB_PHYS_BASE           0x0018a000ULL
++#define GCC_MSS_AHB_SIZE                0x00001000ULL /* 4 KiB page covering MSS CBCRs */
++#define GCC_BIMC_MSS_PHYS_BASE          0x00144000ULL
++#define GCC_BIMC_MSS_SIZE               0x00001000ULL /* 4 KiB page covering GCC_BIMC_MSS_Q6_AXI_CBCR (0x4401C) */
++#define GCC_BIMC_MSS_Q6_AXI_CBCR_OFF    0x01Cu        /* BIT(0): branch enable (.has_sibling = 1) */
++#define GCC_APCS_VOTE_PHYS_BASE         0x00152000ULL
++#define GCC_APCS_VOTE_SIZE              0x00001000ULL /* 4 KiB page covering APCS_CLOCK_BRANCH_ENA_VOTE(_1) */
++#define GCC_APCS_CLK_ENA_VOTE_OFF       0x004u        /* 0x00152004: BIT(10) = gcc_boot_rom_ahb_clk (preserve BIT(17)!) */
++#define GCC_BOOT_ROM_AHB_VOTE_BIT       (1u << 10)
++#define GCC_APCS_CLK_ENA_VOTE_1_OFF     0x00Cu        /* 0x0015200C: BIT(2)  = gpll0_out_msscc */
++#define GCC_GPLL0_MSSCC_VOTE_BIT        (1u << 2)
++#define GCC_MSS_RESTART_PHYS_BASE       0x00179000ULL
++#define GCC_MSS_RESTART_SIZE            0x00001000ULL /* 4 KiB page covering GCC_MSS_RESTART */
 +
 +static void
 +probe_stage4_5_active_mba_load(void)
@@ -2358,24 +2362,23 @@ new file mode 100644
 +	__asm__ volatile("dsb sy\nisb" ::: "memory");
 +	printf("WIFI PROBE: [4.5] Data cache cleaned to Point of Coherence for MBA memory region.\n");
 +
-+	/* 4.1 Sub-Phase 4.5F: TrustZone Memory Protection Assignment (MP_ASSIGN) for MBA+DP (1 MiB) */
-+	printf("WIFI PROBE: [4.5] Sub-Phase 4.5F: Reassigning MBA+DP (0x94100000, 1 MiB) HLOS (0x3) -> MSS_MSA (0xF)...\n");
++	/* 4.1 Sub-Phase 4.5G: TrustZone Memory Protection Assignment (MP_ASSIGN) for MBA+DP (1 MiB) */
++	printf("WIFI PROBE: [4.5] Sub-Phase 4.5G: Reassigning MBA+DP (0x94100000, 1 MiB) HLOS (0x3) -> MSS_MSA (0xF)...\n");
 +	int assign_mba = sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_DP_SIZE,
 +	    QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW);
 +
 +	printf("WIFI PROBE: [4.5] MP_ASSIGN Result: MBA(1 MiB)=%s (%d) [0x94200000 & 0x8cc00000 kept in HLOS]\n",
 +	    assign_mba == 0 ? "SUCCESS" : "FAILED", assign_mba);
 +
-+	/* 5. Map Discrete Safe Control Register Pages (GCC MSS, GCC Restart, TCSR AXI Halts) */
++	/* 5. Map Discrete Safe Control Register Pages (GCC MSS/BIMC/VOTE, TCSR AXI Halts, GCC Restart) */
 +	vm_offset_t gcc_va  = ml_io_map(GCC_MSS_AHB_PHYS_BASE, GCC_MSS_AHB_SIZE);
++	vm_offset_t bimc_va = ml_io_map(GCC_BIMC_MSS_PHYS_BASE, GCC_BIMC_MSS_SIZE);
++	vm_offset_t vote_va = ml_io_map(GCC_APCS_VOTE_PHYS_BASE, GCC_APCS_VOTE_SIZE);
 +	vm_offset_t halt_va = ml_io_map(TCSR_MSS_HALT_PHYS_BASE, TCSR_MSS_HALT_SIZE);
 +	vm_offset_t rst_va  = ml_io_map(GCC_MSS_RESTART_PHYS_BASE, GCC_MSS_RESTART_SIZE);
 +
-+	if (!gcc_va || !halt_va || !rst_va) {
-+		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC (0x%llx), TCSR Halt (0x%llx), or Restart (0x%llx).\n",
-+		    (unsigned long long)GCC_MSS_AHB_PHYS_BASE,
-+		    (unsigned long long)TCSR_MSS_HALT_PHYS_BASE,
-+		    (unsigned long long)GCC_MSS_RESTART_PHYS_BASE);
++	if (!gcc_va || !bimc_va || !vote_va || !halt_va || !rst_va) {
++		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC MSS/BIMC/VOTE, TCSR Halt, or Restart pages.\n");
 +		return;
 +	}
 +
@@ -2405,42 +2408,93 @@ new file mode 100644
 +	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART after deassert:  0x%08x\n",
 +	    *(volatile uint32_t *)(rst_va + 0x00));
 +
-+	/* 8. Enable Verified Safe MSS Clocks on 0x0018a000 Page ONLY (zero access to 0x38004/0x4401C/0x5200C) */
-+	uint32_t init_ahb  = *(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF);
-+	uint32_t init_mnoc = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
-+	uint32_t init_snoc = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
-+	uint32_t init_q6b  = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
++	/* 8. Enable ALL 6 pil_mss_enable_clks() branches in pil-msa.c order (zero access to 0x00138004) */
++	uint32_t init_ahb   = *(volatile uint32_t *)(gcc_va  + GCC_MSS_CFG_AHB_CBCR_OFF);
++	uint32_t init_mnoc  = *(volatile uint32_t *)(gcc_va  + GCC_MSS_MNOC_BIMC_CBCR_OFF);
++	uint32_t init_snoc  = *(volatile uint32_t *)(gcc_va  + GCC_MSS_SNOC_AXI_CBCR_OFF);
++	uint32_t init_q6b   = *(volatile uint32_t *)(gcc_va  + GCC_MSS_Q6_BIMC_CBCR_OFF);
++	uint32_t init_bimc  = *(volatile uint32_t *)(bimc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF);
++	uint32_t init_vote0 = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF);
++	uint32_t init_vote1 = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF);
 +	printf("WIFI PROBE: [4.5] GCC MSS Clocks Pre-Enable:\n");
 +	printf("WIFI PROBE: [4.5]   AHB=0x%08x SNOC=0x%08x MNOC=0x%08x Q6BIMC=0x%08x\n",
 +	    init_ahb, init_snoc, init_mnoc, init_q6b);
++	printf("WIFI PROBE: [4.5]   BIMC_Q6_AXI=0x%08x APCS_VOTE=0x%08x (BIT10=%u, BIT17=%u) APCS_VOTE_1=0x%08x (BIT2=%u)\n",
++	    init_bimc, init_vote0, (init_vote0 >> 10) & 1u, (init_vote0 >> 17) & 1u,
++	    init_vote1, (init_vote1 >> 2) & 1u);
 +
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF)   |= 0x1;
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF)  |= 0x1;
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF) |= 0x1;
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF)   |= 0x1;
++	/* 8a. ahb_clk: gcc_mss_cfg_ahb_clk (0x0018a000 |= 0x1) */
++	printf("WIFI PROBE: [4.5]   Step 8a: enabling gcc_mss_cfg_ahb_clk (0x0018a000)...\n");
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF) |= 0x1u;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
-+	/* Poll GCC_MSS_CFG_AHB_CBCR for CLK_OFF == 0 (timeout 100ms) */
 +	uint32_t ahb_after = 0;
 +	bool ahb_active = false;
 +	for (int i = 0; i < 1000; i++) {
 +		ahb_after = *(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF);
-+		if (((ahb_after >> 31) & 1) == 0) {
++		if (((ahb_after >> 31) & 1u) == 0) {
 +			ahb_active = true;
 +			break;
 +		}
 +		delay(100);
 +	}
++	printf("WIFI PROBE: [4.5]     AHB=0x%08x (OFF=%u -> %s)\n",
++	    ahb_after, (ahb_after >> 31) & 1u, ahb_active ? "ACTIVE" : "GATED");
 +
++	/* 8b. axi_clk: gcc_bimc_mss_q6_axi_clk (0x0014401C |= 0x1, non-fatal CLK_OFF check) */
++	printf("WIFI PROBE: [4.5]   Step 8b: enabling gcc_bimc_mss_q6_axi_clk (0x0014401C)...\n");
++	*(volatile uint32_t *)(bimc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF) |= 0x1u;
++	__asm__ volatile("dmb sy" ::: "memory");
++	uint32_t bimc_after = 0;
++	for (int i = 0; i < 200; i++) {
++		bimc_after = *(volatile uint32_t *)(bimc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF);
++		if (((bimc_after >> 31) & 1u) == 0) {
++			break;
++		}
++		delay(10);
++	}
++	printf("WIFI PROBE: [4.5]     BIMC_Q6_AXI=0x%08x (OFF=%u)\n",
++	    bimc_after, (bimc_after >> 31) & 1u);
++
++	/* 8c. rom_clk: gcc_boot_rom_ahb_clk via APCS vote (0x00152004 |= BIT(10), preserve BIT(17)) */
++	printf("WIFI PROBE: [4.5]   Step 8c: voting gcc_boot_rom_ahb_clk (0x00152004 |= BIT(10))...\n");
++	uint32_t v0_cur = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF);
++	*(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF) = v0_cur | GCC_BOOT_ROM_AHB_VOTE_BIT;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(50);
++	uint32_t vote0_after = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF);
++	printf("WIFI PROBE: [4.5]     APCS_VOTE=0x%08x (BIT10=%u, BIT17=%u)\n",
++	    vote0_after, (vote0_after >> 10) & 1u, (vote0_after >> 17) & 1u);
++
++	/* 8d. gpll0_mss_clk: gpll0_out_msscc via APCS vote_1 (0x0015200C |= BIT(2)) */
++	printf("WIFI PROBE: [4.5]   Step 8d: voting gpll0_out_msscc (0x0015200C |= BIT(2))...\n");
++	uint32_t v1_cur = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF);
++	*(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF) = v1_cur | GCC_GPLL0_MSSCC_VOTE_BIT;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(50);
++	uint32_t vote1_after = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF);
++	printf("WIFI PROBE: [4.5]     APCS_VOTE_1=0x%08x (BIT2=%u)\n",
++	    vote1_after, (vote1_after >> 2) & 1u);
++
++	/* 8e. snoc_axi_clk & mnoc_axi_clk (+ q6_bimc) on 0x0018a000 page */
++	printf("WIFI PROBE: [4.5]   Step 8e: enabling SNOC/MNOC/Q6BIMC AXI clocks (0x0018a000)...\n");
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF)  |= 0x1u;
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF) |= 0x1u;
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF)   |= 0x1u;
++	__asm__ volatile("dmb sy" ::: "memory");
++	delay(20);
++
++	ahb_after = *(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF);
++	ahb_active = (((ahb_after >> 31) & 1u) == 0);
 +	uint32_t snoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
 +	uint32_t mnoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
 +	uint32_t q6b_cbcr  = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
 +	printf("WIFI PROBE: [4.5] GCC MSS Clocks Post-Enable:\n");
 +	printf("WIFI PROBE: [4.5]   AHB=0x%08x (OFF=%u) SNOC=0x%08x (OFF=%u) MNOC=0x%08x (OFF=%u) Q6BIMC=0x%08x (OFF=%u) -> %s\n",
-+	    ahb_after, (ahb_after >> 31) & 1,
-+	    snoc_cbcr, (snoc_cbcr >> 31) & 1,
-+	    mnoc_cbcr, (mnoc_cbcr >> 31) & 1,
-+	    q6b_cbcr,  (q6b_cbcr >> 31) & 1,
++	    ahb_after, (ahb_after >> 31) & 1u,
++	    snoc_cbcr, (snoc_cbcr >> 31) & 1u,
++	    mnoc_cbcr, (mnoc_cbcr >> 31) & 1u,
++	    q6b_cbcr,  (q6b_cbcr >> 31) & 1u,
 +	    ahb_active ? "ACTIVE" : "GATED / FAILED");
 +
 +	/* 9. CRITICAL HARD SAFETY GATE: If AHB clock failed, ABORT immediately to prevent SError */
@@ -2478,6 +2532,15 @@ new file mode 100644
 +	    init_q6_rst, init_q6_gfm, init_q6_pwr, init_q6_xo, init_q6_slp);
 +	printf("WIFI PROBE: [4.5]         BHS_078=0x%08x BHS_0C4=0x%08x\n",
 +	    init_q6_b78, init_q6_bc4);
++
++	/* 10b. Program RMB image/DP registers before Q6v5 reset per pil_mss_reset() (pil-msa.c:500-525) */
++	*(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG) = (uint32_t)PIL_MBA_PHYS_BASE;
++	if (init_rmb_cmd != 0) {
++		*(volatile uint32_t *)(rmb_va + RMB_MBA_COMMAND_REG) = 0x0;
++	}
++	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_START_REG) = 0x0;
++	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_LENGTH_REG) = 0x0;
++	__asm__ volatile("dmb sy" ::: "memory");
 +
 +	/* 11. Assert resets & stop core per Qualcomm __pil_q6v55_reset */
 +	*(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG) =
@@ -2570,13 +2633,22 @@ new file mode 100644
 +	    pwr_after, (pwr_after >> 24) & 1, (pwr_after >> 25) & 1,
 +	    (pwr_after >> 20) & 1, (pwr_after >> 21) & 1, (pwr_after >> 22) & 1);
 +
-+	/* 21. Program RMB Registers with MBA Carveout Physical Address */
++	/* 21. Re-verify APCS clock vote bits & confirm RMB_MBA_IMAGE_REG readback before core release */
++	uint32_t v0_pre = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF);
++	if ((v0_pre & GCC_BOOT_ROM_AHB_VOTE_BIT) == 0) {
++		*(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF) = v0_pre | GCC_BOOT_ROM_AHB_VOTE_BIT;
++		__asm__ volatile("dmb sy" ::: "memory");
++	}
++	uint32_t v1_pre = *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF);
++	if ((v1_pre & GCC_GPLL0_MSSCC_VOTE_BIT) == 0) {
++		*(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF) = v1_pre | GCC_GPLL0_MSSCC_VOTE_BIT;
++		__asm__ volatile("dmb sy" ::: "memory");
++	}
 +	*(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG) = (uint32_t)PIL_MBA_PHYS_BASE;
-+	*(volatile uint32_t *)(rmb_va + RMB_MBA_COMMAND_REG) = 0x0;
-+	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_START_REG) = 0x0;
-+	*(volatile uint32_t *)(rmb_va + RMB_PMI_CODE_LENGTH_REG) = 0x0;
 +	__asm__ volatile("dmb sy" ::: "memory");
-+	printf("WIFI PROBE: [4.5] Programmed RMB_MBA_IMAGE_REG = 0x%08x\n", (uint32_t)PIL_MBA_PHYS_BASE);
++	uint32_t rmb_img_rb = *(volatile uint32_t *)(rmb_va + RMB_MBA_IMAGE_REG);
++	printf("WIFI PROBE: [4.5] Programmed RMB_MBA_IMAGE_REG = 0x%08x (readback=0x%08x)\n",
++	    (uint32_t)PIL_MBA_PHYS_BASE, rmb_img_rb);
 +
 +	/* 22. Bring Hexagon Core Out of Reset (clear Q6SS_CORE_ARES and Q6SS_STOP_CORE; KEEP BUS_ARES_ENA) */
 +	uint32_t q6_rst = *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG);
@@ -2674,6 +2746,10 @@ new file mode 100644
 +	    *(volatile uint32_t *)(q6_va + QDSP6V62SS_BHS_STATUS),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_MEM_PWR_CTL_ALT),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_STRAP_ACC));
++	printf("WIFI PROBE: [4.5]   GCC:  BIMC_Q6_AXI=0x%08x APCS_VOTE=0x%08x APCS_VOTE_1=0x%08x\n",
++	    *(volatile uint32_t *)(bimc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF),
++	    *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_OFF),
++	    *(volatile uint32_t *)(vote_va + GCC_APCS_CLK_ENA_VOTE_1_OFF));
 +	printf("WIFI PROBE: [4.5] Sub-Phase 4.5 active MBA load complete.\n\n");
 +}
 +

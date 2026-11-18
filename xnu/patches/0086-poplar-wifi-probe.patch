@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,2392 @@
+@@ -0,0 +1,2572 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -1498,10 +1498,119 @@ new file mode 100644
 + */
 +extern int sweet_ufs_read_part(const char *want, uint64_t off, void *dst, uint64_t len);
 +
-+static uint8_t s_fat_buf[4096];
-+static uint8_t s_hdr_buf[64];
++#ifndef EIO
++#define EIO 5
++#endif
++#ifndef EINVAL
++#define EINVAL 22
++#endif
++
++static uint8_t  s_fat_buf[4096];
++static uint8_t  s_hdr_buf[64];
++static uint16_t s_fat16_table[8192];
++static bool     s_fat16_valid = false;
++static uint32_t s_fat_bytes_per_sec = 0;
++static uint32_t s_fat_sec_per_clus = 0;
++static uint32_t s_fat_data_start_sec = 0;
 +static uint64_t s_mba_part_off = 0x01079000ULL;
 +static uint32_t s_mba_size = 230056U;
++static uint32_t s_mba_start_clus = 1053U;
++
++struct sweet_fw_cat_entry {
++	uint32_t start_clus;
++	uint32_t size;
++	bool     found;
++	bool     contiguous;
++};
++
++static struct sweet_fw_cat_entry s_fw_mba;
++static struct sweet_fw_cat_entry s_fw_mdt;
++static struct sweet_fw_cat_entry s_fw_wlanmdsp;
++static struct sweet_fw_cat_entry s_fw_bdwlan;
++static struct sweet_fw_cat_entry s_fw_modem_seg[30]; /* modem.b00 .. modem.b29 */
++
++static bool
++sweet_fat16_check_contiguous(uint32_t start_clus, uint32_t fsize)
++{
++	if (fsize == 0) {
++		return true;
++	}
++	if (!s_fat16_valid || start_clus < 2 || start_clus >= 8192 ||
++	    s_fat_bytes_per_sec == 0 || s_fat_sec_per_clus == 0) {
++		return true;
++	}
++	uint32_t clus_bytes = s_fat_bytes_per_sec * s_fat_sec_per_clus;
++	uint32_t need_clus = (fsize + clus_bytes - 1u) / clus_bytes;
++	uint32_t cur = start_clus;
++	for (uint32_t k = 0; k < need_clus; k++) {
++		if (k + 1u < need_clus) {
++			if (cur < 2 || cur >= 8192) {
++				return false;
++			}
++			uint16_t nxt = s_fat16_table[cur];
++			if (nxt < 2 || nxt >= 0xfff0u) {
++				break;
++			}
++			if (nxt != cur + 1u) {
++				return false;
++			}
++			cur = nxt;
++		}
++	}
++	return true;
++}
++
++static int
++sweet_modem_fat16_read(uint32_t start_clus, uint32_t fsize, void *dst)
++{
++	if (fsize == 0) {
++		return 0;
++	}
++	if (!s_fat16_valid || s_fat_bytes_per_sec == 0 || s_fat_sec_per_clus == 0) {
++		return EINVAL;
++	}
++	uint32_t clus_bytes = s_fat_bytes_per_sec * s_fat_sec_per_clus;
++	uint32_t cur = start_clus;
++	uint32_t done = 0;
++	uint32_t hops = 0;
++
++	while (done < fsize) {
++		if (cur < 2 || cur >= 8192 || hops >= 8192) {
++			return EIO;
++		}
++		uint32_t run_start = cur;
++		uint32_t run_len = clus_bytes;
++		while (done + run_len < fsize && hops < 8192) {
++			uint16_t nxt = s_fat16_table[cur];
++			if (nxt == cur + 1u && nxt < 8192) {
++				cur = nxt;
++				run_len += clus_bytes;
++				hops++;
++			} else {
++				break;
++			}
++		}
++		uint32_t want = fsize - done;
++		if (run_len < want) {
++			want = run_len;
++		}
++		uint64_t off = (uint64_t)(s_fat_data_start_sec +
++		    (run_start - 2u) * s_fat_sec_per_clus) * s_fat_bytes_per_sec;
++		int err = sweet_ufs_read_part("modem", off, (uint8_t *)dst + done, want);
++		if (err != 0) {
++			return err;
++		}
++		done += want;
++		hops++;
++		if (done < fsize) {
++			cur = s_fat16_table[cur];
++			if (cur < 2 || cur >= 0xfff0u || cur >= 8192) {
++				return EIO;
++			}
++		}
++	}
++	return 0;
++}
 +
 +static void
 +probe_stage4_3_passive_audit(void)
@@ -1570,6 +1679,25 @@ new file mode 100644
 +
 +	printf("WIFI PROBE: [4.3]   Root Dir Start Sec: %u (sectors: %u), Data Start Sec: %u\n",
 +	    root_dir_sec, root_dir_sz_sec, data_start_sec);
++
++	/* Cache FAT16 allocation table in BSS for cluster-chain reads (Final Stage readiness) */
++	s_fat16_valid = false;
++	memset(&s_fw_mba, 0, sizeof(s_fw_mba));
++	memset(&s_fw_mdt, 0, sizeof(s_fw_mdt));
++	memset(&s_fw_wlanmdsp, 0, sizeof(s_fw_wlanmdsp));
++	memset(&s_fw_bdwlan, 0, sizeof(s_fw_bdwlan));
++	memset(s_fw_modem_seg, 0, sizeof(s_fw_modem_seg));
++	if (!is_fat32 && fat_sz > 0 && (uint64_t)fat_sz * bytes_per_sec <= sizeof(s_fat16_table)) {
++		int ferr = sweet_ufs_read_part("modem",
++		    (uint64_t)rsvd_sec_cnt * bytes_per_sec,
++		    s_fat16_table, (uint64_t)fat_sz * bytes_per_sec);
++		if (ferr == 0) {
++			s_fat_bytes_per_sec  = bytes_per_sec;
++			s_fat_sec_per_clus   = sec_per_clus;
++			s_fat_data_start_sec = data_start_sec;
++			s_fat16_valid        = true;
++		}
++	}
 +
 +	/* Step 4.3.2: Walk Root Directory to find 'IMAGE' subdirectory */
 +	uint32_t image_start_clus = 0;
@@ -1652,43 +1780,115 @@ new file mode 100644
 +	unsigned target_count = sizeof(targets) / sizeof(targets[0]);
 +	unsigned matched_count = 0;
 +
-+	for (uint32_t chunk = 0; chunk < 4; chunk++) {
-+		err = sweet_ufs_read_part("modem", dir_cluster_off + (chunk * 4096), s_fat_buf, 4096);
-+		if (err != 0) break;
++	uint32_t clus_bytes = (uint32_t)bytes_per_sec * sec_per_clus;
++	uint32_t chunks_per_clus = clus_bytes / 4096u;
++	if (chunks_per_clus == 0) {
++		chunks_per_clus = 1u;
++	}
++	uint32_t dir_clus = image_start_clus;
++	uint32_t max_dir_clus = found_image_dir ? 8u : 1u;
 +
-+		for (uint32_t i = 0; i < 4096 / 32; i++) {
-+			uint8_t *e = &s_fat_buf[i * 32];
-+			if (e[0] == 0x00) goto done_scan;
-+			if (e[0] == 0xe5 || e[11] == 0x0f) continue;
++	for (uint32_t dc = 0; dc < max_dir_clus; dc++) {
++		if (found_image_dir && (dir_clus < 2u || dir_clus >= 8192u)) {
++			break;
++		}
++		uint64_t base_off = found_image_dir ?
++		    (uint64_t)(data_start_sec + (dir_clus - 2u) * sec_per_clus) * bytes_per_sec :
++		    (uint64_t)root_dir_sec * bytes_per_sec;
++		uint32_t nchunks = found_image_dir ? chunks_per_clus : 4u;
 +
-+			for (unsigned t = 0; t < target_count; t++) {
-+				if (memcmp(e, targets[t].s83, 11) == 0) {
-+					uint32_t clus = (uint32_t)(e[26] | (e[27] << 8));
-+					if (is_fat32) clus |= ((uint32_t)(e[20] | (e[21] << 8)) << 16);
-+					uint32_t fsize = (uint32_t)(e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24));
-+					uint64_t file_part_off = (uint64_t)(data_start_sec + (clus - 2) * sec_per_clus) * bytes_per_sec;
++		for (uint32_t chunk = 0; chunk < nchunks; chunk++) {
++			err = sweet_ufs_read_part("modem", base_off + ((uint64_t)chunk * 4096u), s_fat_buf, 4096);
++			if (err != 0) {
++				goto done_scan;
++			}
 +
-+					/* Read first 16 bytes of the file to verify magic header */
-+					memset(s_hdr_buf, 0, sizeof(s_hdr_buf));
-+					(void)sweet_ufs_read_part("modem", file_part_off, s_hdr_buf, 16);
++			for (uint32_t i = 0; i < 4096u / 32u; i++) {
++				uint8_t *e = &s_fat_buf[i * 32u];
++				if (e[0] == 0x00) {
++					goto done_scan;
++				}
++				if (e[0] == 0xe5 || e[11] == 0x0f || (e[11] & 0x10)) {
++					continue;
++				}
 +
-+					printf("WIFI PROBE: [4.3]   MATCH: %-12s Clus=%-6u PartOff=0x%08llx Size=%-8u [Hdr: %02x %02x %02x %02x %02x %02x %02x %02x]\n",
-+					    targets[t].friendly, clus, (unsigned long long)file_part_off, fsize,
-+					    s_hdr_buf[0], s_hdr_buf[1], s_hdr_buf[2], s_hdr_buf[3],
-+					    s_hdr_buf[4], s_hdr_buf[5], s_hdr_buf[6], s_hdr_buf[7]);
++				uint32_t clus = (uint32_t)(e[26] | (e[27] << 8));
++				if (is_fat32) {
++					clus |= ((uint32_t)(e[20] | (e[21] << 8)) << 16);
++				}
++				uint32_t fsize = (uint32_t)(e[28] | (e[29] << 8) | (e[30] << 16) | (e[31] << 24));
++				bool contig = sweet_fat16_check_contiguous(clus, fsize);
 +
-+					if (strcmp(targets[t].friendly, "mba.mbn") == 0) {
-+						s_mba_part_off = file_part_off;
-+						s_mba_size = fsize;
++				/* Populate full Final-Stage firmware catalog */
++				if (memcmp(e, "MBA     MBN", 11) == 0) {
++					s_fw_mba = (struct sweet_fw_cat_entry){ clus, fsize, true, contig };
++					s_mba_start_clus = clus;
++				} else if (memcmp(e, "MODEM   MDT", 11) == 0) {
++					s_fw_mdt = (struct sweet_fw_cat_entry){ clus, fsize, true, contig };
++				} else if (memcmp(e, "WLANMDSPMBN", 11) == 0) {
++					s_fw_wlanmdsp = (struct sweet_fw_cat_entry){ clus, fsize, true, contig };
++				} else if (memcmp(e, "BDWLAN  BIN", 11) == 0) {
++					s_fw_bdwlan = (struct sweet_fw_cat_entry){ clus, fsize, true, contig };
++				} else if (memcmp(e, "MODEM   B", 9) == 0 &&
++				           e[9] >= '0' && e[9] <= '9' && e[10] >= '0' && e[10] <= '9') {
++					unsigned idx = (unsigned)((e[9] - '0') * 10 + (e[10] - '0'));
++					if (idx < 30u) {
++						s_fw_modem_seg[idx] = (struct sweet_fw_cat_entry){ clus, fsize, true, contig };
 +					}
++				}
 +
-+					matched_count++;
++				for (unsigned t = 0; t < target_count; t++) {
++					if (memcmp(e, targets[t].s83, 11) == 0) {
++						uint64_t file_part_off = (uint64_t)(data_start_sec + (clus - 2u) * sec_per_clus) * bytes_per_sec;
++
++						/* Read first 16 bytes of the file to verify magic header */
++						memset(s_hdr_buf, 0, sizeof(s_hdr_buf));
++						(void)sweet_ufs_read_part("modem", file_part_off, s_hdr_buf, 16);
++
++						printf("WIFI PROBE: [4.3]   MATCH: %-12s Clus=%-6u PartOff=0x%08llx Size=%-8u [Hdr: %02x %02x %02x %02x %02x %02x %02x %02x]\n",
++						    targets[t].friendly, clus, (unsigned long long)file_part_off, fsize,
++						    s_hdr_buf[0], s_hdr_buf[1], s_hdr_buf[2], s_hdr_buf[3],
++						    s_hdr_buf[4], s_hdr_buf[5], s_hdr_buf[6], s_hdr_buf[7]);
++
++						if (strcmp(targets[t].friendly, "mba.mbn") == 0) {
++							s_mba_part_off = file_part_off;
++							s_mba_size = fsize;
++						}
++
++						matched_count++;
++					}
 +				}
 +			}
 +		}
++
++		if (!found_image_dir || !s_fat16_valid || dir_clus < 2u || dir_clus >= 8192u) {
++			break;
++		}
++		dir_clus = s_fat16_table[dir_clus];
++		if (dir_clus < 2u || dir_clus >= 0xfff0u) {
++			break;
++		}
 +	}
 +done_scan:
-+	printf("WIFI PROBE: [4.3] Target audit complete: %u key firmware files verified on live partition.\n", matched_count);
++	{
++		unsigned pt_found = 0, pt_frag = 0;
++		for (unsigned s = 2u; s <= 28u; s++) {
++			if (s == 15u || s == 19u) {
++				continue; /* Pure BSS segments (no file on disk) */
++			}
++			if (s_fw_modem_seg[s].found) {
++				pt_found++;
++				if (!s_fw_modem_seg[s].contiguous) {
++					pt_frag++;
++				}
++			}
++		}
++		printf("WIFI PROBE: [4.3] Target audit complete: %u key firmware files verified on live partition.\n", matched_count);
++		printf("WIFI PROBE: [4.3] Final-Stage Readiness: FAT16=%s | mdt=%uB | PT_LOAD=%u/25 (frag=%u) | wlanmdsp=%uB | bdwlan=%uB\n",
++		    s_fat16_valid ? "OK" : "NONE",
++		    s_fw_mdt.size, pt_found, pt_frag,
++		    s_fw_wlanmdsp.size, s_fw_bdwlan.size);
++	}
 +	printf("WIFI PROBE: [4.3] Sub-Phase 4.3 passive audit complete.\n\n");
 +}
 +
@@ -2101,23 +2301,12 @@ new file mode 100644
 +#define TCSR_HALT_NC_OFFSET         0x1000
 +#define TCSR_HALT_MODEM_OFFSET      0x2000
 +
-+#define AXI_HALTREQ_OFF             0x00
-+#define AXI_HALTACK_OFF             0x04
-+#define AXI_IDLE_OFF                0x08
-+
-+/* GCC Register Base (covers all clock CBCRs and MSS restart) */
-+#define GCC_PHYS_BASE               0x00100000ULL
-+#define GCC_PHYS_SIZE               0x00090000ULL /* 576 KiB */
-+
-+#define GCC_BOOT_ROM_AHB_CBCR_OFF   0x38004
-+#define GCC_BIMC_MSS_Q6_AXI_CBCR_OFF 0x4401C
-+#define GCC_APCS_CLK_ENA_VOTE_OFF   0x52004 /* bit 10: boot_rom_ahb */
-+#define GCC_APCS_CLK_ENA_VOTE_1_OFF 0x5200C /* bit 2: gpll0_mss */
-+#define GCC_MSS_RESTART_OFF         0x79000
-+#define GCC_MSS_CFG_AHB_CBCR_OFF    0x8A000
-+#define GCC_MSS_MNOC_BIMC_CBCR_OFF  0x8A004
-+#define GCC_MSS_SNOC_AXI_CBCR_OFF   0x8A03C
-+#define GCC_MSS_Q6_BIMC_CBCR_OFF    0x8A040
++/* Discrete, verified-safe 4 KiB GCC / Reset control pages (zero access to 0x38004/0x4401C/0x5200C) */
++#define PIL_MBA_DP_SIZE             0x00100000ULL /* 1 MiB MBA+DP per pil-msa.c SZ_1M; 0x94200000 kept in HLOS */
++#define GCC_MSS_AHB_PHYS_BASE       0x0018a000ULL
++#define GCC_MSS_AHB_SIZE            0x00001000ULL /* 4 KiB page covering MSS CBCRs */
++#define GCC_MSS_RESTART_PHYS_BASE   0x00179000ULL
++#define GCC_MSS_RESTART_SIZE        0x00001000ULL /* 4 KiB page covering GCC_MSS_RESTART */
 +
 +static void
 +probe_stage4_5_active_mba_load(void)
@@ -2145,16 +2334,19 @@ new file mode 100644
 +		return;
 +	}
 +
-+	/* 2. Stream mba.mbn directly from UFS into 0x94100000 */
-+	int err = sweet_ufs_read_part("modem", s_mba_part_off, (void *)mba_va, s_mba_size);
++	/* 2. Stream mba.mbn directly from UFS into 0x94100000 (via FAT16 chain if audited, else raw offset) */
++	int err = (s_fat16_valid && s_fw_mba.found) ?
++	    sweet_modem_fat16_read(s_mba_start_clus, s_mba_size, (void *)mba_va) :
++	    sweet_ufs_read_part("modem", s_mba_part_off, (void *)mba_va, s_mba_size);
 +	if (err != 0) {
-+		printf("WIFI PROBE: [4.5] ERROR: sweet_ufs_read_part('modem') failed: %d\n", err);
++		printf("WIFI PROBE: [4.5] ERROR: mba.mbn UFS read failed: %d\n", err);
 +		return;
 +	}
 +
 +	/* 3. Validate in-DRAM header magic (\x7fELF) */
 +	const uint8_t *p = (const uint8_t *)mba_va;
-+	printf("WIFI PROBE: [4.5] mba.mbn streamed successfully (%u bytes).\n", s_mba_size);
++	printf("WIFI PROBE: [4.5] mba.mbn streamed successfully (%u bytes, via %s).\n",
++	    s_mba_size, (s_fat16_valid && s_fw_mba.found) ? "FAT16 chain" : "raw offset");
 +	printf("WIFI PROBE: [4.5] In-DRAM Header: %02x %02x %02x %02x %02x %02x %02x %02x (%s)\n",
 +	    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
 +	    (p[0] == 0x7f && p[1] == 'E' && p[2] == 'L' && p[3] == 'F') ? "VALID ELF" : "INVALID HEADER");
@@ -2166,24 +2358,24 @@ new file mode 100644
 +	__asm__ volatile("dsb sy\nisb" ::: "memory");
 +	printf("WIFI PROBE: [4.5] Data cache cleaned to Point of Coherence for MBA memory region.\n");
 +
-+	/* 4.1 Sub-Phase 4.5D: TrustZone Memory Protection Assignment (MP_ASSIGN) */
-+	printf("WIFI PROBE: [4.5] Sub-Phase 4.5D: Reassigning memory ownership HLOS (0x3) -> MSS_MSA (0xF)...\n");
-+	int assign_mpss = sweet_scm_assign_mem(PIL_MPSS_PHYS_BASE, PIL_MPSS_SIZE,
-+	    QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW);
-+	int assign_mba = sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_SIZE,
++	/* 4.1 Sub-Phase 4.5F: TrustZone Memory Protection Assignment (MP_ASSIGN) for MBA+DP (1 MiB) */
++	printf("WIFI PROBE: [4.5] Sub-Phase 4.5F: Reassigning MBA+DP (0x94100000, 1 MiB) HLOS (0x3) -> MSS_MSA (0xF)...\n");
++	int assign_mba = sweet_scm_assign_mem(PIL_MBA_PHYS_BASE, PIL_MBA_DP_SIZE,
 +	    QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_PERM_RW);
 +
-+	printf("WIFI PROBE: [4.5] MP_ASSIGN Results: MPSS=%s (%d), MBA=%s (%d)\n",
-+	    assign_mpss == 0 ? "SUCCESS" : "FAILED", assign_mpss,
++	printf("WIFI PROBE: [4.5] MP_ASSIGN Result: MBA(1 MiB)=%s (%d) [0x94200000 & 0x8cc00000 kept in HLOS]\n",
 +	    assign_mba == 0 ? "SUCCESS" : "FAILED", assign_mba);
 +
-+	/* 5. Map Control Register Blocks (GCC & TCSR AXI Halts) */
-+	vm_offset_t gcc_va  = ml_io_map(GCC_PHYS_BASE, GCC_PHYS_SIZE);
++	/* 5. Map Discrete Safe Control Register Pages (GCC MSS, GCC Restart, TCSR AXI Halts) */
++	vm_offset_t gcc_va  = ml_io_map(GCC_MSS_AHB_PHYS_BASE, GCC_MSS_AHB_SIZE);
 +	vm_offset_t halt_va = ml_io_map(TCSR_MSS_HALT_PHYS_BASE, TCSR_MSS_HALT_SIZE);
++	vm_offset_t rst_va  = ml_io_map(GCC_MSS_RESTART_PHYS_BASE, GCC_MSS_RESTART_SIZE);
 +
-+	if (!gcc_va || !halt_va) {
-+		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC (0x%llx) or TCSR Halt (0x%llx) blocks.\n",
-+		    (unsigned long long)GCC_PHYS_BASE, (unsigned long long)TCSR_MSS_HALT_PHYS_BASE);
++	if (!gcc_va || !halt_va || !rst_va) {
++		printf("WIFI PROBE: [4.5] ERROR: Failed to map GCC (0x%llx), TCSR Halt (0x%llx), or Restart (0x%llx).\n",
++		    (unsigned long long)GCC_MSS_AHB_PHYS_BASE,
++		    (unsigned long long)TCSR_MSS_HALT_PHYS_BASE,
++		    (unsigned long long)GCC_MSS_RESTART_PHYS_BASE);
 +		return;
 +	}
 +
@@ -2198,48 +2390,34 @@ new file mode 100644
 +	printf("WIFI PROBE: [4.5]   halt_q6:   req=%u ack=%u | halt_nc: req=%u ack=%u | halt_modem: req=%u ack=%u\n",
 +	    q6_req, q6_ack, nc_req, nc_ack, mss_req, mss_ack);
 +
-+	/* Release all three AXI halt requests to 0 per Qualcomm pil_q6v5_halt_axi_port */
++	/* Release all three AXI halt requests to 0 */
 +	*(volatile uint32_t *)(halt_va + TCSR_HALT_Q6_OFFSET + AXI_HALTREQ_OFF) = 0x0;
 +	*(volatile uint32_t *)(halt_va + TCSR_HALT_NC_OFFSET + AXI_HALTREQ_OFF) = 0x0;
 +	*(volatile uint32_t *)(halt_va + TCSR_HALT_MODEM_OFFSET + AXI_HALTREQ_OFF) = 0x0;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
-+	/* 7. Hardware Reset Pulse via GCC_MSS_RESTART (Assert 1 -> wait 10us -> Deassert 0) */
-+	uint32_t init_rst = *(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF);
-+	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART before pulse: 0x%08x\n", init_rst);
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF) = 0x1;
++	/* 7. Safe Reset Deassertion via GCC_MSS_RESTART (pil_mss_restart_reg(drv, 0); NEVER assert 1) */
++	uint32_t init_rst = *(volatile uint32_t *)(rst_va + 0x00);
++	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART before deassert: 0x%08x\n", init_rst);
++	*(volatile uint32_t *)(rst_va + 0x00) = 0x0;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +	delay(10);
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF) = 0x0;
-+	__asm__ volatile("dmb sy" ::: "memory");
-+	delay(10);
-+	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART pulsed: 0x%08x -> clean reset deasserted\n",
-+	    *(volatile uint32_t *)(gcc_va + GCC_MSS_RESTART_OFF));
++	printf("WIFI PROBE: [4.5] GCC_MSS_RESTART after deassert:  0x%08x\n",
++	    *(volatile uint32_t *)(rst_va + 0x00));
 +
-+	/* 8. Enable Full Suite of MSS & Boot ROM Clocks (pil_mss_enable_clks) */
-+	/* Vote GPLL0 MSS branch in GCC_APCS_CLOCK_BRANCH_ENA_VOTE_1 (bit 2) */
-+	*(volatile uint32_t *)(gcc_va + GCC_APCS_CLK_ENA_VOTE_1_OFF) |= (1u << 2);
++	/* 8. Enable Verified Safe MSS Clocks on 0x0018a000 Page ONLY (zero access to 0x38004/0x4401C/0x5200C) */
++	uint32_t init_ahb  = *(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF);
++	uint32_t init_mnoc = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
++	uint32_t init_snoc = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
++	uint32_t init_q6b  = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
++	printf("WIFI PROBE: [4.5] GCC MSS Clocks Pre-Enable:\n");
++	printf("WIFI PROBE: [4.5]   AHB=0x%08x SNOC=0x%08x MNOC=0x%08x Q6BIMC=0x%08x\n",
++	    init_ahb, init_snoc, init_mnoc, init_q6b);
 +
-+	/* Vote Boot ROM AHB in GCC_APCS_CLOCK_BRANCH_ENA_VOTE (bit 10) */
-+	*(volatile uint32_t *)(gcc_va + GCC_APCS_CLK_ENA_VOTE_OFF) |= (1u << 10);
-+
-+	/* Ungate Boot ROM AHB CBCR (0x38004) */
-+	*(volatile uint32_t *)(gcc_va + GCC_BOOT_ROM_AHB_CBCR_OFF) |= 0x1;
-+
-+	/* Ungate BIMC MSS Q6 AXI CBCR (0x4401C) */
-+	*(volatile uint32_t *)(gcc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF) |= 0x1;
-+
-+	/* Ungate MSS CFG AHB CBCR (0x8A000) */
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF) |= 0x1;
-+
-+	/* Ungate MSS SNOC AXI CBCR (0x8A03C) */
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF) |= 0x1;
-+
-+	/* Ungate MSS MNOC BIMC CBCR (0x8A004) */
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_CFG_AHB_CBCR_OFF)   |= 0x1;
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF)  |= 0x1;
 +	*(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF) |= 0x1;
-+
-+	/* Ungate MSS Q6 BIMC CBCR (0x8A040) */
-+	*(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF) |= 0x1;
++	*(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF)   |= 0x1;
 +	__asm__ volatile("dmb sy" ::: "memory");
 +
 +	/* Poll GCC_MSS_CFG_AHB_CBCR for CLK_OFF == 0 (timeout 100ms) */
@@ -2254,18 +2432,15 @@ new file mode 100644
 +		delay(100);
 +	}
 +
-+	uint32_t rom_cbcr  = *(volatile uint32_t *)(gcc_va + GCC_BOOT_ROM_AHB_CBCR_OFF);
-+	uint32_t bimc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_BIMC_MSS_Q6_AXI_CBCR_OFF);
 +	uint32_t snoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_SNOC_AXI_CBCR_OFF);
 +	uint32_t mnoc_cbcr = *(volatile uint32_t *)(gcc_va + GCC_MSS_MNOC_BIMC_CBCR_OFF);
 +	uint32_t q6b_cbcr  = *(volatile uint32_t *)(gcc_va + GCC_MSS_Q6_BIMC_CBCR_OFF);
 +	printf("WIFI PROBE: [4.5] GCC MSS Clocks Post-Enable:\n");
-+	printf("WIFI PROBE: [4.5]   AHB=0x%08x (OFF=%u) ROM=0x%08x (OFF=%u) BIMC_Q6=0x%08x (OFF=%u)\n",
-+	    ahb_after, (ahb_after >> 31) & 1, rom_cbcr, (rom_cbcr >> 31) & 1,
-+	    bimc_cbcr, (bimc_cbcr >> 31) & 1);
-+	printf("WIFI PROBE: [4.5]   SNOC=0x%08x (OFF=%u) MNOC=0x%08x (OFF=%u) Q6BIMC=0x%08x (OFF=%u) -> %s\n",
-+	    snoc_cbcr, (snoc_cbcr >> 31) & 1, mnoc_cbcr, (mnoc_cbcr >> 31) & 1,
-+	    q6b_cbcr, (q6b_cbcr >> 31) & 1,
++	printf("WIFI PROBE: [4.5]   AHB=0x%08x (OFF=%u) SNOC=0x%08x (OFF=%u) MNOC=0x%08x (OFF=%u) Q6BIMC=0x%08x (OFF=%u) -> %s\n",
++	    ahb_after, (ahb_after >> 31) & 1,
++	    snoc_cbcr, (snoc_cbcr >> 31) & 1,
++	    mnoc_cbcr, (mnoc_cbcr >> 31) & 1,
++	    q6b_cbcr,  (q6b_cbcr >> 31) & 1,
 +	    ahb_active ? "ACTIVE" : "GATED / FAILED");
 +
 +	/* 9. CRITICAL HARD SAFETY GATE: If AHB clock failed, ABORT immediately to prevent SError */
@@ -2418,19 +2593,20 @@ new file mode 100644
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG));
 +
-+	/* 24. Monitor PBL and MBA Handshake */
++	/* 24. Monitor PBL and MBA Handshake (bounded 1,000 ms per pil-msa.c pbl_mba_boot_timeout_ms) */
 +	printf("WIFI PROBE: [4.5] Polling RMB_MBA_STATUS_REG (0x0C) and RMB_PBL_STATUS_REG (0x04)...\n");
 +	uint32_t last_pbl = 0xFFFFFFFF;
 +	uint32_t last_mba = 0xFFFFFFFF;
 +	uint32_t last_mss = 0xFFFFFFFF;
++	bool pbl_logged = false;
 +	bool success = false;
 +
-+	for (int iter = 0; iter <= 500; iter++) {
++	for (int iter = 0; iter <= 200; iter++) {
 +		uint32_t cur_pbl = *(volatile uint32_t *)(rmb_va + RMB_PBL_STATUS_REG);
 +		uint32_t cur_mba = *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG);
 +		uint32_t cur_mss = *(volatile uint32_t *)(rmb_va + RMB_MBA_MSS_STATUS);
 +
-+		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 500) {
++		if (cur_pbl != last_pbl || cur_mba != last_mba || cur_mss != last_mss || iter == 0 || iter == 200) {
 +			printf("WIFI PROBE: [4.5]   t=%4d ms | PBL=0x%08x MBA=0x%08x MSS=0x%08x\n",
 +			    iter * 5, cur_pbl, cur_mba, cur_mss);
 +			last_pbl = cur_pbl;
@@ -2438,7 +2614,8 @@ new file mode 100644
 +			last_mss = cur_mss;
 +		}
 +
-+		if (cur_pbl == STATUS_PBL_SUCCESS && last_pbl != STATUS_PBL_SUCCESS) {
++		if (cur_pbl == STATUS_PBL_SUCCESS && !pbl_logged) {
++			pbl_logged = true;
 +			printf("WIFI PROBE: [4.5] *** PBL HANDSHAKE SUCCESS! PBL=0x00000001 (MBA Authenticated & Launched) at t=%d ms ***\n",
 +			    iter * 5);
 +		}
@@ -2482,6 +2659,9 @@ new file mode 100644
 +	    *(volatile uint32_t *)(rmb_va + RMB_MBA_STATUS_REG),
 +	    *(volatile uint32_t *)(rmb_va + RMB_MBA_MSS_STATUS),
 +	    *(volatile uint32_t *)(rmb_va + RMB_MBA_ALT_RESET));
++	printf("WIFI PROBE: [4.5]         VER=0x%08x DBG=0x%08x\n",
++	    *(volatile uint32_t *)(rmb_va + RMB_PROTOCOL_VERSION_REG),
++	    *(volatile uint32_t *)(rmb_va + RMB_MBA_DEBUG_INFO_REG));
 +	printf("WIFI PROBE: [4.5]   Q6SS: RST=0x%08x GFM=0x%08x PWR=0x%08x MEM=0x%08x XO=0x%08x SLP=0x%08x\n",
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_RESET_REG),
 +	    *(volatile uint32_t *)(q6_va + QDSP6SS_GFMUX_CTL_REG),

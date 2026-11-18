@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,5659 @@
+@@ -0,0 +1,5903 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3302,20 +3302,19 @@ new file mode 100644
 +			break;
 +		}
 +		uint32_t payload_off = off + hdr_and_pad;
-+		uint32_t rem_after = map_len - payload_off - item_sz;
-+		uint32_t total_entry = hdr_and_pad + item_sz + (uint32_t)pad_dat;
-+		total_entry = (total_entry + 7u) & ~7u;
++		uint32_t usable_sz   = ((uint32_t)pad_dat < item_sz) ? (item_sz - (uint32_t)pad_dat) : item_sz;
++		uint32_t total_entry = hdr_and_pad + item_sz;
 +
-+		printf("WIFI PROBE: [5A.3]   item[%u] @ +0x%04x: id=%u sz=%u\n",
-+		    items, off, item_id, item_sz);
++		printf("WIFI PROBE: [5A.3]   item[%u] @ +0x%04x: id=%u sz=%u (usable=%u)\n",
++		    items, off, item_id, item_sz, usable_sz);
 +
-+		if (item_sz >= 20u && probe_rd32(part_va, payload_off) == 0x504d5324u) { /* "$SMP" */
++		if (usable_sz >= 20u && probe_rd32(part_va, payload_off) == 0x504d5324u) { /* "$SMP" */
 +			uint32_t pids = probe_rd32(part_va, payload_off + 8u);
 +			uint32_t cnts = probe_rd32(part_va, payload_off + 12u);
 +			uint16_t loc_pid = (uint16_t)pids;
 +			uint16_t rem_pid = (uint16_t)(pids >> 16);
 +			uint16_t valid_e = (uint16_t)(cnts >> 16);
-+			uint32_t max_fit = (item_sz - 20u) / 20u;
++			uint32_t max_fit = (usable_sz - 20u) / 20u;
 +			if (valid_e > 16u) {
 +				valid_e = 16u;
 +			}
@@ -3364,7 +3363,7 @@ new file mode 100644
 +			}
 +		}
 +
-+		if (total_entry == 0u || (uint32_t)pad_dat > rem_after || off + total_entry <= off) {
++		if (total_entry == 0u || total_entry > map_len - off || off + total_entry <= off) {
 +			break;
 +		}
 +		off += total_entry;
@@ -3607,9 +3606,7 @@ new file mode 100644
 + * =========================================================================
 + */
 +
-+#define ARM_SMMU_GR0_sTLBIALL       0x0060u
-+#define ARM_SMMU_GR0_sTLBGSYNC      0x0070u
-+#define ARM_SMMU_GR0_sTLBGSTATUS    0x0074u
++#define POPLAR_SMMU_ANOC2_FULL_SIZE 0x40000u      /* Full 256 KiB ANOC2 SMMU aperture (GR0 + GR1 + CBs) */
 +#define POPLAR_RMTFS_CARVEOUT_PA    0x93c00000ULL /* pil_video_region@93c00000 (5 MiB unused) */
 +#define POPLAR_RMTFS_CARVEOUT_SIZE  0x00200000ULL /* 2 MiB */
 +#define POPLAR_SMEM_HWLOCK_PA       0x01f43000u   /* TCSR SFPB Mutex #3 */
@@ -3662,11 +3659,13 @@ new file mode 100644
 +#define WLFW_CAP_REQ                0x0024u
 +#define WLFW_BDF_DOWNLOAD_REQ       0x0025u
 +#define WLFW_CAL_REPORT_REQ         0x0026u
++#define WLFW_MSA_READY_IND          0x002bu
 +#define WLFW_PIN_CONNECT_IND        0x002cu
 +#define WLFW_MSA_INFO_REQ           0x002du
 +#define WLFW_MSA_READY_REQ          0x002eu
++#define WLFW_MAC_ADDR_REQ           0x0033u
 +#define WLFW_MSA_READY_IND_ALT1     0x0037u
-+#define WLFW_MSA_READY_IND_ALT2     0x0038u
++#define WLFW_FW_INIT_DONE_IND       0x0038u
 +#define WLFW_CLIENT_ID_KNEL         0x4b4e454cu
 +
 +#define TFTP_OP_RRQ                 1u
@@ -3675,6 +3674,7 @@ new file mode 100644
 +#define TFTP_OP_ACK                 4u
 +#define TFTP_OP_ERROR               5u
 +#define TFTP_OP_OACK                6u
++#define TFTP_MAX_BLKSIZE_CAP        1024u         /* fits MPSS 1152 B reusable GLINK intents */
 +
 +struct qrtr_hdr_v1 {
 +	uint32_t version;
@@ -3702,9 +3702,9 @@ new file mode 100644
 +	bool     in_use;
 +};
 +
-+#define MPSS_MAX_REM_INTENTS 32u
++#define MPSS_MAX_REM_INTENTS 128u
 +#define TFTP_MAX_SESS        8u
-+#define IPCRTR_RXQ_SLOTS     8u
++#define IPCRTR_RXQ_SLOTS     16u
 +
 +struct tftp_session {
 +	bool     active;
@@ -3736,22 +3736,23 @@ new file mode 100644
 +static struct {
 +	vm_offset_t hwlock_va;
 +	vm_offset_t ipc_va;
-+	vm_offset_t unc_va;
-+	vm_offset_t cac_va;
-+	uint32_t    cac_win_off;
-+	uint32_t    cac_win_sz;
-+	uint32_t    descs_off;     /* offset inside unc_va */
++	vm_offset_t part_va;       /* Full p[07] Device-nGnRnE mapping */
++	uint32_t    smp2p_in_off;
++	uint32_t    smp2p_out_off;
++	uint32_t    smp2p_last_state;
++	uint32_t    descs_off;
 +	uint32_t    tx_tail_idx;
 +	uint32_t    tx_head_idx;
 +	uint32_t    rx_tail_idx;
 +	uint32_t    rx_head_idx;
-+	uint32_t    tx_fifo_off;   /* partition offset inside cac_va */
++	uint32_t    tx_fifo_off;
 +	uint32_t    tx_fifo_len;
-+	uint32_t    rx_fifo_off;   /* partition offset inside cac_va */
++	uint32_t    rx_fifo_off;
 +	uint32_t    rx_fifo_len;
 +	bool        bound;
 +	bool        link_up;
 +	bool        glink_reuse;
++	bool        ipcrtr_open_tx;
 +	bool        ipcrtr_rem_open;
 +	bool        ipcrtr_open_acked;
 +	bool        intents_seeded;
@@ -3773,6 +3774,7 @@ new file mode 100644
 +	/* WLFW handshake state */
 +	bool        wlfw_fw_ready;
 +	bool        wlfw_msa_ready_ind;
++	bool        wlfw_fw_init_done;
 +	bool        qmi_resp_ready;
 +	uint16_t    qmi_resp_txn;
 +	uint16_t    qmi_resp_msg;
@@ -3796,7 +3798,7 @@ new file mode 100644
 +static uint8_t s_5b_qmi_tx_buf[2048]  __attribute__((aligned(8)));
 +static uint8_t s_5b_tftp_tx_buf[8192] __attribute__((aligned(8)));
 +static uint8_t s_5b_rmtfs_io_buf[16384] __attribute__((aligned(64)));
-+static uint8_t s_5b_bdf_buf[20480]    __attribute__((aligned(64)));
++static uint8_t s_5b_bdf_buf[24576]    __attribute__((aligned(64)));
 +
 +static inline uint16_t
 +s5b_rd_le16(const uint8_t *p)
@@ -3931,31 +3933,22 @@ new file mode 100644
 +	return len;
 +}
 +
-+static bool
-+s5b_cac_valid_off(uint32_t part_off, uint32_t size)
-+{
-+	return (s5b.cac_va != 0u &&
-+	    part_off >= s5b.cac_win_off &&
-+	    size <= s_smem_p07_sz &&
-+	    part_off <= s_smem_p07_sz - size);
-+}
-+
 +static uint32_t
-+s5b_cac_rd32(uint32_t part_off)
++s5b_part_rd32(uint32_t part_off)
 +{
-+	if (!s5b_cac_valid_off(part_off, 4u)) {
++	if (s5b.part_va == 0u || s_smem_p07_sz < 4u || part_off > s_smem_p07_sz - 4u) {
 +		return 0u;
 +	}
-+	return probe_rd32(s5b.cac_va, part_off - s5b.cac_win_off);
++	return probe_rd32(s5b.part_va, part_off);
 +}
 +
 +static void
-+s5b_cac_wr32(uint32_t part_off, uint32_t val)
++s5b_part_wr32(uint32_t part_off, uint32_t val)
 +{
-+	if (!s5b_cac_valid_off(part_off, 4u)) {
++	if (s5b.part_va == 0u || s_smem_p07_sz < 4u || part_off > s_smem_p07_sz - 4u) {
 +		return;
 +	}
-+	probe_wr32(s5b.cac_va, part_off - s5b.cac_win_off, val);
++	probe_wr32(s5b.part_va, part_off, val);
 +}
 +
 +static bool
@@ -3984,19 +3977,216 @@ new file mode 100644
 +	probe_wr32(s5b.hwlock_va, 0u, 0u);
 +}
 +
-+static void
-+s5b_unc_wr_ascii4(uint32_t part_off, const char *s, unsigned nbytes)
++static bool
++s5b_smem_get_item(uint16_t item, uint32_t *out_off, uint32_t *out_sz)
 +{
++	if (s5b.part_va == 0u || s_smem_p07_sz < 0x40u) {
++		return false;
++	}
++
++	uint32_t free_unc = s5b_part_rd32(0x0cu);
++	uint32_t off = 0x20u;
++	while (off + 16u <= free_unc && off <= s_smem_p07_sz - 16u) {
++		uint32_t w0 = s5b_part_rd32(off);
++		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++		uint16_t it   = (uint16_t)(w0 >> 16);
++		uint32_t sz   = s5b_part_rd32(off + 4u);
++		uint32_t w2   = s5b_part_rd32(off + 8u);
++		uint16_t pdat = (uint16_t)w2;
++		uint16_t phdr = (uint16_t)(w2 >> 16);
++		if ((uint32_t)phdr > s_smem_p07_sz - (off + 16u) ||
++		    sz > s_smem_p07_sz - (off + 16u + (uint32_t)phdr)) {
++			break;
++		}
++		uint32_t poff = off + 16u + (uint32_t)phdr;
++		if (it == item) {
++			if (out_off) *out_off = poff;
++			if (out_sz)  *out_sz  = (pdat < sz) ? (sz - pdat) : sz;
++			return true;
++		}
++		off = poff + sz;
++	}
++
++	uint32_t free_cac = s5b_part_rd32(0x10u);
++	uint32_t cl = (s_smem_p07_cacheline >= 16u) ? s_smem_p07_cacheline : 32u;
++	uint32_t hdr_stride = (16u + cl - 1u) & ~(cl - 1u);
++	if (s_smem_p07_sz < hdr_stride) {
++		return false;
++	}
++	uint32_t ce = s_smem_p07_sz - hdr_stride;
++	while (ce > free_cac && ce + hdr_stride <= s_smem_p07_sz) {
++		uint32_t w0 = s5b_part_rd32(ce);
++		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++			break;
++		}
++		uint16_t it   = (uint16_t)(w0 >> 16);
++		uint32_t sz   = s5b_part_rd32(ce + 4u);
++		uint16_t pdat = (uint16_t)s5b_part_rd32(ce + 8u);
++		if (sz > ce) {
++			break;
++		}
++		uint32_t doff = ce - sz;
++		if (it == item) {
++			if (out_off) *out_off = doff;
++			if (out_sz)  *out_sz  = (pdat < sz) ? (sz - pdat) : sz;
++			return true;
++		}
++		if (doff < hdr_stride) {
++			break;
++		}
++		ce = doff - hdr_stride;
++	}
++	return false;
++}
++
++static bool
++s5b_smem_alloc_unc(uint16_t item, uint32_t payload_sz, uint32_t *out_off)
++{
++	if (s5b_smem_get_item(item, out_off, NULL)) {
++		return true;
++	}
++	if (!s5b_smem_lock()) {
++		return false;
++	}
++	uint32_t free_unc = s5b_part_rd32(0x0cu);
++	uint32_t free_cac = s5b_part_rd32(0x10u);
++	uint32_t asize = (payload_sz + 7u) & ~7u;
++	uint32_t pdat  = asize - payload_sz;
++	if (free_unc > free_cac || asize > free_cac - free_unc || 16u > free_cac - free_unc - asize) {
++		s5b_smem_unlock();
++		return false;
++	}
++	uint32_t e = free_unc;
++	s5b_part_wr32(e + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | ((uint32_t)item << 16));
++	s5b_part_wr32(e + 4u,  asize);
++	s5b_part_wr32(e + 8u,  pdat);
++	s5b_part_wr32(e + 12u, 0u);
++	uint32_t p = e + 16u;
++	for (uint32_t k = 0u; k < asize; k += 4u) {
++		s5b_part_wr32(p + k, 0u);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	s5b_part_wr32(0x0cu, p + asize);
++	s5b_smem_unlock();
++	if (out_off) {
++		*out_off = p;
++	}
++	return true;
++}
++
++static bool
++s5b_smem_alloc_cac(uint16_t item, uint32_t payload_sz, uint32_t *out_off, uint32_t *out_sz)
++{
++	if (s5b_smem_get_item(item, out_off, out_sz)) {
++		return true;
++	}
++	if (!s5b_smem_lock()) {
++		return false;
++	}
++	uint32_t free_unc = s5b_part_rd32(0x0cu);
++	uint32_t free_cac = s5b_part_rd32(0x10u);
++	uint32_t cl = (s_smem_p07_cacheline >= 16u) ? s_smem_p07_cacheline : 32u;
++	uint32_t hdr_stride = (16u + cl - 1u) & ~(cl - 1u);
++	uint32_t asize = (payload_sz + cl - 1u) & ~(cl - 1u);
++	uint32_t pdat  = asize - payload_sz;
++	if (free_cac < hdr_stride + asize || free_cac - hdr_stride - asize <= free_unc + 0x200u) {
++		s5b_smem_unlock();
++		return false;
++	}
++	uint32_t new_hdr  = free_cac - hdr_stride;
++	uint32_t new_data = new_hdr - asize;
++	for (uint32_t k = 0u; k < asize; k += 4u) {
++		s5b_part_wr32(new_data + k, 0u);
++	}
++	uint32_t pad_hdr = hdr_stride - 16u;
++	s5b_part_wr32(new_hdr + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | ((uint32_t)item << 16));
++	s5b_part_wr32(new_hdr + 4u,  asize);
++	s5b_part_wr32(new_hdr + 8u,  pdat | (pad_hdr << 16));
++	s5b_part_wr32(new_hdr + 12u, 0u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	s5b_part_wr32(0x10u, new_data);
++	s5b_smem_unlock();
++	if (out_off) *out_off = new_data;
++	if (out_sz)  *out_sz  = payload_sz;
++	return true;
++}
++
++static void
++s5b_part_wr_ascii4(uint32_t part_off, const char *s, unsigned nbytes)
++{
++	bool ended = false;
 +	for (unsigned k = 0u; k < nbytes; k += 4u) {
 +		uint32_t w = 0u;
 +		for (unsigned b = 0u; b < 4u && (k + b) < nbytes; b++) {
-+			uint8_t ch = (uint8_t)s[k + b];
-+			w |= ((uint32_t)ch << (b * 8u));
-+			if (ch == '\0') {
-+				break;
++			if (!ended) {
++				uint8_t ch = (uint8_t)s[k + b];
++				w |= ((uint32_t)ch << (b * 8u));
++				if (ch == '\0') {
++					ended = true;
++				}
 +			}
 +		}
-+		probe_wr32(s5b.unc_va, part_off + k, w);
++		s5b_part_wr32(part_off + k, w);
++	}
++}
++
++static void
++s5b_smp2p_kick(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_SMP2P_MASK);
++}
++
++static void
++s5b_smp2p_service(void)
++{
++	if (s5b.smp2p_in_off == 0u) {
++		(void)s5b_smem_get_item(SMEM_SMP2P_IN_MODEM_ID, &s5b.smp2p_in_off, NULL);
++		if (s5b.smp2p_in_off == 0u) {
++			return;
++		}
++	}
++	if (s5b.smp2p_out_off != 0u) {
++		uint32_t in_flags  = s5b_part_rd32(s5b.smp2p_in_off + 16u);
++		uint32_t want_ack  = (in_flags & 1u) ? 2u : 0u;
++		uint32_t out_flags = s5b_part_rd32(s5b.smp2p_out_off + 16u);
++		if ((out_flags & 2u) != want_ack) {
++			s5b_part_wr32(s5b.smp2p_out_off + 16u, (out_flags & ~2u) | want_ack);
++			s5b_smp2p_kick();
++			printf("WIFI PROBE: [5B.2] SMP2P restart %s (in_flags=0x%x)\n",
++			    want_ack ? "acked" : "ack cleared", in_flags);
++		}
++	}
++	uint32_t valid_e = s5b_part_rd32(s5b.smp2p_in_off + 12u) >> 16;
++	if (valid_e > 16u) {
++		valid_e = 16u;
++	}
++	for (uint32_t e = 0u; e < valid_e; e++) {
++		uint32_t eoff = s5b.smp2p_in_off + 20u + e * 20u;
++		char ename[17];
++		for (uint32_t k = 0u; k < 4u; k++) {
++			uint32_t cw = s5b_part_rd32(eoff + k * 4u);
++			ename[k * 4u + 0u] = (char)(cw & 0xffu);
++			ename[k * 4u + 1u] = (char)((cw >> 8) & 0xffu);
++			ename[k * 4u + 2u] = (char)((cw >> 16) & 0xffu);
++			ename[k * 4u + 3u] = (char)((cw >> 24) & 0xffu);
++		}
++		ename[16] = '\0';
++		if (strcmp(ename, "slave-kernel") == 0) {
++			uint32_t v = s5b_part_rd32(eoff + 16u);
++			if (v != s5b.smp2p_last_state) {
++				s5b.smp2p_last_state = v;
++				printf("WIFI PROBE: [5B.2] SMP2P slave-kernel state=0x%x%s%s%s%s\n",
++				    v,
++				    (v & 1u) ? " ERR-FATAL" : "",
++				    (v & 2u) ? " ready" : "",
++				    (v & 4u) ? " handover" : "",
++				    (v & 8u) ? " stop-ack" : "");
++			}
++			break;
++		}
 +	}
 +}
 +
@@ -4010,19 +4200,19 @@ new file mode 100644
 +static uint32_t
 +s5b_fifo_avail_rx(void)
 +{
-+	uint32_t head = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_head_idx * 4u);
-+	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	uint32_t head = s5b_part_rd32(s5b.descs_off + s5b.rx_head_idx * 4u);
++	uint32_t tail = s5b_part_rd32(s5b.descs_off + s5b.rx_tail_idx * 4u);
 +	return (head >= tail) ? (head - tail) : (s5b.rx_fifo_len - tail + head);
 +}
 +
 +static void
 +s5b_fifo_peek_bytes(uint32_t off, uint8_t *dst, uint32_t n)
 +{
-+	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	uint32_t tail = s5b_part_rd32(s5b.descs_off + s5b.rx_tail_idx * 4u);
 +	uint32_t pos = (tail + off) % s5b.rx_fifo_len;
 +	uint32_t i = 0u;
 +	while (i < n) {
-+		uint32_t w = s5b_cac_rd32(s5b.rx_fifo_off + (pos & ~3u));
++		uint32_t w = s5b_part_rd32(s5b.rx_fifo_off + (pos & ~3u));
 +		uint32_t shift = (pos & 3u) * 8u;
 +		dst[i] = (uint8_t)((w >> shift) & 0xffu);
 +		i++;
@@ -4036,9 +4226,9 @@ new file mode 100644
 +static void
 +s5b_fifo_advance_rx(uint32_t n)
 +{
-+	uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u);
++	uint32_t tail = s5b_part_rd32(s5b.descs_off + s5b.rx_tail_idx * 4u);
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	probe_wr32(s5b.unc_va, s5b.descs_off + s5b.rx_tail_idx * 4u,
++	s5b_part_wr32(s5b.descs_off + s5b.rx_tail_idx * 4u,
 +	    (tail + n) % s5b.rx_fifo_len);
 +}
 +
@@ -4055,10 +4245,10 @@ new file mode 100644
 +		return false;
 +	}
 +	for (unsigned tries = 0u;; tries++) {
-+		uint32_t head = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u);
-+		uint32_t tail = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_tail_idx * 4u);
++		uint32_t head = s5b_part_rd32(s5b.descs_off + s5b.tx_head_idx * 4u);
++		uint32_t tail = s5b_part_rd32(s5b.descs_off + s5b.tx_tail_idx * 4u);
 +		uint32_t avail = (tail <= head) ? (s5b.tx_fifo_len - head + tail) : (tail - head);
-+		if (avail > total) {
++		if (avail > total + 16u) {
 +			break;
 +		}
 +		if (tries == 200u) {
@@ -4069,7 +4259,7 @@ new file mode 100644
 +		delay(1000);
 +	}
 +
-+	uint32_t pos = probe_rd32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u);
++	uint32_t pos = s5b_part_rd32(s5b.descs_off + s5b.tx_head_idx * 4u);
 +	for (uint32_t i = 0u; i < total; i += 4u) {
 +		uint32_t w = 0u;
 +		for (uint32_t b = 0u; b < 4u; b++) {
@@ -4077,14 +4267,14 @@ new file mode 100644
 +				w |= ((uint32_t)buf[i + b] << (b * 8u));
 +			}
 +		}
-+		s5b_cac_wr32(s5b.tx_fifo_off + pos, w);
++		s5b_part_wr32(s5b.tx_fifo_off + pos, w);
 +		pos += 4u;
 +		if (pos >= s5b.tx_fifo_len) {
 +			pos = 0u;
 +		}
 +	}
 +	__asm__ volatile("dsb sy" ::: "memory");
-+	probe_wr32(s5b.unc_va, s5b.descs_off + s5b.tx_head_idx * 4u, pos);
++	s5b_part_wr32(s5b.descs_off + s5b.tx_head_idx * 4u, pos);
 +	s5b_glink_kick();
 +	return true;
 +}
@@ -4112,6 +4302,7 @@ new file mode 100644
 +	s5b_wr_le16(msg + 2, lcid);
 +	s5b_wr_le32(msg + 4, slen);
 +	memcpy(msg + 8, name, slen);
++	s5b.ipcrtr_open_tx = true;
 +	return s5b_glink_send_raw(msg, 8u + slen);
 +}
 +
@@ -4136,6 +4327,21 @@ new file mode 100644
 +static void s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len);
 +static bool s5b_glink_rx_step(void);
 +
++static int
++s5b_glink_find_rem_intent(uint32_t len)
++{
++	int best = -1;
++	for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
++		if (s5b.rem_intents[i].valid && !s5b.rem_intents[i].in_use &&
++		    s5b.rem_intents[i].size >= len) {
++			if (best < 0 || s5b.rem_intents[i].size < s5b.rem_intents[best].size) {
++				best = (int)i;
++			}
++		}
++	}
++	return best;
++}
++
 +static bool
 +s5b_glink_tx_data(const uint8_t *payload, uint32_t len)
 +{
@@ -4143,29 +4349,18 @@ new file mode 100644
 +		return false;
 +	}
 +
-+	int slot = -1;
-+	for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
-+		if (s5b.rem_intents[i].valid && !s5b.rem_intents[i].in_use &&
-+		    s5b.rem_intents[i].size >= len) {
-+			slot = (int)i;
-+			break;
-+		}
-+	}
-+
++	int slot = s5b_glink_find_rem_intent(len);
 +	if (slot < 0) {
-+		(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ, 1u, len);
 +		bool prev_wait = s5b.in_intent_wait;
 +		s5b.in_intent_wait = true;
-+		for (unsigned ms = 0u; ms < 500u && slot < 0; ms++) {
++		for (unsigned ms = 0u; ms < 3000u && slot < 0; ms++) {
++			if (ms == 0u || ms == 500u || ms == 1500u) {
++				(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ, 1u, len);
++			}
++			s5b_smp2p_service();
 +			while (s5b_glink_rx_step()) {
 +			}
-+			for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
-+				if (s5b.rem_intents[i].valid && !s5b.rem_intents[i].in_use &&
-+				    s5b.rem_intents[i].size >= len) {
-+					slot = (int)i;
-+					break;
-+				}
-+			}
++			slot = s5b_glink_find_rem_intent(len);
 +			if (slot < 0) {
 +				delay(1000);
 +			}
@@ -4210,6 +4405,9 @@ new file mode 100644
 +		if (p1 >= 1u) {
 +			s5b.glink_reuse = (p2 & 1u) != 0u;
 +			(void)s5b_glink_send_cmd(GLINK_CMD_VERSION_ACK, 1u, p2 & 1u);
++			if (!s5b.link_up) {
++				(void)s5b_glink_send_cmd(GLINK_CMD_VERSION, 1u, 1u);
++			}
 +		}
 +		break;
 +
@@ -4217,8 +4415,8 @@ new file mode 100644
 +		s5b_fifo_advance_rx(8u);
 +		if (p1 == 1u) {
 +			s5b.glink_reuse = (p2 & 1u) != 0u;
-+			if (!s5b.link_up) {
-+				s5b.link_up = true;
++			s5b.link_up = true;
++			if (!s5b.ipcrtr_open_tx) {
 +				(void)s5b_glink_send_open(1u, "IPCRTR");
 +			}
 +		}
@@ -4235,16 +4433,19 @@ new file mode 100644
 +		s5b_fifo_peek_bytes(8u, (uint8_t *)cname, clen);
 +		cname[clen] = '\0';
 +		s5b_fifo_advance_rx(frame_len);
++		(void)s5b_glink_send_cmd(GLINK_CMD_OPEN_ACK, p1, 0u);
 +		if (strcmp(cname, "IPCRTR") == 0) {
 +			s5b.ipcrtr_rcid = p1;
 +			s5b.ipcrtr_rem_open = true;
-+			(void)s5b_glink_send_cmd(GLINK_CMD_OPEN_ACK, p1, 0u);
++			if (!s5b.ipcrtr_open_tx) {
++				(void)s5b_glink_send_open(1u, "IPCRTR");
++			}
 +			if (s5b.ipcrtr_open_acked && !s5b.intents_seeded) {
 +				s5b.intents_seeded = true;
 +				s5b_glink_seed_intents(8u, 8192u);
 +			}
 +		} else {
-+			printf("WIFI PROBE: [5B.2] GLINK remote open '%s' (rcid=%u) ignored\n",
++			printf("WIFI PROBE: [5B.2] GLINK remote open '%s' (rcid=%u) acked\n",
 +			    cname, p1);
 +		}
 +		break;
@@ -4254,7 +4455,7 @@ new file mode 100644
 +		s5b_fifo_advance_rx(8u);
 +		if (p1 == 1u) {
 +			s5b.ipcrtr_open_acked = true;
-+			if (s5b.ipcrtr_rem_open && !s5b.intents_seeded) {
++			if (!s5b.intents_seeded) {
 +				s5b.intents_seeded = true;
 +				s5b_glink_seed_intents(8u, 8192u);
 +			}
@@ -4274,7 +4475,7 @@ new file mode 100644
 +		break;
 +
 +	case GLINK_CMD_INTENT: {
-+		if (p2 > 64u) {
++		if (p2 > 128u) {
 +			s5b_fifo_advance_rx(8u);
 +			break;
 +		}
@@ -4285,7 +4486,7 @@ new file mode 100644
 +		for (uint32_t k = 0u; k < p2; k++) {
 +			uint8_t ib[8];
 +			s5b_fifo_peek_bytes(8u + k * 8u, ib, 8u);
-+			if (p1 == s5b.ipcrtr_rcid) {
++			if (p1 == s5b.ipcrtr_rcid && s5b.ipcrtr_rem_open) {
 +				uint32_t sz  = s5b_rd_le32(ib + 0);
 +				uint32_t iid = s5b_rd_le32(ib + 4);
 +				for (unsigned s = 0u; s < MPSS_MAX_REM_INTENTS; s++) {
@@ -4327,6 +4528,8 @@ new file mode 100644
 +			uint32_t grant_sz = (p2 > 8192u) ? 8192u : ((p2 < 2048u) ? 2048u : p2);
 +			s5b_glink_seed_intents(1u, grant_sz);
 +			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 1u, 1u);
++		} else {
++			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 0u, 0u);
 +		}
 +		break;
 +
@@ -4406,6 +4609,7 @@ new file mode 100644
 +static void
 +s5b_pump_all(void)
 +{
++	s5b_smp2p_service();
 +	while (s5b_glink_rx_step()) {
 +	}
 +	while (!s5b.in_intent_wait && s5b.rxq_tail != s5b.rxq_head) {
@@ -4540,14 +4744,25 @@ new file mode 100644
 +s5b_handle_servreg_qmi(uint32_t local_port, uint32_t src_node, uint32_t src_port,
 +    uint16_t txn, uint16_t msg_id, const uint8_t *sdu, uint32_t sdu_len)
 +{
-+	uint8_t resp[256];
++	uint8_t resp[384];
 +	uint32_t roff = 0u;
 +
 +	if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_REQ */
++		static const struct {
++			const char *service;
++			const char *domain;
++			uint32_t    instance;
++		} sr_db[] = {
++			{ "tms/servreg",       "msm/modem/root_pd", 180u },
++			{ "gps/gps_service",   "msm/modem/root_pd", 180u },
++			{ "kernel/elf_loader", "msm/modem/wlan_pd", 180u },
++			{ "tms/servreg",       "msm/modem/wlan_pd", 180u },
++			{ "wlan/fw",           "msm/modem/wlan_pd", 180u },
++		};
 +		uint16_t slen = 0u, olen = 0u;
 +		const uint8_t *sv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &slen);
 +		const uint8_t *ov = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &olen);
-+		char svc_name[72];
++		char svc_name[80];
 +		memset(svc_name, 0, sizeof(svc_name));
 +		if (sv && slen > 0u) {
 +			uint32_t copy_n = (slen < sizeof(svc_name) - 1u) ? slen : (uint32_t)(sizeof(svc_name) - 1u);
@@ -4555,11 +4770,25 @@ new file mode 100644
 +		}
 +		uint32_t dom_off = (ov && olen >= 4u) ? s5b_rd_le32(ov) : 0u;
 +
-+		bool has_root = s5b_str_contains(svc_name, "servreg") || s5b_str_contains(svc_name, "pdr_enabled");
-+		bool has_wlan = s5b_str_contains(svc_name, "servreg") || s5b_str_contains(svc_name, "wlan") ||
-+		                s5b_str_contains(svc_name, "elf_loader");
-+
-+		uint16_t total = (uint16_t)((has_root ? 1u : 0u) + (has_wlan ? 1u : 0u));
++		uint8_t list_buf[256];
++		uint32_t loff = 1u;
++		uint16_t total = 0u;
++		uint8_t cnt = 0u;
++		for (unsigned i = 0u; i < sizeof(sr_db) / sizeof(sr_db[0]); i++) {
++			if (strcmp(sr_db[i].service, svc_name) != 0) {
++				continue;
++			}
++			if (total++ < dom_off) {
++				continue;
++			}
++			uint32_t need = 1u + sweet_str_len(sr_db[i].domain) + 4u + 1u + 4u;
++			if (loff + need <= sizeof(list_buf)) {
++				loff = s5b_servreg_append_entry(list_buf, loff,
++				    sr_db[i].domain, sr_db[i].instance);
++				cnt++;
++			}
++		}
++		list_buf[0] = cnt;
 +		printf("WIFI PROBE: [5B.3] SERVREG_LOC(port=%u) GET_DOMAIN_LIST svc='%s' off=%u -> total=%u\n",
 +		    local_port, svc_name, dom_off, total);
 +
@@ -4569,29 +4798,24 @@ new file mode 100644
 +		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 2u, u16buf);
 +		s5b_wr_le16(u16buf, 1u); /* db_rev_count */
 +		roff = s5b_qmi_put_tlv(resp, roff, 0x11u, 2u, u16buf);
-+
-+		if (total > 0u && dom_off < total) {
-+			uint8_t list_buf[160];
-+			uint32_t loff = 1u;
-+			uint8_t cnt = 0u;
-+			if (has_root && dom_off == 0u) {
-+				loff = s5b_servreg_append_entry(list_buf, loff, "msm/modem/root_pd", 180u);
-+				cnt++;
-+			}
-+			if (has_wlan) {
-+				loff = s5b_servreg_append_entry(list_buf, loff, "msm/modem/wlan_pd", 180u);
-+				cnt++;
-+			}
-+			list_buf[0] = cnt;
-+			roff = s5b_qmi_put_tlv(resp, roff, 0x12u, (uint16_t)loff, list_buf);
-+		}
-+		s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
-+		    resp, (uint16_t)roff);
-+	} else {
++		roff = s5b_qmi_put_tlv(resp, roff, 0x12u, (uint16_t)loff, list_buf);
++	} else if (msg_id == 0x0024u) { /* QMI_SERVREG_LOC_PFR_REQ */
++		uint16_t l1 = 0u, l2 = 0u;
++		const uint8_t *svc = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &l1);
++		const uint8_t *why = s5b_qmi_find_tlv(sdu, sdu_len, 0x02u, &l2);
++		char s_svc[48], s_why[128];
++		memset(s_svc, 0, sizeof(s_svc));
++		memset(s_why, 0, sizeof(s_why));
++		if (svc && l1 > 0u) memcpy(s_svc, svc, (l1 < sizeof(s_svc) - 1u) ? l1 : sizeof(s_svc) - 1u);
++		if (why && l2 > 0u) memcpy(s_why, why, (l2 < sizeof(s_why) - 1u) ? l2 : sizeof(s_why) - 1u);
++		printf("WIFI PROBE: [5B.3] SERVREG PD FAILURE '%s': %s\n", s_svc, s_why);
 +		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
-+		s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
-+		    resp, (uint16_t)roff);
++	} else {
++		printf("WIFI PROBE: [5B.3] SERVREG_LOC unsupported msg=0x%04x\n", msg_id);
++		roff = s5b_qmi_put_result(resp, roff, 1u, 0x47u);
 +	}
++	s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, local_port, src_node, src_port,
++	    resp, (uint16_t)roff);
 +}
 +
 +static const char *
@@ -4610,7 +4834,7 @@ new file mode 100644
 +s5b_handle_rmtfs_qmi(uint32_t src_node, uint32_t src_port,
 +    uint16_t txn, uint16_t msg_id, const uint8_t *sdu, uint32_t sdu_len)
 +{
-+	uint8_t resp[64];
++	uint8_t resp[96];
 +	uint32_t roff = 0u;
 +
 +	if (msg_id == 0x0001u) { /* OPEN_REQ */
@@ -4630,7 +4854,7 @@ new file mode 100644
 +
 +		printf("WIFI PROBE: [5B.3] RMTFS OPEN '%s' -> caller_id=%u\n", path, cid);
 +		if (cid == 0u) {
-+			roff = s5b_qmi_put_result(resp, roff, 1u, 1u);
++			roff = s5b_qmi_put_result(resp, roff, 1u, 3u);
 +		} else {
 +			uint8_t cid_le[4];
 +			s5b.rmtfs_caller_id[cid] = cid;
@@ -4638,11 +4862,24 @@ new file mode 100644
 +			roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
 +			roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 4u, cid_le);
 +		}
-+	} else if (msg_id == 0x0004u) { /* ALLOC_BUFF_REQ */
-+		uint8_t addr_le[8];
-+		s5b_wr_le64(addr_le, POPLAR_RMTFS_CARVEOUT_PA);
++	} else if (msg_id == 0x0002u) { /* CLOSE_REQ */
++		uint16_t cl = 0u;
++		const uint8_t *cv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &cl);
++		uint32_t cid = (cv && cl >= 4u) ? s5b_rd_le32(cv) : 0u;
++		printf("WIFI PROBE: [5B.3] RMTFS CLOSE caller_id=%u\n", cid);
 +		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
-+		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 8u, addr_le);
++	} else if (msg_id == 0x0004u) { /* ALLOC_BUFF_REQ */
++		uint16_t sl = 0u;
++		const uint8_t *sv = s5b_qmi_find_tlv(sdu, sdu_len, 0x02u, &sl);
++		uint32_t req_sz = (sv && sl >= 4u) ? s5b_rd_le32(sv) : 0u;
++		if (req_sz <= POPLAR_RMTFS_CARVEOUT_SIZE) {
++			uint8_t addr_le[8];
++			s5b_wr_le64(addr_le, POPLAR_RMTFS_CARVEOUT_PA);
++			roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++			roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 8u, addr_le);
++		} else {
++			roff = s5b_qmi_put_result(resp, roff, 1u, 3u);
++		}
 +	} else if (msg_id == 0x0003u) { /* RW_IOVEC_REQ */
 +		uint16_t cl = 0u, dl = 0u, il = 0u;
 +		const uint8_t *cv = s5b_qmi_find_tlv(sdu, sdu_len, 0x01u, &cl);
@@ -4651,19 +4888,22 @@ new file mode 100644
 +		uint32_t cid = (cv && cl >= 4u) ? s5b_rd_le32(cv) : 0u;
 +		uint8_t dir = (dv && dl >= 1u) ? dv[0] : 1u;
 +		const char *part = s5b_rmtfs_part_from_caller(cid);
-+		int rw_err = 0;
++		int rw_err = (part == NULL) ? EINVAL : 0;
 +
 +		if (part != NULL && dir == 0u && iv && il >= 1u) {
-+			uint8_t nent = iv[0];
-+			if ((uint32_t)nent * 12u <= il - 1u) {
++			uint32_t hdr = ((il % 12u) == 1u) ? 1u : (((il % 12u) == 2u) ? 2u : 4u);
++			uint32_t nent = (il >= hdr) ? ((uint32_t)(il - hdr) / 12u) : 0u;
++			if (nent > 0u && hdr + nent * 12u <= il) {
 +				vm_offset_t rmt_va = ml_io_map_unmappable(POPLAR_RMTFS_CARVEOUT_PA,
 +				    POPLAR_RMTFS_CARVEOUT_SIZE, SWEET_VM_WIMG_WCOMB);
 +				if (rmt_va) {
-+					for (uint8_t e = 0u; e < nent; e++) {
-+						const uint8_t *ev = iv + 1u + (uint32_t)e * 12u;
++					for (uint32_t e = 0u; e < nent; e++) {
++						const uint8_t *ev = iv + hdr + e * 12u;
 +						uint32_t sec_addr = s5b_rd_le32(ev + 0);
-+						uint32_t phys_off = s5b_rd_le32(ev + 4);
++						uint32_t phys_raw = s5b_rd_le32(ev + 4);
 +						uint32_t nsec     = s5b_rd_le32(ev + 8);
++						uint32_t phys_off = (phys_raw >= (uint32_t)POPLAR_RMTFS_CARVEOUT_PA) ?
++						    (phys_raw - (uint32_t)POPLAR_RMTFS_CARVEOUT_PA) : phys_raw;
 +						uint64_t bytes    = (uint64_t)nsec * 512ULL;
 +						if (phys_off > POPLAR_RMTFS_CARVEOUT_SIZE ||
 +						    bytes > POPLAR_RMTFS_CARVEOUT_SIZE - phys_off) {
@@ -4690,6 +4930,8 @@ new file mode 100644
 +							done += chunk;
 +						}
 +						sweet_dcache_clean_poc(rmt_va + phys_off, (size_t)bytes);
++						printf("WIFI PROBE: [5B.3] RMTFS READ '%s' sec=%u+%u -> err=%d\n",
++						    part, sec_addr, nsec, rw_err);
 +						if (rw_err != 0) {
 +							break;
 +						}
@@ -4699,33 +4941,20 @@ new file mode 100644
 +					rw_err = EIO;
 +				}
 +			}
-+			printf("WIFI PROBE: [5B.3] RMTFS READ '%s' -> err=%d\n", part, rw_err);
 +		} else if (dir != 0u) {
 +			printf("WIFI PROBE: [5B.3] RMTFS WRITE cid=%u ignored (read-only mode)\n", cid);
 +		}
-+		roff = s5b_qmi_put_result(resp, roff, rw_err == 0 ? 0u : 1u, rw_err == 0 ? 0u : 1u);
++		roff = s5b_qmi_put_result(resp, roff, rw_err == 0 ? 0u : 1u, rw_err == 0 ? 0u : 3u);
 +	} else if (msg_id == 0x0005u) { /* GET_DEV_ERROR_REQ */
-+		uint8_t zero[4] = { 0, 0, 0, 0 };
++		uint8_t zero = 0u;
 +		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
-+		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 4u, zero);
++		roff = s5b_qmi_put_tlv(resp, roff, 0x10u, 1u, &zero);
 +	} else {
-+		roff = s5b_qmi_put_result(resp, roff, 0u, 0u);
++		roff = s5b_qmi_put_result(resp, roff, 1u, 0x47u);
 +	}
 +
 +	s5b_qmi_send_sdu(QMI_MSG_RESPONSE, txn, msg_id, QRTR_LOCAL_PORT_RMTFS,
 +	    src_node, src_port, resp, (uint16_t)roff);
-+}
-+
-+static uint32_t
-+s5b_max_rem_intent_size(void)
-+{
-+	uint32_t best = 0u;
-+	for (unsigned i = 0u; i < MPSS_MAX_REM_INTENTS; i++) {
-+		if (s5b.rem_intents[i].valid && s5b.rem_intents[i].size > best) {
-+			best = s5b.rem_intents[i].size;
-+		}
-+	}
-+	return (best > 0u) ? best : 2048u;
 +}
 +
 +static void
@@ -4919,9 +5148,7 @@ new file mode 100644
 +			uint32_t v = s5b_parse_dec(opts[k].val, &ok);
 +			if (!ok) continue;
 +			if (s5b_str_eq_ci(opts[k].key, "blksize")) {
-+				uint32_t max_blk = s5b_max_rem_intent_size();
-+				max_blk = (max_blk > 64u) ? (max_blk - 64u) : 512u;
-+				if (max_blk > 4096u) max_blk = 4096u;
++				uint32_t max_blk = TFTP_MAX_BLKSIZE_CAP;
 +				if (v < 1u) v = 1u;
 +				if (v > max_blk) v = max_blk;
 +				sess->blksize = v;
@@ -5041,9 +5268,12 @@ new file mode 100644
 +		if (msg_id == WLFW_FW_READY_IND) {
 +			s5b.wlfw_fw_ready = true;
 +			printf("WIFI PROBE: [5B.4] *** WCN3990 WLAN FIRMWARE READY (QMI_WLFW_FW_READY_IND 0x0021)! ***\n");
-+		} else if (msg_id == WLFW_MSA_READY_IND_ALT1 || msg_id == WLFW_MSA_READY_IND_ALT2) {
++		} else if (msg_id == WLFW_MSA_READY_IND || msg_id == WLFW_MSA_READY_IND_ALT1) {
 +			s5b.wlfw_msa_ready_ind = true;
 +			printf("WIFI PROBE: [5B.4] WLFW MSA_READY_IND (0x%04x) received.\n", msg_id);
++		} else if (msg_id == WLFW_FW_INIT_DONE_IND) {
++			s5b.wlfw_fw_init_done = true;
++			printf("WIFI PROBE: [5B.4] WLFW FW_INIT_DONE_IND (0x%04x) received.\n", msg_id);
 +		} else if (msg_id == WLFW_PIN_CONNECT_IND) {
 +			uint16_t l0 = 0u, l1 = 0u, l2 = 0u;
 +			const uint8_t *v0 = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &l0);
@@ -5191,60 +5421,101 @@ new file mode 100644
 +static void
 +s5b_anoc2_smmu_bypass(void)
 +{
-+	vm_offset_t smmu = ml_io_map(POPLAR_SMMU_ANOC2_PA, POPLAR_SMMU_ANOC2_SIZE);
++	vm_offset_t smmu = ml_io_map(POPLAR_SMMU_ANOC2_PA, POPLAR_SMMU_ANOC2_FULL_SIZE);
 +	if (!smmu) {
 +		printf("WIFI PROBE: [5B.1] ERROR: failed to map ANOC2 SMMU\n");
 +		return;
 +	}
 +	uint32_t idr0 = probe_rd32(smmu, ARM_SMMU_GR0_IDR0);
++	uint32_t idr1 = probe_rd32(smmu, ARM_SMMU_GR0_IDR1);
 +	uint32_t num_smr = idr0 & SMMU_IDR0_NUMSMRG_MASK;
-+	if (num_smr > 64u) {
-+		num_smr = 64u;
-+	}
++	uint32_t num_cb  = idr1 & SMMU_IDR1_NUMCB_MASK;
++	uint32_t psize   = (idr1 & SMMU_IDR1_PAGESIZE) ? 0x10000u : 0x1000u;
++	uint32_t npage   = 1u << (((idr1 >> 28) & 7u) + 1u);
++	if (num_smr > 64u) num_smr = 64u;
++	if (num_cb > 64u)  num_cb  = 64u;
 +
 +	uint32_t sids[2] = { WLAN_STREAM_ID_PRIMARY, WLAN_STREAM_ID_SECONDARY };
 +	const char *names[2] = { "CE", "MSA" };
-+	bool changed = false;
++	int smr_slot[2] = { -1, -1 };
++	bool smr_existing[2] = { false, false };
++	uint64_t used_cb = 0u;
 +
-+	for (unsigned t = 0u; t < 2u; t++) {
-+		bool found = false;
-+		int free_slot = -1;
-+		for (uint32_t i = 0u; i < num_smr; i++) {
-+			uint32_t smr = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + i * 4u);
-+			if ((smr & SMMU_SMR_VALID) != 0u) {
-+				uint32_t id = smr & SMMU_SMR_ID_MASK;
-+				uint32_t mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
-+				if (((sids[t] ^ id) & ~mask) == 0u) {
-+					found = true;
-+					uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
-+					printf("WIFI PROBE: [5B.1] ANOC2 %s SID=0x%04x already in SMR[%02u] S2CR=0x%08x\n",
-+					    names[t], sids[t], i, s2cr);
-+					break;
-+				}
-+			} else if (free_slot < 0) {
-+				free_slot = (int)i;
++	for (uint32_t i = 0u; i < num_smr; i++) {
++		uint32_t smr  = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + i * 4u);
++		uint32_t s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + i * 4u);
++		if ((smr & SMMU_SMR_VALID) == 0u) {
++			if (smr_slot[0] < 0) {
++				smr_slot[0] = (int)i;
++			} else if (smr_slot[1] < 0) {
++				smr_slot[1] = (int)i;
 +			}
++			continue;
 +		}
-+		if (!found && free_slot >= 0) {
-+			uint32_t s = (uint32_t)free_slot;
-+			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u, (2u << 16) | 0xffu);
-+			probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE  + s * 4u, SMMU_SMR_VALID | sids[t]);
-+			probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u, (1u << 16));
-+			uint32_t s2 = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u);
-+			printf("WIFI PROBE: [5B.1] Programmed ANOC2 %s SID=0x%04x -> SMR[%02u] BYPASS S2CR=0x%08x\n",
-+			    names[t], sids[t], s, s2);
-+			changed = true;
++		if (((s2cr >> 16) & 3u) == 0u) {
++			used_cb |= (1ULL << (s2cr & 0x3fu));
++		}
++		uint32_t id = smr & SMMU_SMR_ID_MASK;
++		uint32_t mask = (smr >> SMMU_SMR_MASK_SHIFT) & SMMU_SMR_MASK_MASK;
++		for (unsigned t = 0u; t < 2u; t++) {
++			if (((sids[t] ^ id) & ~mask) == 0u) {
++				smr_slot[t] = (int)i;
++				smr_existing[t] = true;
++			}
 +		}
 +	}
-+	if (changed) {
-+		probe_wr32(smmu, ARM_SMMU_GR0_sTLBIALL, 0u);
-+		probe_wr32(smmu, ARM_SMMU_GR0_sTLBGSYNC, 0u);
-+		for (unsigned i = 0u; i < 200u; i++) {
-+			if ((probe_rd32(smmu, ARM_SMMU_GR0_sTLBGSTATUS) & 1u) == 0u) {
-+				break;
-+			}
-+			delay(5);
++
++	uint32_t gr1_off = psize;
++	uint64_t cb_base_off = (uint64_t)npage * psize;
++	int cb = -1;
++	for (uint32_t c = 0u; c < num_cb; c++) {
++		uint64_t cbp_off = cb_base_off + (uint64_t)c * psize;
++		if (cbp_off + psize > POPLAR_SMMU_ANOC2_FULL_SIZE) {
++			break;
 +		}
++		if ((used_cb & (1ULL << c)) == 0u &&
++		    (probe_rd32(smmu, (uint32_t)cbp_off) & 1u) == 0u &&
++		    probe_rd32(smmu, gr1_off + 4u * c) == 0u) {
++			cb = (int)c;
++			break;
++		}
++	}
++
++	if (cb < 0 || smr_slot[0] < 0 || smr_slot[1] < 0) {
++		printf("WIFI PROBE: [5B.1] ERROR: no free ANOC2 CB (%d) or SMR slots (%d, %d)\n",
++		    cb, smr_slot[0], smr_slot[1]);
++		return;
++	}
++
++	/* Configure free Context Bank cb for S1-bypass (SCTLR.M=0) without Secure GR0 TLB writes */
++	uint32_t cbo = (uint32_t)cb_base_off + (uint32_t)cb * psize;
++	probe_wr32(smmu, cbo + 0x58u, 0xffffffffu); /* FSR clear */
++	probe_wr32(smmu, cbo + 0x20u, 0u);          /* TTBR0_L */
++	probe_wr32(smmu, cbo + 0x24u, 0u);          /* TTBR0_H */
++	probe_wr32(smmu, cbo + 0x30u, 0u);          /* TCR */
++	probe_wr32(smmu, cbo + 0x10u, 0u);          /* TCR2 */
++	probe_wr32(smmu, cbo + 0x38u, 0u);          /* MAIR0 */
++	probe_wr32(smmu, cbo + 0x3cu, 0u);          /* MAIR1 */
++	probe_wr32(smmu, gr1_off + 0x800u + 4u * (uint32_t)cb, 0x00000001u); /* CBA2R: AArch64 */
++	probe_wr32(smmu, gr1_off + 4u * (uint32_t)cb, 0x0001f000u);          /* CBAR: S1 trans, S2 bypass */
++	probe_wr32(smmu, cbo + 0x00u, 0x000000a0u);                          /* SCTLR: CFCFG|CFRE, M=0, CFIE=0 */
++
++	uint32_t r_cba2r = probe_rd32(smmu, gr1_off + 0x800u + 4u * (uint32_t)cb);
++	uint32_t r_cbar  = probe_rd32(smmu, gr1_off + 4u * (uint32_t)cb);
++	uint32_t r_sctlr = probe_rd32(smmu, cbo + 0x00u);
++	printf("WIFI PROBE: [5B.1] ANOC2 CB[%d] @ +0x%05x: CBAR=0x%08x CBA2R=0x%08x SCTLR=0x%08x\n",
++	    cb, cbo, r_cbar, r_cba2r, r_sctlr);
++
++	for (unsigned t = 0u; t < 2u; t++) {
++		uint32_t s = (uint32_t)smr_slot[t];
++		probe_wr32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u, (uint32_t)cb); /* TYPE=0 TRANS -> cb */
++		if (!smr_existing[t]) {
++			probe_wr32(smmu, ARM_SMMU_GR0_SMR_BASE + s * 4u, SMMU_SMR_VALID | sids[t]);
++		}
++		uint32_t r_smr  = probe_rd32(smmu, ARM_SMMU_GR0_SMR_BASE + s * 4u);
++		uint32_t r_s2cr = probe_rd32(smmu, ARM_SMMU_GR0_S2CR_BASE + s * 4u);
++		printf("WIFI PROBE: [5B.1] Programmed ANOC2 %s SID=0x%04x -> SMR[%02u]=0x%08x S2CR=0x%08x (TRANS->CB%d)\n",
++		    names[t], sids[t], s, r_smr, r_s2cr, cb);
 +	}
 +	uint32_t gfsr = probe_rd32(smmu, ARM_SMMU_GR0_sGFSR);
 +	printf("WIFI PROBE: [5B.1] ANOC2 post-config sGFSR=0x%08x\n", gfsr);
@@ -5255,182 +5526,129 @@ new file mode 100644
 +{
 +	s5b.hwlock_va = ml_io_map(POPLAR_SMEM_HWLOCK_PA, 0x1000u);
 +	s5b.ipc_va    = ml_io_map(POPLAR_APCS_IPC_PAGE_PA, 0x1000u);
-+	s5b.unc_va    = ml_io_map(s_smem_p07_pa, 0x4000u);
-+	if (!s5b.hwlock_va || !s5b.ipc_va || !s5b.unc_va) {
++	s5b.part_va   = ml_io_map(s_smem_p07_pa, s_smem_p07_sz);
++	if (!s5b.hwlock_va || !s5b.ipc_va || !s5b.part_va) {
 +		printf("WIFI PROBE: [5B.2] ERROR: SMEM/IPC map failed\n");
 +		return false;
 +	}
++	s5b.smp2p_last_state = 0xffffffffu;
 +
-+	uint32_t free_unc = probe_rd32(s5b.unc_va, 0x0cu);
-+	uint32_t free_cac = probe_rd32(s5b.unc_va, 0x10u);
-+	uint32_t want_win = (free_cac <= s_smem_p07_sz && s_smem_p07_sz - free_cac + 0x5000u > 0xb000u) ?
-+	    (s_smem_p07_sz - free_cac + 0x5000u) : 0xb000u;
-+	if (want_win > s_smem_p07_sz - 0x4000u) {
-+		want_win = s_smem_p07_sz - 0x4000u;
-+	}
-+	uint32_t cac_pa = (s_smem_p07_pa + s_smem_p07_sz - want_win) & ~0xfffu;
-+	s5b.cac_win_off = cac_pa - s_smem_p07_pa;
-+	s5b.cac_win_sz  = s_smem_p07_sz - s5b.cac_win_off;
-+	s5b.cac_va      = ml_io_map(cac_pa, s5b.cac_win_sz);
-+	if (!s5b.cac_va) {
-+		printf("WIFI PROBE: [5B.2] ERROR: SMEM cached window map failed\n");
-+		return false;
-+	}
-+
-+	/* Walk uncached heap (upward from +0x20) to locate id=428, id=435, id=478 */
-+	uint32_t smp_in_off = 0u, smp_out_off = 0u, descs_off = 0u;
-+	uint32_t off = 0x20u;
-+	while (off + 16u <= free_unc && off < 0x3800u) {
-+		uint32_t w0 = probe_rd32(s5b.unc_va, off);
-+		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
-+			break;
-+		}
-+		uint16_t id   = (uint16_t)(w0 >> 16);
-+		uint32_t sz   = probe_rd32(s5b.unc_va, off + 4u);
-+		uint32_t w2   = probe_rd32(s5b.unc_va, off + 8u);
-+		uint16_t pdat = (uint16_t)w2;
-+		uint16_t phdr = (uint16_t)(w2 >> 16);
-+		uint32_t poff = off + 16u + (uint32_t)phdr;
-+		if (id == SMEM_SMP2P_IN_MODEM_ID)  smp_in_off  = poff;
-+		if (id == SMEM_SMP2P_OUT_MODEM_ID) smp_out_off = poff;
-+		if (id == SMEM_GLINK_XPRT_DESC_ID) descs_off   = poff;
-+		uint32_t step = (16u + (uint32_t)phdr + sz + (uint32_t)pdat + 7u) & ~7u;
-+		if (step == 0u || off + step <= off) {
-+			break;
-+		}
-+		off += step;
-+	}
-+
-+	uint32_t in_vf = 1u, in_fl = 0u;
-+	if (smp_in_off != 0u) {
-+		in_vf = probe_rd32(s5b.unc_va, smp_in_off + 4u);
-+		in_fl = probe_rd32(s5b.unc_va, smp_in_off + 16u);
-+		printf("WIFI PROBE: [5B.2] SMP2P-in(435) ver_feat=0x%08x flags=0x%08x valid_ent=%u\n",
-+		    in_vf, in_fl, probe_rd32(s5b.unc_va, smp_in_off + 12u) >> 16);
-+	}
-+
-+	/* Allocate APPS->Modem SMP2P outbound item (id=428, 344 B) if absent */
-+	if (smp_out_off == 0u && s5b_smem_lock()) {
-+		free_unc = probe_rd32(s5b.unc_va, 0x0cu);
-+		free_cac = probe_rd32(s5b.unc_va, 0x10u);
-+		if (free_unc + 16u + 344u + 0x100u < free_cac && free_unc + 16u + 344u < 0x3f00u) {
-+			uint32_t e = free_unc;
-+			probe_wr32(s5b.unc_va, e + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | (SMEM_SMP2P_OUT_MODEM_ID << 16));
-+			probe_wr32(s5b.unc_va, e + 4u,  344u);
-+			probe_wr32(s5b.unc_va, e + 8u,  0u);
-+			probe_wr32(s5b.unc_va, e + 12u, 0u);
-+			uint32_t p = e + 16u;
-+			for (uint32_t k = 0u; k < 344u; k += 4u) {
-+				probe_wr32(s5b.unc_va, p + k, 0u);
-+			}
-+			probe_wr32(s5b.unc_va, p + 0u,  0x504d5324u); /* "$SMP" */
-+			probe_wr32(s5b.unc_va, p + 4u,  1u | (in_vf & 0x0100u));
-+			probe_wr32(s5b.unc_va, p + 8u,  (1u << 16) | 0u); /* local=0, remote=1 */
-+			probe_wr32(s5b.unc_va, p + 12u, (2u << 16) | 16u);
-+			probe_wr32(s5b.unc_va, p + 16u, in_fl & 1u);
-+			s5b_unc_wr_ascii4(p + 20u, "master-kernel", 16u);
-+			s5b_unc_wr_ascii4(p + 40u, "smp2p", 16u);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			probe_wr32(s5b.unc_va, 0x0cu, e + 16u + 344u);
-+			smp_out_off = p;
-+			printf("WIFI PROBE: [5B.2] Allocated SMP2P-out(428) @ +0x%04x\n", smp_out_off);
-+		}
-+		s5b_smem_unlock();
-+		probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_SMP2P_MASK);
-+	}
-+
-+	if (descs_off == 0u) {
-+		printf("WIFI PROBE: [5B.2] ERROR: GLINK_XPRT_DESC(478) not found\n");
-+		return false;
-+	}
-+	s5b.descs_off = descs_off;
-+
-+	/* Walk cached heap downward from top of p[07] to find FIFO_0 (479) and FIFO_1 (480) */
++	uint32_t free_unc = s5b_part_rd32(0x0cu);
++	uint32_t free_cac = s5b_part_rd32(0x10u);
 +	uint32_t cl = (s_smem_p07_cacheline >= 16u) ? s_smem_p07_cacheline : 32u;
 +	uint32_t hdr_stride = (16u + cl - 1u) & ~(cl - 1u);
-+	uint32_t fifo0_off = 0u, fifo0_len = 0u, fifo1_off = 0u, fifo1_len = 0u;
-+	free_cac = probe_rd32(s5b.unc_va, 0x10u);
++	printf("WIFI PROBE: [5B.2] SMEM p[07] free_unc=0x%x free_cac=0x%x cl=%u\n",
++	    free_unc, free_cac, cl);
 +
-+	uint32_t ce = s_smem_p07_sz - hdr_stride;
-+	while (ce > free_cac && ce >= s5b.cac_win_off) {
-+		uint32_t w0 = s5b_cac_rd32(ce + 0u);
-+		if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
-+			break;
-+		}
-+		uint16_t cid  = (uint16_t)(w0 >> 16);
-+		uint32_t csz  = s5b_cac_rd32(ce + 4u);
-+		uint16_t cpad = (uint16_t)s5b_cac_rd32(ce + 8u);
-+		uint32_t ulen = (cpad < csz) ? (csz - cpad) : csz;
-+		uint32_t doff = ce - csz;
-+		printf("WIFI PROBE: [5B.2]   cached item @ +0x%05x: id=%u sz=0x%x (usable=0x%x)\n",
-+		    doff, cid, csz, ulen);
-+		if (cid == SMEM_GLINK_FIFO_0_ID) { fifo0_off = doff; fifo0_len = ulen; }
-+		if (cid == SMEM_GLINK_FIFO_1_ID) { fifo1_off = doff; fifo1_len = ulen; }
-+		if (doff < hdr_stride) {
-+			break;
-+		}
-+		ce = doff - hdr_stride;
-+	}
-+
-+	if (fifo0_off == 0u) {
-+		printf("WIFI PROBE: [5B.2] ERROR: GLINK FIFO_0(479) not found\n");
-+		return false;
-+	}
-+
-+	if (fifo1_off == 0u && s5b_smem_lock()) {
-+		free_unc = probe_rd32(s5b.unc_va, 0x0cu);
-+		free_cac = probe_rd32(s5b.unc_va, 0x10u);
-+		uint32_t new_hdr  = free_cac - hdr_stride;
-+		uint32_t new_data = new_hdr - SMEM_GLINK_FIFO_SIZE;
-+		if (new_hdr >= s5b.cac_win_off + SMEM_GLINK_FIFO_SIZE &&
-+		    new_data >= s5b.cac_win_off &&
-+		    new_data > free_unc + 0x1000u) {
-+			for (uint32_t k = 0u; k < SMEM_GLINK_FIFO_SIZE; k += 4u) {
-+				s5b_cac_wr32(new_data + k, 0u);
++	/* Log existing cached SMEM items (if any) */
++	if (s_smem_p07_sz >= hdr_stride) {
++		uint32_t ce = s_smem_p07_sz - hdr_stride;
++		while (ce > free_cac && ce + hdr_stride <= s_smem_p07_sz) {
++			uint32_t w0 = s5b_part_rd32(ce + 0u);
++			if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
++				break;
 +			}
-+			uint32_t pad_hdr = hdr_stride - 16u;
-+			s5b_cac_wr32(new_hdr + 0u,  (uint32_t)SMEM_PRIVATE_CANARY | (SMEM_GLINK_FIFO_1_ID << 16));
-+			s5b_cac_wr32(new_hdr + 4u,  SMEM_GLINK_FIFO_SIZE);
-+			s5b_cac_wr32(new_hdr + 8u,  (pad_hdr << 16));
-+			s5b_cac_wr32(new_hdr + 12u, 0u);
-+			__asm__ volatile("dsb sy" ::: "memory");
-+			probe_wr32(s5b.unc_va, 0x10u, new_data);
-+			fifo1_off = new_data;
-+			fifo1_len = SMEM_GLINK_FIFO_SIZE;
-+			printf("WIFI PROBE: [5B.2] Allocated GLINK FIFO_1(480) @ +0x%05x (16 KiB cached)\n",
-+			    fifo1_off);
++			uint16_t cid  = (uint16_t)(w0 >> 16);
++			uint32_t csz  = s5b_part_rd32(ce + 4u);
++			uint16_t cpad = (uint16_t)s5b_part_rd32(ce + 8u);
++			uint32_t ulen = (cpad < csz) ? (csz - cpad) : csz;
++			if (csz > ce) break;
++			uint32_t doff = ce - csz;
++			printf("WIFI PROBE: [5B.2]   cached item @ +0x%05x: id=%u sz=0x%x (usable=0x%x)\n",
++			    doff, cid, csz, ulen);
++			if (doff < hdr_stride) break;
++			ce = doff - hdr_stride;
 +		}
-+		s5b_smem_unlock();
 +	}
 +
-+	if (fifo1_off == 0u) {
-+		printf("WIFI PROBE: [5B.2] ERROR: unable to allocate GLINK FIFO_1(480)\n");
++	/* Locate SMP2P-in(435) and allocate/init SMP2P-out(428) with SSR_ACK feature */
++	if (s5b_smem_get_item(SMEM_SMP2P_IN_MODEM_ID, &s5b.smp2p_in_off, NULL)) {
++		uint32_t in_vf = s5b_part_rd32(s5b.smp2p_in_off + 4u);
++		uint32_t in_fl = s5b_part_rd32(s5b.smp2p_in_off + 16u);
++		uint32_t in_ve = s5b_part_rd32(s5b.smp2p_in_off + 12u) >> 16;
++		printf("WIFI PROBE: [5B.2] SMP2P-in(435) @ +0x%04x ver_feat=0x%08x flags=0x%08x valid_ent=%u\n",
++		    s5b.smp2p_in_off, in_vf, in_fl, in_ve);
++	}
++	if (s5b_smem_alloc_unc(SMEM_SMP2P_OUT_MODEM_ID, 340u, &s5b.smp2p_out_off)) {
++		if (s5b_part_rd32(s5b.smp2p_out_off + 0u) != 0x504d5324u) {
++			s5b_part_wr32(s5b.smp2p_out_off + 8u,  (1u << 16) | 0u);  /* local=0, rem=1 */
++			s5b_part_wr32(s5b.smp2p_out_off + 12u, (1u << 16) | 16u); /* valid=1, total=16 */
++			s5b_part_wr32(s5b.smp2p_out_off + 16u, 0u);
++			s5b_part_wr_ascii4(s5b.smp2p_out_off + 20u, "master-kernel", 16u);
++			s5b_part_wr32(s5b.smp2p_out_off + 36u, 0u);
++			s5b_part_wr32(s5b.smp2p_out_off + 0u,  0x504d5324u); /* "$SMP" */
++			__asm__ volatile("dsb sy" ::: "memory");
++			s5b_part_wr32(s5b.smp2p_out_off + 4u,  1u | (1u << 8)); /* ver=1, feat=SSR_ACK */
++			printf("WIFI PROBE: [5B.2] Allocated SMP2P-out(428) @ +0x%04x\n", s5b.smp2p_out_off);
++		}
++		s5b_smp2p_kick();
++	}
++	s5b_smp2p_service();
++
++	/* Locate or allocate GLINK_XPRT_DESC(478) and FIFOs 479/480 */
++	if (!s5b_smem_alloc_unc(SMEM_GLINK_XPRT_DESC_ID, 32u, &s5b.descs_off)) {
++		printf("WIFI PROBE: [5B.2] ERROR: GLINK_XPRT_DESC(478) unavailable\n");
 +		return false;
 +	}
 +
-+	/* Auto-detect FIFO / descriptor direction after ringing APCS GLINK doorbell */
++	uint32_t fifo0_off = 0u, fifo0_len = 0u, fifo1_off = 0u, fifo1_len = 0u;
++	bool mod_had_f0 = s5b_smem_get_item(SMEM_GLINK_FIFO_0_ID, &fifo0_off, &fifo0_len);
++	bool mod_had_f1 = s5b_smem_get_item(SMEM_GLINK_FIFO_1_ID, &fifo1_off, &fifo1_len);
++	if (!mod_had_f0) {
++		if (!s5b_smem_alloc_cac(SMEM_GLINK_FIFO_0_ID, SMEM_GLINK_FIFO_SIZE, &fifo0_off, &fifo0_len)) {
++			printf("WIFI PROBE: [5B.2] ERROR: unable to allocate GLINK FIFO_0(479)\n");
++			return false;
++		}
++		printf("WIFI PROBE: [5B.2] Allocated GLINK FIFO_0(479) @ +0x%05x (%u B cached)\n",
++		    fifo0_off, fifo0_len);
++	}
++	if (!mod_had_f1) {
++		if (!s5b_smem_alloc_cac(SMEM_GLINK_FIFO_1_ID, SMEM_GLINK_FIFO_SIZE, &fifo1_off, &fifo1_len)) {
++			printf("WIFI PROBE: [5B.2] ERROR: unable to allocate GLINK FIFO_1(480)\n");
++			return false;
++		}
++		printf("WIFI PROBE: [5B.2] Allocated GLINK FIFO_1(480) @ +0x%05x (%u B cached)\n",
++		    fifo1_off, fifo1_len);
++	}
++
 +	s5b_glink_kick();
 +	for (unsigned ms = 0u; ms < 50u; ms++) {
-+		uint32_t d1 = probe_rd32(s5b.unc_va, descs_off + 4u);
-+		uint32_t d3 = probe_rd32(s5b.unc_va, descs_off + 12u);
++		s5b_smp2p_service();
++		uint32_t d1 = s5b_part_rd32(s5b.descs_off + 4u);
++		uint32_t d3 = s5b_part_rd32(s5b.descs_off + 12u);
 +		if (d1 != 0u || d3 != 0u) {
 +			break;
 +		}
 +		delay(1000);
 +	}
 +
-+	uint32_t d0 = probe_rd32(s5b.unc_va, descs_off + 0u);
-+	uint32_t d1 = probe_rd32(s5b.unc_va, descs_off + 4u);
-+	uint32_t d2 = probe_rd32(s5b.unc_va, descs_off + 8u);
-+	uint32_t d3 = probe_rd32(s5b.unc_va, descs_off + 12u);
-+	printf("WIFI PROBE: [5B.2] Post-doorbell desc[0..3] = {%u, %u, %u, %u} f0=%08x f1=%08x\n",
-+	    d0, d1, d2, d3, s5b_cac_rd32(fifo0_off), s5b_cac_rd32(fifo1_off));
++	uint32_t d0 = s5b_part_rd32(s5b.descs_off + 0u);
++	uint32_t d1 = s5b_part_rd32(s5b.descs_off + 4u);
++	uint32_t d2 = s5b_part_rd32(s5b.descs_off + 8u);
++	uint32_t d3 = s5b_part_rd32(s5b.descs_off + 12u);
++	printf("WIFI PROBE: [5B.2] Post-doorbell desc[0..3]={%u,%u,%u,%u} f0=%08x f1=%08x (mod479=%d mod480=%d)\n",
++	    d0, d1, d2, d3, s5b_part_rd32(fifo0_off), s5b_part_rd32(fifo1_off),
++	    mod_had_f0 ? 1 : 0, mod_had_f1 ? 1 : 0);
 +
-+	if (d3 != 0u && d1 == 0u && s5b_cac_rd32(fifo1_off) != 0u) {
-+		s5b.rx_tail_idx = 2u; s5b.rx_head_idx = 3u;
-+		s5b.rx_fifo_off = fifo1_off; s5b.rx_fifo_len = fifo1_len;
++	/* Bind FIFO direction: Modem=RX if Modem pre-allocated that FIFO or already wrote its head */
++	bool f0_is_tx;
++	if (d3 != 0u && d1 == 0u) {
++		f0_is_tx = true;
++	} else if (d1 != 0u && d3 == 0u) {
++		f0_is_tx = false;
++	} else if (mod_had_f1 && !mod_had_f0) {
++		f0_is_tx = true;  /* g.c convention: 479=APPS->Modem TX, 480=Modem->APPS RX */
++	} else if (mod_had_f0 && !mod_had_f1) {
++		f0_is_tx = false; /* Modem owns 479=RX, APPS allocated 480=TX */
++	} else {
++		f0_is_tx = true;
++	}
++
++	if (f0_is_tx) {
 +		s5b.tx_tail_idx = 0u; s5b.tx_head_idx = 1u;
 +		s5b.tx_fifo_off = fifo0_off; s5b.tx_fifo_len = fifo0_len;
++		s5b.rx_tail_idx = 2u; s5b.rx_head_idx = 3u;
++		s5b.rx_fifo_off = fifo1_off; s5b.rx_fifo_len = fifo1_len;
 +	} else {
 +		s5b.rx_tail_idx = 0u; s5b.rx_head_idx = 1u;
 +		s5b.rx_fifo_off = fifo0_off; s5b.rx_fifo_len = fifo0_len;
@@ -5441,32 +5659,37 @@ new file mode 100644
 +	s5b.next_liid = 1u;
 +
 +	if (s5b_fifo_avail_rx() == 0u) {
++		s5b_part_wr32(s5b.descs_off + s5b.rx_tail_idx * 4u, 0u);
++		s5b_part_wr32(s5b.descs_off + s5b.tx_head_idx * 4u, 0u);
 +		(void)s5b_glink_send_cmd(GLINK_CMD_VERSION, 1u, 1u);
-+		for (unsigned ms = 0u; ms < 120u; ms++) {
++		for (unsigned ms = 0u; ms < 200u; ms++) {
 +			s5b_pump_all();
 +			if (s5b.link_up) {
 +				break;
 +			}
 +			delay(1000);
 +		}
-+		if (!s5b.link_up &&
-+		    probe_rd32(s5b.unc_va, descs_off + 0u) == 0u &&
-+		    probe_rd32(s5b.unc_va, descs_off + 4u) == 0u &&
-+		    probe_rd32(s5b.unc_va, descs_off + 8u) == 0u) {
-+			/* Fallback: swap FIFO direction if MPSS bound FIFO_0 as Host0 TX */
-+			probe_wr32(s5b.unc_va, descs_off + 12u, 0u);
++		if (!s5b.link_up && s5b_fifo_avail_rx() == 0u) {
++			/* Reset prior TX slot and swap direction if Modem bound the opposite FIFO */
++			s5b_part_wr32(s5b.descs_off + s5b.tx_head_idx * 4u, 0u);
 +			for (uint32_t k = 0u; k < 16u; k += 4u) {
-+				s5b_cac_wr32(fifo1_off + k, 0u);
++				s5b_part_wr32(s5b.tx_fifo_off + k, 0u);
 +			}
-+			s5b.rx_tail_idx = 2u; s5b.rx_head_idx = 3u;
-+			s5b.rx_fifo_off = fifo1_off; s5b.rx_fifo_len = fifo1_len;
-+			s5b.tx_tail_idx = 0u; s5b.tx_head_idx = 1u;
-+			s5b.tx_fifo_off = fifo0_off; s5b.tx_fifo_len = fifo0_len;
++			uint32_t ot = s5b.tx_tail_idx, oh = s5b.tx_head_idx;
++			uint32_t oo = s5b.tx_fifo_off, ol = s5b.tx_fifo_len;
++			s5b.tx_tail_idx = s5b.rx_tail_idx; s5b.tx_head_idx = s5b.rx_head_idx;
++			s5b.tx_fifo_off = s5b.rx_fifo_off; s5b.tx_fifo_len = s5b.rx_fifo_len;
++			s5b.rx_tail_idx = ot; s5b.rx_head_idx = oh;
++			s5b.rx_fifo_off = oo; s5b.rx_fifo_len = ol;
++			s5b_part_wr32(s5b.descs_off + s5b.rx_tail_idx * 4u, 0u);
++			s5b_part_wr32(s5b.descs_off + s5b.tx_head_idx * 4u, 0u);
++			printf("WIFI PROBE: [5B.2] Swapped GLINK FIFOs -> tx=0x%x rx=0x%x\n",
++			    s5b.tx_fifo_off, s5b.rx_fifo_off);
 +			(void)s5b_glink_send_cmd(GLINK_CMD_VERSION, 1u, 1u);
 +		}
 +	}
 +
-+	for (unsigned ms = 0u; ms < 1000u; ms++) {
++	for (unsigned ms = 0u; ms < 2000u; ms++) {
 +		s5b_pump_all();
 +		if (s5b.ipcrtr_open_acked && s5b.ipcrtr_rem_open) {
 +			break;
@@ -5546,9 +5769,13 @@ new file mode 100644
 +		sl = s5b_qmi_put_tlv(sdu, sl, 0x14u, 1u, &end_b);
 +
 +		uint16_t res = 0u, err = 0u;
-+		if (!s5b_wlfw_qmi_sync(WLFW_BDF_DOWNLOAD_REQ, sdu, (uint16_t)sl, &res, &err)) {
++		bool seg_ok = s5b_wlfw_qmi_sync(WLFW_BDF_DOWNLOAD_REQ, sdu, (uint16_t)sl, &res, &err);
++		if (!seg_ok && !(is_end && err == 1u)) {
 +			printf("WIFI PROBE: [5B.4] ERROR: BDF seg=%u rejected res=%u err=%u\n", seg_id, res, err);
 +			return false;
++		}
++		if (!seg_ok && is_end && err == 1u) {
++			printf("WIFI PROBE: [5B.4] BDF final seg=%u CRC warning res=%u err=%u (non-fatal)\n", seg_id, res, err);
 +		}
 +		off += chunk;
 +		seg_id++;
@@ -5616,9 +5843,9 @@ new file mode 100644
 +		return;
 +	}
 +
-+	/* Pump IPCRTR up to 8 seconds for PD/TFTP/RMTFS traffic & WLFW (0x45) server arrival */
-+	printf("WIFI PROBE: [5B.3] Pumping IPCRTR up to 8000 ms for MPSS services & wlan_pd...\n");
-+	for (unsigned ms = 0u; ms < 8000u; ms++) {
++	/* Pump IPCRTR up to 12 seconds for PD/TFTP/RMTFS traffic & WLFW (0x45) server arrival */
++	printf("WIFI PROBE: [5B.3] Pumping IPCRTR up to 12000 ms for MPSS services & wlan_pd...\n");
++	for (unsigned ms = 0u; ms < 12000u; ms++) {
 +		s5b_pump_all();
 +		if (s5b.wlfw_up) {
 +			break;
@@ -5627,7 +5854,7 @@ new file mode 100644
 +	}
 +
 +	if (!s5b.wlfw_up) {
-+		printf("WIFI PROBE: [5B.4] NOTICE: WLFW (0x45) did not arrive within 8000 ms (hello_recvd=%d).\n\n",
++		printf("WIFI PROBE: [5B.4] NOTICE: WLFW (0x45) did not arrive within 12000 ms (hello_recvd=%d).\n\n",
 +		    s5b.hello_recvd ? 1 : 0);
 +		return;
 +	}
@@ -5646,12 +5873,19 @@ new file mode 100644
 +		sl = s5b_qmi_put_tlv(sdu, sl, 0x15u, 4u, cid);
 +		uint16_t res = 0u, err = 0u;
 +		bool ok = s5b_wlfw_qmi_sync(WLFW_IND_REGISTER_REQ, sdu, (uint16_t)sl, &res, &err);
-+		printf("WIFI PROBE: [5B.4] 1. IND_REGISTER (0x0020): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++		uint16_t fw_st_len = 0u;
++		const uint8_t *fw_st_v = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x10u, &fw_st_len);
++		uint64_t fw_status = (fw_st_v && fw_st_len >= 8u) ? s5b_rd_le64(fw_st_v) : 0ULL;
++		if ((fw_status & 2ULL) != 0ULL) {
++			s5b.wlfw_fw_ready = true;
++		}
++		printf("WIFI PROBE: [5B.4] 1. IND_REGISTER (0x0020): ok=%d res=%u err=%u fw_status=0x%llx\n",
++		    ok ? 1 : 0, res, err, (unsigned long long)fw_status);
 +		if (!ok) return;
 +	}
 +
-+	/* 5B.4 Step 2: WLFW_MSA_INFO_REQ (0x002d) & Multi-VMID wlan_msa MP_ASSIGN */
-+	{
++	/* 5B.4 Step 2 & 3: WLFW_MSA_INFO_REQ (0x002d), Multi-VMID MP_ASSIGN & WLFW_MSA_READY_REQ (0x002e) */
++	if (!s5b.wlfw_fw_ready) {
 +		uint8_t sdu[32], pa8[8], sz4[4];
 +		uint32_t sl = 0u;
 +		s5b_wr_le64(pa8, PIL_MBA_PHYS_BASE);
@@ -5664,9 +5898,9 @@ new file mode 100644
 +		if (!ok) return;
 +
 +		uint16_t rlen = 0u;
-+		const uint8_t *rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x10u, &rlen);
++		const uint8_t *rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x03u, &rlen);
 +		if (!rv) {
-+			rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x03u, &rlen);
++			rv = s5b_qmi_find_tlv(s_5b_qmi_resp_buf, s5b.qmi_resp_len, 0x10u, &rlen);
 +		}
 +		if (rv && rlen >= 1u) {
 +			uint8_t nr = rv[0];
@@ -5684,6 +5918,7 @@ new file mode 100644
 +				    rsize > 0u && asize > 0u &&
 +				    (uint64_t)asize <= PIL_MBA_PHYS_BASE + PIL_MBA_DP_SIZE - raddr &&
 +				    (raddr & 0xfffULL) == 0u) {
++					delay(20000); /* quiesce before TZ XPU update after MSA_INFO reply */
 +					uint32_t src_v[1] = { QCOM_SCM_VMID_HLOS };
 +					uint32_t dst_s[2] = { QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_WLAN };
 +					uint32_t prm_s[2] = { QCOM_SCM_PERM_RW, QCOM_SCM_PERM_RW };
@@ -5694,18 +5929,11 @@ new file mode 100644
 +				}
 +			}
 +		}
-+	}
 +
-+	/* 5B.4 Step 3: WLFW_MSA_READY_REQ (0x002e) */
-+	{
-+		uint16_t res = 0u, err = 0u;
-+		bool ok = s5b_wlfw_qmi_sync(WLFW_MSA_READY_REQ, NULL, 0u, &res, &err);
++		res = 0u; err = 0u;
++		ok = s5b_wlfw_qmi_sync(WLFW_MSA_READY_REQ, NULL, 0u, &res, &err);
 +		printf("WIFI PROBE: [5B.4] 3. MSA_READY (0x002e): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
 +		if (!ok) return;
-+		for (unsigned ms = 0u; ms < 200u && !s5b.wlfw_msa_ready_ind; ms++) {
-+			s5b_pump_all();
-+			delay(1000);
-+		}
 +	}
 +
 +	/* 5B.4 Step 4: WLFW_CAP_REQ (0x0024) */
@@ -5737,24 +5965,40 @@ new file mode 100644
 +		    chip_id, chip_fm, board_id, soc_id, fw_ver, build_id);
 +	}
 +
-+	/* 5B.4 Step 5: Brief wait for autonomous FW_READY_IND or send BDF_DOWNLOAD + CAL_REPORT */
-+	for (unsigned ms = 0u; ms < 100u && !s5b.wlfw_fw_ready; ms++) {
++	/* 5B.4 Step 5: Wait for MSA_READY_IND, then BDF_DOWNLOAD, MAC_ADDR (0x0033), & CAL_REPORT */
++	for (unsigned ms = 0u; ms < 5000u && !s5b.wlfw_msa_ready_ind && !s5b.wlfw_fw_ready; ms++) {
 +		s5b_pump_all();
 +		delay(1000);
 +	}
 +	if (!s5b.wlfw_fw_ready) {
 +		if (s5b_wlfw_download_bdf(board_id)) {
++			uint8_t mac[6] = { 0x02u, 0x50u, 0x4fu, 0x50u, 0x4cu, 0x30u };
++			DTEntry chosen = NULL;
++			void const *mprop = NULL;
++			unsigned int mlen = 0;
++			if (SecureDTLookupEntry(NULL, "/chosen", &chosen) == kSuccess &&
++			    SecureDTGetProperty(chosen, "mac-address-wifi0", &mprop, &mlen) == kSuccess &&
++			    mlen == 6u) {
++				memcpy(mac, mprop, 6u);
++			}
++			uint8_t mac_sdu[12];
++			uint32_t msl = s5b_qmi_put_tlv(mac_sdu, 0u, 0x10u, 6u, mac);
++			uint16_t mres = 0u, merr = 0u;
++			bool mok = s5b_wlfw_qmi_sync(WLFW_MAC_ADDR_REQ, mac_sdu, (uint16_t)msl, &mres, &merr);
++			printf("WIFI PROBE: [5B.4] 5a. MAC_ADDR (0x0033) %02x:%02x:%02x:%02x:%02x:%02x: ok=%d res=%u err=%u\n",
++			    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], mok ? 1 : 0, mres, merr);
++
 +			uint8_t cal_sdu[8];
 +			uint8_t meta_cnt = 0u;
 +			uint32_t csl = s5b_qmi_put_tlv(cal_sdu, 0u, 0x01u, 1u, &meta_cnt);
 +			uint16_t res = 0u, err = 0u;
 +			bool ok = s5b_wlfw_qmi_sync(WLFW_CAL_REPORT_REQ, cal_sdu, (uint16_t)csl, &res, &err);
-+			printf("WIFI PROBE: [5B.4] 5. CAL_REPORT (0x0026): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
++			printf("WIFI PROBE: [5B.4] 5b. CAL_REPORT (0x0026): ok=%d res=%u err=%u\n", ok ? 1 : 0, res, err);
 +		}
 +	}
 +
-+	/* 5B.4 Step 6: Wait up to 5000 ms for QMI_WLFW_FW_READY_IND_V01 (0x0021) */
-+	for (unsigned ms = 0u; ms < 5000u && !s5b.wlfw_fw_ready; ms++) {
++	/* 5B.4 Step 6: Wait up to 10000 ms for QMI_WLFW_FW_READY_IND_V01 (0x0021) */
++	for (unsigned ms = 0u; ms < 10000u && !s5b.wlfw_fw_ready; ms++) {
 +		s5b_pump_all();
 +		delay(1000);
 +	}

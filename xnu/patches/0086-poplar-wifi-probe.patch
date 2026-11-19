@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6255 @@
+@@ -0,0 +1,6259 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4238,7 +4238,11 @@ new file mode 100644
 +	}
 +
 +	/* 3. Check global SMEM partition p[11] @ POPLAR_SMEM_BASE_PA */
-+	vm_offset_t p11_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
++	static vm_offset_t s_p11_va = 0;
++	if (!s_p11_va) {
++		s_p11_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
++	}
++	vm_offset_t p11_va = s_p11_va;
 +	if (p11_va) {
 +		uint32_t magic = probe_rd32(p11_va, 0u);
 +		if (magic == 0x54525024u) { /* "$PRT" */
@@ -4278,7 +4282,7 @@ new file mode 100644
 +		} else {
 +			printf("WIFI PROBE: [5B.2] SMEM base magic=0x%08x (legacy table mode)\n", magic);
 +		}
-+		ml_io_unmap(p11_va, 0x40000u);
++		/* NOTE: Do NOT call ml_io_unmap on permanent ml_io_map region */
 +	}
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}

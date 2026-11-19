@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6259 @@
+@@ -0,0 +1,6335 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -2619,6 +2619,8 @@ new file mode 100644
 +static bool        s_mba_boot_ok = false;
 +static vm_offset_t s_mba_va      = 0;
 +static vm_offset_t s_rmb_va      = 0;
++static vm_offset_t s_rmtfs_va    = 0;
++static vm_offset_t s_smem_base_va = 0;
 +
 +static void
 +probe_stage4_5_active_mba_load(void)
@@ -4237,20 +4239,19 @@ new file mode 100644
 +		}
 +	}
 +
-+	/* 3. Check global SMEM partition p[11] @ POPLAR_SMEM_BASE_PA */
-+	static vm_offset_t s_p11_va = 0;
-+	if (!s_p11_va) {
-+		s_p11_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
++	/* 3. Check global SMEM table @ POPLAR_SMEM_BASE_PA (1 MiB mapping) */
++	if (!s_smem_base_va) {
++		s_smem_base_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x100000u);
 +	}
-+	vm_offset_t p11_va = s_p11_va;
++	vm_offset_t p11_va = s_smem_base_va;
 +	if (p11_va) {
 +		uint32_t magic = probe_rd32(p11_va, 0u);
 +		if (magic == 0x54525024u) { /* "$PRT" */
 +			uint32_t p11_free_unc = probe_rd32(p11_va, 0x0cu);
-+			printf("WIFI PROBE: [5B.2] SMEM p[11] (global partition) free_unc=0x%x:\n", p11_free_unc);
++			printf("WIFI PROBE: [5B.2] SMEM p[11] ($PRT) free_unc=0x%x:\n", p11_free_unc);
 +			uint32_t off = 0x20u;
 +			uint32_t item_idx = 0u;
-+			while (off + 16u <= p11_free_unc && off <= 0x40000u - 16u && item_idx < 32u) {
++			while (off + 16u <= p11_free_unc && off <= 0x100000u - 16u && item_idx < 64u) {
 +				uint32_t w0 = probe_rd32(p11_va, off);
 +				if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
 +					break;
@@ -4262,32 +4263,112 @@ new file mode 100644
 +				uint16_t phdr = (uint16_t)(w2 >> 16);
 +				uint32_t poff = off + 16u + (uint32_t)phdr;
 +				uint32_t usz  = (pdat < sz) ? (sz - pdat) : sz;
-+				if (it == 421u || it == 134u || it == 133u || it == 424u) {
-+					char cstr[256];
-+					for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
-+					uint32_t max_c = (usz < sizeof(cstr) - 1u) ? usz : (uint32_t)(sizeof(cstr) - 1u);
-+					for (uint32_t k = 0u; k < max_c; k++) {
-+						uint32_t cw = probe_rd32(p11_va, poff + (k & ~3u));
-+						char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
-+						cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
-+						if (ch == '\0') break;
-+					}
-+					cstr[sizeof(cstr) - 1u] = '\0';
-+					printf("WIFI PROBE: [5B.2] *** GLOBAL SMEM CRASH ITEM %u: '%s' ***\n",
-+					    it, cstr);
++				char cstr[256];
++				for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++				uint32_t max_c = (usz < sizeof(cstr) - 1u) ? usz : (uint32_t)(sizeof(cstr) - 1u);
++				for (uint32_t k = 0u; k < max_c; k++) {
++					uint32_t cw = probe_rd32(p11_va, poff + (k & ~3u));
++					char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++					cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++					if (ch == '\0') break;
++				}
++				cstr[sizeof(cstr) - 1u] = '\0';
++				if (it == 421u) {
++					printf("WIFI PROBE: [5B.2] *** MPSS CRASH REASON (p[11] item 421): '%s' ***\n", cstr);
++				} else {
++					printf("WIFI PROBE: [5B.2]   p[11] item[%u]: id=%u sz=%u '%s'\n", item_idx, it, sz, cstr);
 +				}
 +				off = poff + sz;
 +				item_idx++;
 +			}
 +		} else {
-+			printf("WIFI PROBE: [5B.2] SMEM base magic=0x%08x (legacy table mode)\n", magic);
++			/* Standard Qualcomm Global SMEM Table mode */
++			uint32_t init     = probe_rd32(p11_va, 0xc0u);
++			uint32_t free_off = probe_rd32(p11_va, 0xc4u);
++			uint32_t avail    = probe_rd32(p11_va, 0xc8u);
++			printf("WIFI PROBE: [5B.2] Global SMEM table: init=%u free_off=0x%x avail=0x%x\n",
++			    init, free_off, avail);
++
++			uint32_t alloc_count = 0u;
++			for (uint32_t it = 0u; it < 512u; it++) {
++				uint32_t ent_off  = 0xd0u + it * 16u;
++				uint32_t alloc    = probe_rd32(p11_va, ent_off + 0u);
++				uint32_t item_off = probe_rd32(p11_va, ent_off + 4u);
++				uint32_t item_sz  = probe_rd32(p11_va, ent_off + 8u);
++				if (alloc != 0u && item_sz > 0u) {
++					alloc_count++;
++					char cstr[128];
++					for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++					if (item_off < 0x100000u) {
++						uint32_t max_c = (item_sz < sizeof(cstr) - 1u) ? item_sz : (uint32_t)(sizeof(cstr) - 1u);
++						if (item_off + max_c > 0x100000u) {
++							max_c = 0x100000u - item_off;
++						}
++						for (uint32_t k = 0u; k < max_c; k++) {
++							uint32_t cw = probe_rd32(p11_va, item_off + (k & ~3u));
++							char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++							cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++							if (ch == '\0') break;
++						}
++						cstr[sizeof(cstr) - 1u] = '\0';
++					}
++					if (it == 421u) {
++						printf("WIFI PROBE: [5B.2] *** MPSS CRASH REASON (item 421): '%s' (sz=%u off=0x%x) ***\n",
++						    cstr, item_sz, item_off);
++					} else if (it == 134u || it == 133u || it == 424u || it == 3u || it == 4u || it == 10u) {
++						printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: '%s' (sz=%u off=0x%x)\n",
++						    it, cstr, item_sz, item_off);
++					} else if (cstr[0] >= 32 && cstr[0] <= 126) {
++						printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: '%s' (sz=%u off=0x%x)\n",
++						    it, cstr, item_sz, item_off);
++					}
++				}
++			}
++			printf("WIFI PROBE: [5B.2] Global SMEM total allocated items: %u\n", alloc_count);
 +		}
-+		/* NOTE: Do NOT call ml_io_unmap on permanent ml_io_map region */
++
++		/* 4. Check modem-shared partitions p[08] (hosts 1:2) and p[09] (hosts 1:3) */
++		static const struct { const char *name; uint32_t off; } modem_parts[] = {
++			{ "p[08] (1:2)", 0xd3000u },
++			{ "p[09] (1:3)", 0xc3000u },
++		};
++		for (unsigned pi = 0u; pi < sizeof(modem_parts)/sizeof(modem_parts[0]); pi++) {
++			uint32_t base = modem_parts[pi].off;
++			uint32_t mag = probe_rd32(p11_va, base);
++			if (mag == 0x54525024u) {
++				uint32_t func = probe_rd32(p11_va, base + 0x0cu);
++				if (func > 0x20u) {
++					printf("WIFI PROBE: [5B.2] SMEM %s has allocated items: free_unc=0x%x\n",
++					    modem_parts[pi].name, func);
++					uint32_t item_off = 0x20u;
++					while (item_off + 16u <= func && item_off <= 0x10000u - 16u) {
++						uint32_t w0 = probe_rd32(p11_va, base + item_off);
++						if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) break;
++						uint16_t it = (uint16_t)(w0 >> 16);
++						uint32_t isz = probe_rd32(p11_va, base + item_off + 4u);
++						uint32_t w2  = probe_rd32(p11_va, base + item_off + 8u);
++						uint16_t phdr = (uint16_t)(w2 >> 16);
++						uint32_t poff = item_off + 16u + (uint32_t)phdr;
++						char cstr[128];
++						for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++						uint32_t max_c = (isz < sizeof(cstr) - 1u) ? isz : (uint32_t)(sizeof(cstr) - 1u);
++						for (uint32_t k = 0u; k < max_c; k++) {
++							uint32_t cw = probe_rd32(p11_va, base + poff + (k & ~3u));
++							char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++							cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++							if (ch == '\0') break;
++						}
++						cstr[sizeof(cstr) - 1u] = '\0';
++						printf("WIFI PROBE: [5B.2]   %s item[%u]: '%s' (sz=%u)\n",
++						    modem_parts[pi].name, it, cstr, isz);
++						item_off = poff + isz;
++					}
++				}
++			}
++		}
 +	}
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}
-+
-+static void
 +s5b_smp2p_service(void)
 +{
 +	if (s5b.smp2p_in_off == 0u) {
@@ -5057,9 +5138,7 @@ new file mode 100644
 +			uint32_t hdr = ((il % 12u) == 1u) ? 1u : (((il % 12u) == 2u) ? 2u : 4u);
 +			uint32_t nent = (il >= hdr) ? ((uint32_t)(il - hdr) / 12u) : 0u;
 +			if (nent > 0u && hdr + nent * 12u <= il) {
-+				vm_offset_t rmt_va = ml_io_map_unmappable(POPLAR_RMTFS_CARVEOUT_PA,
-+				    POPLAR_RMTFS_CARVEOUT_SIZE, SWEET_VM_WIMG_WCOMB);
-+				if (rmt_va) {
++				if (s_rmtfs_va) {
 +					for (uint32_t e = 0u; e < nent; e++) {
 +						const uint8_t *ev = iv + hdr + e * 12u;
 +						uint32_t sec_addr = s5b_rd_le32(ev + 0);
@@ -5088,11 +5167,11 @@ new file mode 100644
 +							}
 +							for (uint32_t k = 0u; k < chunk; k += 4u) {
 +								uint32_t w = s5b_rd_le32(s_5b_rmtfs_io_buf + k);
-+								probe_wr32(rmt_va, phys_off + done + k, w);
++								probe_wr32(s_rmtfs_va, phys_off + done + k, w);
 +							}
 +							done += chunk;
 +						}
-+						sweet_dcache_clean_poc(rmt_va + phys_off, (size_t)bytes);
++						sweet_dcache_clean_poc(s_rmtfs_va + phys_off, (size_t)bytes);
 +						s5b.rmtfs_read_count++;
 +						printf("WIFI PROBE: [5B.3] RMTFS READ '%s' sec=%u+%u -> err=%d\n",
 +						    part, sec_addr, nsec, rw_err);
@@ -5100,7 +5179,6 @@ new file mode 100644
 +							break;
 +						}
 +					}
-+					ml_io_unmap(rmt_va, POPLAR_RMTFS_CARVEOUT_SIZE);
 +				} else {
 +					rw_err = EIO;
 +				}
@@ -5517,7 +5595,6 @@ new file mode 100644
 +	s5b.wlan_pd_registered = true;
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
-+	s5b_servreg_restart_pd(snode, sport, "msm/modem/wlan_pd");
 +}
 +
 +static void
@@ -5541,8 +5618,7 @@ new file mode 100644
 +				if (curr_st == 0x1fffffffu) {
 +					s5b.wlan_pd_started = true;
 +				} else if (curr_st == 0x7fffffffu) {
-+					printf("WIFI PROBE: [5B.3] wlan_pd UNINIT -> triggering SERVREG_RESTART_PD_REQ\n");
-+					s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd");
++					printf("WIFI PROBE: [5B.3] wlan_pd UNINIT (waiting for modem initialization)\n");
 +				}
 +			} else if (txn == s5b.servreg_root_pd_txn) {
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
@@ -6172,12 +6248,12 @@ new file mode 100644
 +	printf("WIFI PROBE: [5B.1] PM8998 WLAN Rails: L5=%d L7=%d L17=%d L25=%d RF_CLK2=%d\n",
 +	    ok_l5 ? 1 : 0, ok_l7 ? 1 : 0, ok_l17 ? 1 : 0, ok_l25 ? 1 : 0, ok_clk ? 1 : 0);
 +
-+	vm_offset_t rmt_va = ml_io_map_unmappable(POPLAR_RMTFS_CARVEOUT_PA,
-+	    POPLAR_RMTFS_CARVEOUT_SIZE, SWEET_VM_WIMG_WCOMB);
-+	if (rmt_va) {
-+		sweet_io_zero((void *)rmt_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
-+		sweet_dcache_clean_poc(rmt_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
-+		ml_io_unmap(rmt_va, POPLAR_RMTFS_CARVEOUT_SIZE);
++	if (!s_rmtfs_va) {
++		s_rmtfs_va = ml_io_map(POPLAR_RMTFS_CARVEOUT_PA, POPLAR_RMTFS_CARVEOUT_SIZE);
++	}
++	if (s_rmtfs_va) {
++		sweet_io_zero((void *)s_rmtfs_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
++		sweet_dcache_clean_poc(s_rmtfs_va, (size_t)POPLAR_RMTFS_CARVEOUT_SIZE);
 +		uint32_t rsrc[1] = { QCOM_SCM_VMID_HLOS };
 +		uint32_t rdst[2] = { QCOM_SCM_VMID_HLOS, QCOM_SCM_VMID_MSS_MSA };
 +		uint32_t rprm[2] = { QCOM_SCM_PERM_RW,  QCOM_SCM_PERM_RW };

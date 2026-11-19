@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6335 @@
+@@ -0,0 +1,6337 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4369,6 +4369,8 @@ new file mode 100644
 +	}
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}
++
++static void
 +s5b_smp2p_service(void)
 +{
 +	if (s5b.smp2p_in_off == 0u) {

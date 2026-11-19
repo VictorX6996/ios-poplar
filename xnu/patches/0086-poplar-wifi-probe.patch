@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6314 @@
+@@ -0,0 +1,6331 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -5573,6 +5573,7 @@ new file mode 100644
 +	s5b.wlan_pd_registered = true;
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
++	s5b_servreg_restart_pd(snode, sport, "msm/modem/wlan_pd");
 +}
 +
 +static void
@@ -5596,10 +5597,15 @@ new file mode 100644
 +				if (curr_st == 0x1fffffffu) {
 +					s5b.wlan_pd_started = true;
 +				} else if (curr_st == 0x7fffffffu) {
-+					printf("WIFI PROBE: [5B.3] wlan_pd UNINIT (waiting for modem initialization)\n");
++					printf("WIFI PROBE: [5B.3] wlan_pd UNINIT -> triggering SERVREG_RESTART_PD_REQ\n");
++					s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd");
 +				}
 +			} else if (txn == s5b.servreg_root_pd_txn) {
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
++				if (!s5b.wlan_pd_started) {
++					printf("WIFI PROBE: [5B.3] root_pd is UP -> triggering SERVREG_RESTART_PD_REQ for wlan_pd\n");
++					s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd");
++				}
 +			}
 +		} else if (msg_id == 0x0024u) { /* RESTART_PD_RESP */
 +			printf("WIFI PROBE: [5B.3] SERVREG RESTART_PD resp: txn=%u res=%u err=%u\n", txn, res, err);
@@ -5738,6 +5744,12 @@ new file mode 100644
 +			} else {
 +				printf("WIFI PROBE: [5B.3] IPCRTR unhandled LOOKUP: svc=0x%04x inst=%u from %u:%u\n",
 +				    svc, inst, src_node, src_port);
++			}
++		} else if (cmd == QRTR_TYPE_DEL_CLIENT && size >= 12u) {
++			uint32_t cnode = s5b_rd_le32(body + 4);
++			uint32_t cport = s5b_rd_le32(body + 8);
++			if (cnode != QRTR_NODE_APPS) {
++				printf("WIFI PROBE: [5B.3] IPCRTR DEL_CLIENT %u:%u\n", cnode, cport);
 +			}
 +		} else {
 +			printf("WIFI PROBE: [5B.3] IPCRTR CTRL cmd=%u type=%u src=%u:%u dst=%u:%u sz=%u\n",
@@ -6260,6 +6272,11 @@ new file mode 100644
 +			    ms, s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0,
 +			    s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state, s5b.wlfw_up ? 1 : 0,
 +			    s5b.rmtfs_read_count, s5b.tftp_req_count);
++			if (s5b.servreg_notif_up && !s5b.wlan_pd_started && s5b.rmtfs_read_count >= 3 &&
++			    (ms == 2000u || ms == 6000u || ms == 10000u)) {
++				printf("WIFI PROBE: [5B.3] Triggering periodic SERVREG_RESTART_PD_REQ for wlan_pd (ms=%u)\n", ms);
++				s5b_servreg_restart_pd(s5b.servreg_notif_node, s5b.servreg_notif_port, "msm/modem/wlan_pd");
++			}
 +		}
 +		delay(1000);
 +	}

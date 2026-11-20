@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6469 @@
+@@ -0,0 +1,6581 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3186,6 +3186,9 @@ new file mode 100644
 +static uint32_t s_smem_p07_pa = 0u;
 +static uint32_t s_smem_p07_sz = 0u;
 +static uint32_t s_smem_p07_cacheline = 32u;
++static uint32_t s_smem_comm_pa = 0u;
++static uint32_t s_smem_comm_sz = 0u;
++static uint32_t s_smem_comm_cacheline = 32u;
 +
 +static void
 +probe_stage5a_smem_modem_audit(void)
@@ -3195,6 +3198,9 @@ new file mode 100644
 +	s_smem_p07_pa = 0u;
 +	s_smem_p07_sz = 0u;
 +	s_smem_p07_cacheline = 32u;
++	s_smem_comm_pa = 0u;
++	s_smem_comm_sz = 0u;
++	s_smem_comm_cacheline = 32u;
 +
 +	vm_offset_t toc = ml_io_map(POPLAR_SMEM_TOC_PA, 0x1000u);
 +	if (!toc) {
@@ -3227,15 +3233,24 @@ new file mode 100644
 +		uint32_t cl    = probe_rd32(toc, e_off + 16u);
 +		uint16_t h0 = (uint16_t)hosts;
 +		uint16_t h1 = (uint16_t)(hosts >> 16);
++		printf("WIFI PROBE: [5A.3] SMEM TOC[%02u]: off=0x%05x sz=%uKB hosts=%u:%u (0x%04x:0x%04x) cl=%u\n",
++		    i, off, sz / 1024u, h0, h1, h0, h1, cl);
 +		if (((h0 == 0u && h1 == 1u) || (h0 == 1u && h1 == 0u)) &&
-+		    sz > 0u && sz <= 0x200000u && off <= 0x200000u - sz) {
++		    sz > 0u && sz <= 0x200000u && off <= 0x200000u - sz && part_idx == 0xFFFFFFFFu) {
 +			part_idx = i;
 +			part_off = off;
 +			part_sz  = sz;
 +			part_cl  = (cl > 0u) ? cl : 32u;
 +			part_h0  = h0;
 +			part_h1  = h1;
-+			break;
++		}
++		if (h0 == 0xFFFEu && h1 == 0xFFFEu &&
++		    sz > 0u && sz <= 0x200000u && off <= 0x200000u - sz && s_smem_comm_pa == 0u) {
++			s_smem_comm_pa = POPLAR_SMEM_BASE_PA + off;
++			s_smem_comm_sz = sz;
++			s_smem_comm_cacheline = (cl > 0u) ? cl : 32u;
++			printf("WIFI PROBE: [5A.3]   -> Found SMEM Common Partition TOC[%02u] PA=0x%08x sz=%uKB cl=%u\n",
++			    i, s_smem_comm_pa, sz / 1024u, s_smem_comm_cacheline);
 +		}
 +	}
 +
@@ -4242,6 +4257,106 @@ new file mode 100644
 +		}
 +	}
 +
++	/* 2.5 Check SMEM Common Partition (0xFFFE:0xFFFE) for subsystem failure reasons */
++	if (s_smem_comm_pa != 0u && s_smem_comm_sz >= 0x40u) {
++		uint32_t comm_map_len = (s_smem_comm_sz < 0x20000u) ? s_smem_comm_sz : 0x20000u;
++		vm_offset_t comm_va = ml_io_map(s_smem_comm_pa, comm_map_len);
++		if (comm_va) {
++			uint32_t cmagic = probe_rd32(comm_va, 0u);
++			uint32_t c_free_unc = probe_rd32(comm_va, 0x0cu);
++			uint32_t c_free_cac = probe_rd32(comm_va, 0x10u);
++			printf("WIFI PROBE: [5B.2] SMEM Common Partition (%uKB @ 0x%08x): magic=0x%08x free_unc=0x%x free_cac=0x%x\n",
++			    s_smem_comm_sz / 1024u, s_smem_comm_pa, cmagic, c_free_unc, c_free_cac);
++			if (cmagic == SMEM_PART_MAGIC) {
++				uint32_t coff = 0x20u;
++				uint32_t cidx = 0u;
++				while (coff + 16u <= c_free_unc && coff <= comm_map_len - 16u && cidx < 64u) {
++					uint32_t cw0 = probe_rd32(comm_va, coff);
++					if ((uint16_t)cw0 != SMEM_PRIVATE_CANARY) {
++						break;
++					}
++					uint16_t it   = (uint16_t)(cw0 >> 16);
++					uint32_t sz   = probe_rd32(comm_va, coff + 4u);
++					uint32_t cw2  = probe_rd32(comm_va, coff + 8u);
++					uint16_t pdat = (uint16_t)cw2;
++					uint16_t phdr = (uint16_t)(cw2 >> 16);
++					if ((uint32_t)phdr > comm_map_len - (coff + 16u) ||
++					    sz > comm_map_len - (coff + 16u + (uint32_t)phdr)) {
++						break;
++					}
++					uint32_t cpoff = coff + 16u + (uint32_t)phdr;
++					uint32_t cusz  = (pdat < sz) ? (sz - pdat) : sz;
++
++					char cstr[256];
++					for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++					uint32_t max_c = (cusz < sizeof(cstr) - 1u) ? cusz : (uint32_t)(sizeof(cstr) - 1u);
++					for (uint32_t k = 0u; k < max_c; k++) {
++						uint32_t cw = probe_rd32(comm_va, cpoff + (k & ~3u));
++						char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++						cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++						if (ch == '\0') break;
++					}
++				cstr[sizeof(cstr) - 1u] = '\0';
++
++					if (it == 421u) {
++						printf("WIFI PROBE: [5B.2] *** MPSS SSR REASON (Common Part item 421): '%s' (sz=%u) ***\n",
++						    cstr, sz);
++					} else if (it == 408u || it == 409u || it == 6u) {
++						printf("WIFI PROBE: [5B.2] *** MPSS CRASH ITEM %u (Common Part): '%s' (sz=%u) ***\n",
++						    it, cstr, sz);
++					} else if (cstr[0] >= 32 && cstr[0] <= 126) {
++						printf("WIFI PROBE: [5B.2]   Common Partition item[%u]: id=%u sz=%u '%s'\n",
++						    cidx, it, sz, cstr);
++					}
++					coff = cpoff + sz;
++					cidx++;
++				}
++
++				/* Also inspect cached heap of Common Partition */
++				uint32_t ccl = (s_smem_comm_cacheline >= 16u) ? s_smem_comm_cacheline : 32u;
++				uint32_t chdr_stride = (16u + ccl - 1u) & ~(ccl - 1u);
++				if (comm_map_len >= chdr_stride) {
++					uint32_t c_ce = comm_map_len - chdr_stride;
++					while (c_ce > c_free_cac && c_ce + chdr_stride <= comm_map_len) {
++						uint32_t cw0 = probe_rd32(comm_va, c_ce);
++						if ((uint16_t)cw0 != SMEM_PRIVATE_CANARY) {
++							break;
++						}
++						uint16_t it   = (uint16_t)(cw0 >> 16);
++						uint32_t sz   = probe_rd32(comm_va, c_ce + 4u);
++						uint32_t cw2  = probe_rd32(comm_va, c_ce + 8u);
++						uint16_t pdat = (uint16_t)cw2;
++						uint16_t phdr = (uint16_t)(cw2 >> 16);
++						if (sz == 0u || sz > comm_map_len) break;
++						uint32_t cpoff = c_ce - sz;
++						uint32_t cusz  = (pdat < sz) ? (sz - pdat) : sz;
++
++						char cstr[256];
++						for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++						uint32_t max_c = (cusz < sizeof(cstr) - 1u) ? cusz : (uint32_t)(sizeof(cstr) - 1u);
++						for (uint32_t k = 0u; k < max_c; k++) {
++							uint32_t cw = probe_rd32(comm_va, cpoff + (k & ~3u));
++							char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++							cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
++							if (ch == '\0') break;
++						}
++						cstr[sizeof(cstr) - 1u] = '\0';
++
++						if (it == 421u) {
++							printf("WIFI PROBE: [5B.2] *** MPSS SSR REASON (Common Part cached item 421): '%s' (sz=%u) ***\n",
++							    cstr, sz);
++						} else if (it == 408u || it == 409u || it == 6u) {
++							printf("WIFI PROBE: [5B.2] *** MPSS CRASH ITEM %u (Common Part cached): '%s' (sz=%u) ***\n",
++							    it, cstr, sz);
++						}
++						if (cpoff < chdr_stride) break;
++						c_ce = cpoff - chdr_stride;
++					}
++				}
++			}
++		}
++	}
++
 +	/* 3. Check global SMEM table @ POPLAR_SMEM_BASE_PA (safe 256 KB mapping) */
 +	if (!s_smem_base_va) {
 +		s_smem_base_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
@@ -5041,15 +5156,12 @@ new file mode 100644
 +			const char *domain;
 +			uint32_t    instance;
 +		} sr_db[] = {
++			/* Aligned strictly with Sony poplar modemr.jsn and modemuw.jsn */
 +			{ "tms/servreg",          "msm/modem/root_pd", 180u },
-+			{ "gps/gps_service",      "msm/modem/root_pd", 180u },
++			{ "tms/pdr_enabled",      "msm/modem/root_pd", 180u },
 +			{ "kernel/elf_loader",    "msm/modem/wlan_pd", 180u },
 +			{ "tms/servreg",          "msm/modem/wlan_pd", 180u },
 +			{ "wlan/fw",              "msm/modem/wlan_pd", 180u },
-+			{ "tms/pddump_disabled",  "msm/modem/root_pd", 180u },
-+			{ "tms/pddump_disabled",  "msm/modem/wlan_pd", 180u },
-+			{ "tms/pdr_enabled",      "msm/modem/root_pd", 180u },
-+			{ "tms/pdr_enabled",      "msm/modem/wlan_pd", 180u },
 +			{ "msm/modem/root_pd",    "msm/modem/root_pd", 180u },
 +			{ "msm/modem/wlan_pd",    "msm/modem/wlan_pd", 180u },
 +		};

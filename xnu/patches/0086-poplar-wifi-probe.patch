@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6506 @@
+@@ -0,0 +1,6469 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3798,13 +3798,11 @@ new file mode 100644
 +	uint32_t    servreg_loc_remote_node;
 +	uint32_t    servreg_loc_remote_port;
 +	uint16_t    servreg_loc_query_txn;
-+	bool        diag_restart_sent;
 +	bool        wlan_pd_registered;
 +	bool        wlan_pd_started;
 +	uint32_t    wlan_pd_state;
 +	uint16_t    servreg_wlan_pd_txn;
 +	uint16_t    servreg_root_pd_txn;
-+	uint16_t    servreg_restart_txn;
 +	bool        mpss_err_fatal_dumped;
 +	uint32_t    rmtfs_read_count;
 +	uint32_t    tftp_req_count;
@@ -5622,34 +5620,6 @@ new file mode 100644
 +}
 +
 +static void
-+s5b_servreg_diagnostic_restart_pd(uint32_t snode, uint32_t sport, const char *domain)
-+{
-+	if (s5b.diag_restart_sent) {
-+		return;
-+	}
-+	s5b.diag_restart_sent = true;
-+
-+	uint8_t req[128];
-+	uint32_t roff = 0u;
-+	unsigned dom_len = sweet_str_len(domain);
-+
-+	/* TLV 0x01: service_path (string) */
-+	roff = s5b_qmi_put_tlv(req, roff, 0x01u, (uint16_t)dom_len, domain);
-+
-+	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
-+	if (txn == 0u) {
-+		txn = (uint16_t)(++s5b.next_qmi_txn);
-+	}
-+	s5b.servreg_restart_txn = txn;
-+
-+	printf("WIFI PROBE: [5B.3] SERVREG DIAGNOSTIC RESTART_PD_REQ [ONE-TIME ONLY] for '%s' (txn=%u -> node=%u port=%u)\n",
-+	    domain, txn, snode, sport);
-+
-+	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, 0x0024u /* SERVREG_RESTART_PD_REQ */,
-+	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, req, (uint16_t)roff);
-+}
-+
-+static void
 +s5b_icnss_query_service_location(uint32_t snode, uint32_t sport)
 +{
 +	uint8_t req[128];
@@ -5664,18 +5634,14 @@ new file mode 100644
 +	s5b_wr_le32(off_buf, 0u);
 +	roff = s5b_qmi_put_tlv(req, roff, 0x10u, 4u, off_buf);
 +
-+	/* TLV 0x11: client_name = "ICNSS-WLAN" */
-+	const char *client_name = "ICNSS-WLAN";
-+	roff = s5b_qmi_put_tlv(req, roff, 0x11u, (uint16_t)sweet_str_len(client_name), client_name);
-+
 +	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
 +	if (txn == 0u) {
 +		txn = (uint16_t)(++s5b.next_qmi_txn);
 +	}
 +	s5b.servreg_loc_query_txn = txn;
 +
-+	printf("WIFI PROBE: [5B.3] ICNSS SERVICE LOCATION DISCOVERY: client='%s' svc='%s' (txn=%u -> node=%u port=%u)\n",
-+	    client_name, svc_name, txn, snode, sport);
++	printf("WIFI PROBE: [5B.3] ICNSS SERVICE LOCATION DISCOVERY: svc='%s' (txn=%u -> node=%u port=%u)\n",
++	    svc_name, txn, snode, sport);
 +
 +	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, 0x0021u /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_REQ */,
 +	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, req, (uint16_t)roff);
@@ -5715,9 +5681,6 @@ new file mode 100644
 +					s5b.wlan_pd_started = true;
 +				} else if (curr_st == 0x7fffffffu) {
 +					printf("WIFI PROBE: [5B.3] wlan_pd state is UNINIT (0x7fffffff)\n");
-+					if (!s5b.diag_restart_sent) {
-+						s5b_servreg_diagnostic_restart_pd(src_node, src_port, "msm/modem/wlan_pd");
-+					}
 +				}
 +			} else if (txn == s5b.servreg_root_pd_txn) {
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);

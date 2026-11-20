@@ -5853,7 +5853,7 @@ new file mode 100644
 +				s5b.servreg_notif_inst = inst >> 8;
 +				s5b_servreg_register_listeners(snode, sport);
 +			}
-+			if (svc == 0x002bu || svc == QRTR_SVC_SERVREG_LOC) {
++			if (svc == QRTR_SVC_SERVREG_LOC) {
 +				s5b.servreg_loc_up          = true;
 +				s5b.servreg_loc_remote_node = snode;
 +				s5b.servreg_loc_remote_port = sport;

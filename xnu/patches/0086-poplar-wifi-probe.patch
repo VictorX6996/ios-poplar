@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7010 @@
+@@ -0,0 +1,7019 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3893,6 +3893,8 @@ new file mode 100644
 +	uint16_t    ssctl_event_txn;
 +	bool        ssctl_event_sent;
 +	bool        ssctl_event_acked;
++	bool        ssctl_wcnss_sent;
++	bool        ssctl_wcnss_acked;
 +	uint16_t    ssctl_sfr_txn;
 +	bool        ssctl_sfr_sent;
 +	bool        ssctl_sfr_recvd;
@@ -6243,6 +6245,12 @@ new file mode 100644
 +			s5b.ssctl_event_acked = (res == 0u);
 +			printf("WIFI PROBE: [5B.3] SSCTL SUBSYS_EVENT resp: txn=%u res=%u err=%u (%s)\n",
 +			    txn, res, err, (res == 0u && err == 0u) ? "SUCCESS" : "ERROR");
++			if (res == 0u && !s5b.ssctl_wcnss_sent) {
++				s5b.ssctl_wcnss_sent = true;
++				s5b_ssctl_send_event(s5b.ssctl_node, s5b.ssctl_port, "wcnss", SSCTL_SSR_EVENT_AFTER_POWERUP);
++			} else if (res == 0u && s5b.ssctl_wcnss_sent) {
++				s5b.ssctl_wcnss_acked = true;
++			}
 +		} else if (msg_id == SSCTL_GET_FAILURE_REASON_REQ) {
 +			s5b.ssctl_sfr_recvd = true;
 +			printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON resp: txn=%u res=%u err=%u\n",
@@ -6369,7 +6377,7 @@ new file mode 100644
 +				s5b.ssctl_node = snode;
 +				s5b.ssctl_port = sport;
 +				s5b.ssctl_inst = inst >> 8;
-+				s5b_ssctl_send_event(snode, sport, "wcnss", SSCTL_SSR_EVENT_AFTER_POWERUP);
++				s5b_ssctl_send_event(snode, sport, "modem", SSCTL_SSR_EVENT_AFTER_POWERUP);
 +			}
 +		} else if (cmd == QRTR_TYPE_NEW_LOOKUP && size >= 12u) {
 +			uint32_t svc  = s5b_rd_le32(body + 4);
@@ -6948,14 +6956,15 @@ new file mode 100644
 +			    ms, t_rel, s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0,
 +			    s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state, s5b.wlfw_up ? 1 : 0,
 +			    s5b.rmtfs_read_count, s5b.tftp_req_count);
-+			printf("WIFI PROBE: [5B.3]   SSM(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSR(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSCTL(up=%d sent=%d ack=%d)\n",
++			printf("WIFI PROBE: [5B.3]   SSM(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSR(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSCTL(up=%d sent=%d ack=%d wcnss=%d/%d)\n",
 +			    (s5b.ssm_open_acked && s5b.ssm_rem_open) ? 1 : 0,
 +			    s5b.ssm_rx_intents_advertised, s5b.ssm_tx_intents_received,
 +			    s5b.ssm_rx_packets, s5b.ssm_rx_bytes,
 +			    (s5b.ssr_open_acked && s5b.ssr_rem_open) ? 1 : 0,
 +			    s5b.ssr_rx_intents_advertised, s5b.ssr_tx_intents_received,
 +			    s5b.ssr_rx_packets, s5b.ssr_rx_bytes,
-+			    s5b.ssctl_up ? 1 : 0, s5b.ssctl_event_sent ? 1 : 0, s5b.ssctl_event_acked ? 1 : 0);
++			    s5b.ssctl_up ? 1 : 0, s5b.ssctl_event_sent ? 1 : 0, s5b.ssctl_event_acked ? 1 : 0,
++			    s5b.ssctl_wcnss_sent ? 1 : 0, s5b.ssctl_wcnss_acked ? 1 : 0);
 +		}
 +		delay(1000);
 +	}

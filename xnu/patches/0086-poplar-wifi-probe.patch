@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6645 @@
+@@ -0,0 +1,6744 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -311,6 +311,9 @@ new file mode 100644
 +#define GLINK_CMD_READ_NOTIF        13u
 +#define GLINK_CMD_RX_DONE_W_REUSE   14u
 +#define GLINK_CMD_SIGNALS           15u
++
++#define GLINK_LCID_IPCRTR           1u
++#define GLINK_LCID_SSM_RTR          2u
 +
 +/* Qualcomm SMD RPM Resource & Key Constants */
 +#define QCOM_SMD_RPM_LDOA           0x616f646cu   /* "ldoa" in little-endian */
@@ -3792,6 +3795,16 @@ new file mode 100644
 +	uint32_t    rx_pkt_len;
 +	bool        rx_pkt_active;
 +
++	/* GLINK SSM_RTR_MODEM_APPS channel state (Experiment A) */
++	bool        ssm_open_tx;
++	bool        ssm_rem_open;
++	bool        ssm_open_acked;
++	bool        ssm_intents_seeded;
++	uint32_t    ssm_rcid;
++	uint32_t    ssm_rx_pkt_len;
++	bool        ssm_rx_pkt_active;
++	uint32_t    ssm_rx_pkt_count;
++
 +	/* IPCRTR routing state */
 +	bool        hello_sent;
 +	bool        hello_recvd;
@@ -3840,6 +3853,7 @@ new file mode 100644
 +} s5b;
 +
 +static uint8_t s_5b_rx_pkt_buf[8192]  __attribute__((aligned(8)));
++static uint8_t s_5b_ssm_rx_pkt_buf[4096] __attribute__((aligned(8)));
 +static uint8_t s_5b_tx_pkt_buf[8192]  __attribute__((aligned(8)));
 +static uint8_t s_5b_ipcr_tx_buf[8192] __attribute__((aligned(8)));
 +static uint8_t s_5b_qmi_resp_buf[8192] __attribute__((aligned(8)));
@@ -4665,8 +4679,8 @@ new file mode 100644
 +s5b_glink_send_open(uint16_t lcid, const char *name)
 +{
 +	uint32_t slen = sweet_str_len(name) + 1u;
-+	uint8_t msg[32];
-+	if (slen > 24u) {
++	uint8_t msg[48];
++	if (slen > 36u) {
 +		return false;
 +	}
 +	memset(msg, 0, sizeof(msg));
@@ -4674,26 +4688,38 @@ new file mode 100644
 +	s5b_wr_le16(msg + 2, lcid);
 +	s5b_wr_le32(msg + 4, slen);
 +	memcpy(msg + 8, name, slen);
-+	s5b.ipcrtr_open_tx = true;
++	if (lcid == GLINK_LCID_IPCRTR) {
++		s5b.ipcrtr_open_tx = true;
++	} else if (lcid == GLINK_LCID_SSM_RTR) {
++		s5b.ssm_open_tx = true;
++	}
 +	return s5b_glink_send_raw(msg, 8u + slen);
 +}
 +
 +static void
-+s5b_glink_seed_intents(uint32_t count, uint32_t sz)
++s5b_glink_seed_channel_intents(uint16_t lcid, uint32_t count, uint32_t sz)
 +{
 +	uint8_t msg[8u + 8u * 8u];
 +	if (count > 8u) {
 +		count = 8u;
 +	}
 +	s5b_wr_le16(msg + 0, GLINK_CMD_INTENT);
-+	s5b_wr_le16(msg + 2, 1u); /* local lcid=1 ("IPCRTR") */
++	s5b_wr_le16(msg + 2, lcid);
 +	s5b_wr_le32(msg + 4, count);
 +	for (uint32_t i = 0u; i < count; i++) {
 +		uint32_t liid = s5b.next_liid++;
 +		s5b_wr_le32(msg + 8u + i * 8u + 0u, sz);
 +		s5b_wr_le32(msg + 8u + i * 8u + 4u, liid);
++		printf("WIFI PROBE: [5B.2] GLINK advertised RX intent on lcid=%u: liid=%u sz=%u\n",
++		    lcid, liid, sz);
 +	}
 +	(void)s5b_glink_send_raw(msg, 8u + count * 8u);
++}
++
++static void
++s5b_glink_seed_intents(uint32_t count, uint32_t sz)
++{
++	s5b_glink_seed_channel_intents(GLINK_LCID_IPCRTR, count, sz);
 +}
 +
 +static void s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len);
@@ -4810,11 +4836,26 @@ new file mode 100644
 +			s5b.ipcrtr_rcid = p1;
 +			s5b.ipcrtr_rem_open = true;
 +			if (!s5b.ipcrtr_open_tx) {
-+				(void)s5b_glink_send_open(1u, "IPCRTR");
++				(void)s5b_glink_send_open(GLINK_LCID_IPCRTR, "IPCRTR");
 +			}
 +			if (s5b.ipcrtr_open_acked && !s5b.intents_seeded) {
 +				s5b.intents_seeded = true;
 +				s5b_glink_seed_intents(8u, 8192u);
++			}
++		} else if (strcmp(cname, "SSM_RTR_MODEM_APPS") == 0) {
++			s5b.ssm_rcid = p1;
++			s5b.ssm_rem_open = true;
++			printf("WIFI PROBE: [5B.2] GLINK remote open 'SSM_RTR_MODEM_APPS' (rcid=%u) acked\n", p1);
++			/* Experiment A: Open local channel lcid=2 for SSM_RTR_MODEM_APPS */
++			if (!s5b.ssm_open_tx) {
++				printf("WIFI PROBE: [5B.2] GLINK SSM sending local open lcid=%u for 'SSM_RTR_MODEM_APPS'\n",
++				    GLINK_LCID_SSM_RTR);
++				(void)s5b_glink_send_open(GLINK_LCID_SSM_RTR, "SSM_RTR_MODEM_APPS");
++			}
++			if (s5b.ssm_open_acked && !s5b.ssm_intents_seeded) {
++				s5b.ssm_intents_seeded = true;
++				s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 2u, 256u);
++				s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 2u, 1024u);
 +			}
 +		} else {
 +			printf("WIFI PROBE: [5B.2] GLINK remote open '%s' (rcid=%u) acked\n",
@@ -4825,11 +4866,20 @@ new file mode 100644
 +
 +	case GLINK_CMD_OPEN_ACK:
 +		s5b_fifo_advance_rx(8u);
-+		if (p1 == 1u) {
++		if (p1 == GLINK_LCID_IPCRTR) {
 +			s5b.ipcrtr_open_acked = true;
 +			if (!s5b.intents_seeded) {
 +				s5b.intents_seeded = true;
 +				s5b_glink_seed_intents(8u, 8192u);
++			}
++		} else if (p1 == GLINK_LCID_SSM_RTR) {
++			s5b.ssm_open_acked = true;
++			printf("WIFI PROBE: [5B.2] GLINK SSM local open lcid=%u ACKED by modem (rcid=%u)\n",
++			    p1, s5b.ssm_rcid);
++			if (!s5b.ssm_intents_seeded) {
++				s5b.ssm_intents_seeded = true;
++				s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 2u, 256u);
++				s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 2u, 1024u);
 +			}
 +		}
 +		break;
@@ -4839,6 +4889,9 @@ new file mode 100644
 +		(void)s5b_glink_send_cmd(GLINK_CMD_CLOSE_ACK, p1, 0u);
 +		if (p1 == s5b.ipcrtr_rcid) {
 +			s5b.ipcrtr_rem_open = false;
++		} else if (p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) {
++			s5b.ssm_rem_open = false;
++			printf("WIFI PROBE: [5B.2] GLINK SSM remote close (ch=%u)\n", p1);
 +		}
 +		break;
 +
@@ -4870,6 +4923,11 @@ new file mode 100644
 +						break;
 +					}
 +				}
++			} else if (p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) {
++				uint32_t sz  = s5b_rd_le32(ib + 0);
++				uint32_t iid = s5b_rd_le32(ib + 4);
++				printf("WIFI PROBE: [5B.2] GLINK SSM remote advertised TX intent: iid=%u sz=%u (ch=%u)\n",
++				    iid, sz, p1);
 +			}
 +		}
 +		s5b_fifo_advance_rx(frame_len);
@@ -4891,6 +4949,9 @@ new file mode 100644
 +					break;
 +				}
 +			}
++		} else if (p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) {
++			printf("WIFI PROBE: [5B.2] GLINK SSM remote rx_done%s: iid=%u (ch=%u)\n",
++			    (cmd == GLINK_CMD_RX_DONE_W_REUSE) ? "_w_reuse" : "", p2, p1);
 +		}
 +		break;
 +
@@ -4900,6 +4961,11 @@ new file mode 100644
 +			uint32_t grant_sz = (p2 > 8192u) ? 8192u : ((p2 < 2048u) ? 2048u : p2);
 +			s5b_glink_seed_intents(1u, grant_sz);
 +			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 1u, 1u);
++		} else if (p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) {
++			printf("WIFI PROBE: [5B.2] GLINK SSM remote requested RX intent: req_sz=%u (ch=%u)\n", p2, p1);
++			uint32_t grant_sz = (p2 < 256u) ? 256u : p2;
++			s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 1u, grant_sz);
++			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, GLINK_LCID_SSM_RTR, 1u);
 +		} else {
 +			(void)s5b_glink_send_cmd(GLINK_CMD_RX_INTENT_REQ_ACK, 0u, 0u);
 +		}
@@ -4933,6 +4999,17 @@ new file mode 100644
 +			} else {
 +				s5b.rx_pkt_active = false;
 +			}
++		} else if (p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) {
++			if (cmd == GLINK_CMD_TX_DATA) {
++				s5b.ssm_rx_pkt_len = 0u;
++				s5b.ssm_rx_pkt_active = true;
++			}
++			if (s5b.ssm_rx_pkt_active && s5b.ssm_rx_pkt_len + chunk <= sizeof(s_5b_ssm_rx_pkt_buf)) {
++				s5b_fifo_peek_bytes(16u, s_5b_ssm_rx_pkt_buf + s5b.ssm_rx_pkt_len, chunk);
++				s5b.ssm_rx_pkt_len += chunk;
++			} else {
++				s5b.ssm_rx_pkt_active = false;
++			}
 +		}
 +		s5b_fifo_advance_rx(frame_len);
 +		if (p1 == s5b.ipcrtr_rcid && left == 0u) {
@@ -4956,6 +5033,28 @@ new file mode 100644
 +				} else {
 +					s5b_ipcrtr_rx_packet(s_5b_rx_pkt_buf, plen);
 +				}
++			}
++		} else if ((p1 == s5b.ssm_rcid || p1 == GLINK_LCID_SSM_RTR) && left == 0u) {
++			uint32_t plen = s5b.ssm_rx_pkt_active ? s5b.ssm_rx_pkt_len : 0u;
++			s5b.ssm_rx_pkt_active = false;
++			s5b.ssm_rx_pkt_len = 0u;
++			s5b.ssm_rx_pkt_count++;
++			printf("WIFI PROBE: [5B.2] *** GLINK SSM RX PACKET #%u *** len=%u liid=%u (ch=%u)\n",
++			    s5b.ssm_rx_pkt_count, plen, liid, p1);
++			uint32_t dlen = (plen < 64u) ? plen : 64u;
++			char hdump[200];
++			uint32_t hoff = 0u;
++			for (uint32_t b = 0u; b < dlen; b++) {
++				hoff += snprintf(hdump + hoff, sizeof(hdump) - hoff, "%02x ", s_5b_ssm_rx_pkt_buf[b]);
++			}
++			printf("WIFI PROBE: [5B.2]   SSM packet hex (%u bytes): %s\n", plen, hdump);
++			if (s5b.glink_reuse) {
++				(void)s5b_glink_send_cmd(GLINK_CMD_RX_DONE_W_REUSE, GLINK_LCID_SSM_RTR, liid);
++				printf("WIFI PROBE: [5B.2] GLINK SSM RX done with reuse (lcid=%u liid=%u)\n", GLINK_LCID_SSM_RTR, liid);
++			} else {
++				(void)s5b_glink_send_cmd(GLINK_CMD_RX_DONE, GLINK_LCID_SSM_RTR, liid);
++				printf("WIFI PROBE: [5B.2] GLINK SSM RX done (lcid=%u liid=%u), re-seeding intent\n", GLINK_LCID_SSM_RTR, liid);
++				s5b_glink_seed_channel_intents(GLINK_LCID_SSM_RTR, 1u, (plen < 256u) ? 256u : 1024u);
 +			}
 +		}
 +		break;
@@ -6586,10 +6685,10 @@ new file mode 100644
 +			break;
 +		}
 +		if ((ms % 2000u) == 0u && ms > 0u) {
-+			printf("WIFI PROBE: [5B.3] Heartbeat (%u ms): hello=%d notif=%d wlan_pd=%d (st=0x%x) wlfw=%d rmtfs_reads=%u tftp_reqs=%u\n",
++			printf("WIFI PROBE: [5B.3] Heartbeat (%u ms): hello=%d notif=%d wlan_pd=%d (st=0x%x) wlfw=%d rmtfs_reads=%u tftp_reqs=%u ssm_rx=%u\n",
 +			    ms, s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0,
 +			    s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state, s5b.wlfw_up ? 1 : 0,
-+			    s5b.rmtfs_read_count, s5b.tftp_req_count);
++			    s5b.rmtfs_read_count, s5b.tftp_req_count, s5b.ssm_rx_pkt_count);
 +
 +		}
 +		delay(1000);

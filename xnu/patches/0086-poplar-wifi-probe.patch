@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7019 @@
+@@ -0,0 +1,7027 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4256,7 +4256,7 @@ new file mode 100644
 +	probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_SMP2P_MASK);
 +}
 +
-+static void s5b_ssctl_query_failure_reason(void);
++static void s5b_ssctl_query_failure_reason(const char *tag);
 +
 +static void
 +s5b_dump_mpss_crash_reason(void)
@@ -4440,9 +4440,9 @@ new file mode 100644
 +		}
 +	}
 +
-+	/* 3. Check global SMEM table @ POPLAR_SMEM_BASE_PA (safe 256 KB mapping) */
++	/* 3. Check global SMEM table @ POPLAR_SMEM_BASE_PA (full 772 KB TOC[11] mapping) */
 +	if (!s_smem_base_va) {
-+		s_smem_base_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0x40000u);
++		s_smem_base_va = ml_io_map(POPLAR_SMEM_BASE_PA, 0xc1000u);
 +	}
 +	vm_offset_t p11_va = s_smem_base_va;
 +	if (p11_va) {
@@ -4452,7 +4452,7 @@ new file mode 100644
 +			printf("WIFI PROBE: [5B.2] SMEM p[11] ($PRT) free_unc=0x%x:\n", p11_free_unc);
 +			uint32_t off = 0x20u;
 +			uint32_t item_idx = 0u;
-+			while (off + 16u <= p11_free_unc && off <= 0x40000u - 16u && item_idx < 64u) {
++			while (off + 16u <= p11_free_unc && off <= 0xc1000u - 16u && item_idx < 64u) {
 +				uint32_t w0 = probe_rd32(p11_va, off);
 +				if ((uint16_t)w0 != SMEM_PRIVATE_CANARY) {
 +					break;
@@ -4500,10 +4500,10 @@ new file mode 100644
 +					alloc_count++;
 +					char cstr[128];
 +					for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
-+					if (item_off < 0x40000u) {
++					if (item_off < 0xc1000u) {
 +						uint32_t max_c = (item_sz < sizeof(cstr) - 1u) ? item_sz : (uint32_t)(sizeof(cstr) - 1u);
-+						if (item_off + max_c > 0x40000u) {
-+							max_c = 0x40000u - item_off;
++						if (item_off + max_c > 0xc1000u) {
++							max_c = 0xc1000u - item_off;
 +						}
 +						for (uint32_t k = 0u; k < max_c; k++) {
 +							uint32_t cw = probe_rd32(p11_va, item_off + (k & ~3u));
@@ -4512,32 +4512,36 @@ new file mode 100644
 +							if (ch == '\0') break;
 +						}
 +						cstr[sizeof(cstr) - 1u] = '\0';
-+					} else if (it == 421u && item_off < 0xc1000u) {
-+						vm_offset_t cva = ml_io_map(POPLAR_SMEM_BASE_PA + (item_off & ~0xfffu), 0x1000u);
-+						if (cva) {
-+							uint32_t poff = (item_off & 0xfffu);
-+							uint32_t max_c = (item_sz < sizeof(cstr) - 1u) ? item_sz : (uint32_t)(sizeof(cstr) - 1u);
-+							if (poff + max_c > 0x1000u) {
-+								max_c = 0x1000u - poff;
-+							}
-+							for (uint32_t k = 0u; k < max_c; k++) {
-+								uint32_t cw = probe_rd32(cva, poff + (k & ~3u));
-+								char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
-+								cstr[k] = (ch >= 32 && ch <= 126) ? ch : (ch == '\0' ? '\0' : '.');
-+								if (ch == '\0') break;
-+							}
-+							cstr[sizeof(cstr) - 1u] = '\0';
-+						}
 +					}
-+					if (it == 421u) {
-+						printf("WIFI PROBE: [5B.2] *** MPSS CRASH REASON (item 421): '%s' (sz=%u off=0x%x) ***\n",
-+						    cstr, item_sz, item_off);
-+					} else if (it == 134u || it == 133u || it == 424u || it == 3u || it == 4u || it == 10u) {
-+						printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: '%s' (sz=%u off=0x%x)\n",
-+						    it, cstr, item_sz, item_off);
-+					} else if (cstr[0] >= 32 && cstr[0] <= 126) {
-+						printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: '%s' (sz=%u off=0x%x)\n",
-+						    it, cstr, item_sz, item_off);
++					uint32_t w0 = (item_off + 4u <= 0xc1000u) ? probe_rd32(p11_va, item_off) : 0u;
++					uint32_t w1 = (item_off + 8u <= 0xc1000u) ? probe_rd32(p11_va, item_off + 4u) : 0u;
++					printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: sz=%u off=0x%x [w0=0x%08x w1=0x%08x] '%s'\n",
++					    it, item_sz, item_off, w0, w1, cstr);
++					if (it == 421u || it == 408u || it == 402u) {
++						if (item_off < 0xc1000u && item_sz > 0u) {
++							char sbuf[128];
++							unsigned s_len = 0u;
++							uint32_t scan_n = (item_sz < 512u) ? item_sz : 512u;
++							if (item_off + scan_n > 0xc1000u) scan_n = 0xc1000u - item_off;
++							for (uint32_t si = 0u; si < scan_n; si++) {
++								uint32_t cw = probe_rd32(p11_va, item_off + (si & ~3u));
++								char ch = (char)((cw >> ((si & 3u) * 8u)) & 0xffu);
++								if (ch >= 32 && ch <= 126) {
++									if (s_len < sizeof(sbuf) - 1u) sbuf[s_len++] = ch;
++								} else {
++									if (s_len >= 4u) {
++										sbuf[s_len] = '\0';
++										printf("WIFI PROBE: [5B.2]     item[%u]+%u ASCII: '%s'\n",
++										    it, (unsigned)(si - s_len), sbuf);
++									}
++									s_len = 0u;
++								}
++							}
++							if (s_len >= 4u) {
++								sbuf[s_len] = '\0';
++								printf("WIFI PROBE: [5B.2]     item[%u] ASCII: '%s'\n", it, sbuf);
++							}
++						}
 +					}
 +				}
 +			}
@@ -4545,7 +4549,7 @@ new file mode 100644
 +		}
 +	}
 +	if (s5b.ssctl_up) {
-+		s5b_ssctl_query_failure_reason();
++		s5b_ssctl_query_failure_reason("post-fatal");
 +	}
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}
@@ -6253,8 +6257,8 @@ new file mode 100644
 +			}
 +		} else if (msg_id == SSCTL_GET_FAILURE_REASON_REQ) {
 +			s5b.ssctl_sfr_recvd = true;
-+			printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON resp: txn=%u res=%u err=%u\n",
-+			    txn, res, err);
++			printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON resp: txn=%u res=%u err=%u (%s)\n",
++			    txn, res, err, (res == 0u && err == 0u) ? "SUCCESS" : "ERROR");
 +			uint16_t mlen = 0u;
 +			const uint8_t *mv = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &mlen);
 +			if (mv && mlen > 0u) {
@@ -6270,7 +6274,7 @@ new file mode 100644
 +				sfr[copylen] = '\0';
 +				printf("WIFI PROBE: [5B.3] *** SSCTL Subsystem Failure Reason (SFR): '%s' ***\n", sfr);
 +			} else {
-+				printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON returned no error string\n");
++				printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON returned no error string (len=%u)\n", sdu_len);
 +			}
 +		} else {
 +			printf("WIFI PROBE: [5B.3] SSCTL unhandled resp msg=0x%04x txn=%u res=%u err=%u\n",
@@ -6288,20 +6292,20 @@ new file mode 100644
 +}
 +
 +static void
-+s5b_ssctl_query_failure_reason(void)
++s5b_ssctl_query_failure_reason(const char *tag)
 +{
-+	if (!s5b.ssctl_up || s5b.ssctl_sfr_sent) {
++	if (!s5b.ssctl_up) {
 +		return;
 +	}
-+	s5b.ssctl_sfr_sent = true;
 +	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
 +	if (txn == 0u) {
 +		txn = (uint16_t)(++s5b.next_qmi_txn);
 +	}
 +	s5b.ssctl_sfr_txn = txn;
++	s5b.ssctl_sfr_sent = true;
 +
-+	printf("WIFI PROBE: [5B.3] SSCTL query failure reason (txn=%u -> node=%u port=%u)\n",
-+	    txn, s5b.ssctl_node, s5b.ssctl_port);
++	printf("WIFI PROBE: [5B.3] SSCTL query failure reason [%s] (txn=%u -> node=%u port=%u)\n",
++	    tag ? tag : "poll", txn, s5b.ssctl_node, s5b.ssctl_port);
 +
 +	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, SSCTL_GET_FAILURE_REASON_REQ,
 +	    QRTR_LOCAL_PORT_SSCTL, s5b.ssctl_node, s5b.ssctl_port, NULL, 0u);
@@ -6965,6 +6969,10 @@ new file mode 100644
 +			    s5b.ssr_rx_packets, s5b.ssr_rx_bytes,
 +			    s5b.ssctl_up ? 1 : 0, s5b.ssctl_event_sent ? 1 : 0, s5b.ssctl_event_acked ? 1 : 0,
 +			    s5b.ssctl_wcnss_sent ? 1 : 0, s5b.ssctl_wcnss_acked ? 1 : 0);
++			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
++			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
++				s5b_ssctl_query_failure_reason("pre-fatal");
++			}
 +		}
 +		delay(1000);
 +	}

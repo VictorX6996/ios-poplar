@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7027 @@
+@@ -0,0 +1,7028 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -5440,6 +5440,7 @@ new file mode 100644
 +			/* Aligned strictly with Sony poplar modemr.jsn and modemuw.jsn */
 +			{ "tms/servreg",          "msm/modem/root_pd", 180u },
 +			{ "tms/pdr_enabled",      "msm/modem/root_pd", 180u },
++			{ "tms/pddump_disabled",  "msm/modem/root_pd", 180u },
 +			{ "kernel/elf_loader",    "msm/modem/wlan_pd", 180u },
 +			{ "tms/servreg",          "msm/modem/wlan_pd", 180u },
 +			{ "wlan/fw",              "msm/modem/wlan_pd", 180u },

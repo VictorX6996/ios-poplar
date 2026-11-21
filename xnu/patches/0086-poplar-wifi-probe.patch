@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6854 @@
+@@ -0,0 +1,7010 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3668,6 +3668,7 @@ new file mode 100644
 +#define QRTR_TYPE_NEW_LOOKUP        10u
 +
 +#define QRTR_SVC_RMTFS              0x000eu
++#define QRTR_SVC_SSCTL              0x002bu
 +#define QRTR_SVC_SERVREG_LOC        0x0040u
 +#define QRTR_SVC_SERVREG_NOTIF      0x0042u
 +#define QRTR_SVC_WLFW               0x0045u
@@ -3678,12 +3679,26 @@ new file mode 100644
 +#define QRTR_LOCAL_PORT_TFTP        3u
 +#define QRTR_LOCAL_PORT_SERVREG_0   4u
 +#define QRTR_LOCAL_PORT_SERVREG_CLNT 5u
++#define QRTR_LOCAL_PORT_SSCTL       6u
 +#define QRTR_LOCAL_PORT_TFTP_SESS0  16u
 +#define QRTR_LOCAL_PORT_WLFW_CLNT   32u
 +
 +#define QMI_MSG_REQUEST             0u
 +#define QMI_MSG_RESPONSE            2u
 +#define QMI_MSG_INDICATION          4u
++
++#define SSCTL_RESTART_REQ           0x0020u
++#define SSCTL_SHUTDOWN_REQ          0x0021u
++#define SSCTL_GET_FAILURE_REASON_REQ 0x0022u
++#define SSCTL_SUBSYS_EVENT_REQ      0x0023u
++
++#define SSCTL_SSR_EVENT_BEFORE_POWERUP  0u
++#define SSCTL_SSR_EVENT_AFTER_POWERUP   1u
++#define SSCTL_SSR_EVENT_BEFORE_SHUTDOWN 2u
++#define SSCTL_SSR_EVENT_AFTER_SHUTDOWN  3u
++
++#define SSCTL_SSR_EVENT_FORCED          0u
++#define SSCTL_SSR_EVENT_GRACEFUL        1u
 +
 +#define WLFW_IND_REGISTER_REQ       0x0020u
 +#define WLFW_FW_READY_IND           0x0021u
@@ -3869,6 +3884,18 @@ new file mode 100644
 +	/* RMTFS open client handles */
 +	uint32_t    rmtfs_caller_id[8];
 +	struct tftp_session tftp[TFTP_MAX_SESS];
++
++	/* SSCTL client state */
++	bool        ssctl_up;
++	uint32_t    ssctl_node;
++	uint32_t    ssctl_port;
++	uint32_t    ssctl_inst;
++	uint16_t    ssctl_event_txn;
++	bool        ssctl_event_sent;
++	bool        ssctl_event_acked;
++	uint16_t    ssctl_sfr_txn;
++	bool        ssctl_sfr_sent;
++	bool        ssctl_sfr_recvd;
 +} s5b;
 +
 +static uint8_t s_5b_rx_pkt_buf[8192]  __attribute__((aligned(8)));
@@ -4227,6 +4254,8 @@ new file mode 100644
 +	probe_wr32(s5b.ipc_va, 0x08u, APCS_IPC_MPSS_SMP2P_MASK);
 +}
 +
++static void s5b_ssctl_query_failure_reason(void);
++
 +static void
 +s5b_dump_mpss_crash_reason(void)
 +{
@@ -4512,6 +4541,9 @@ new file mode 100644
 +			}
 +			printf("WIFI PROBE: [5B.2] Global SMEM total allocated items: %u\n", alloc_count);
 +		}
++	}
++	if (s5b.ssctl_up) {
++		s5b_ssctl_query_failure_reason();
 +	}
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}
@@ -6156,6 +6188,118 @@ new file mode 100644
 +}
 +
 +static void
++s5b_ssctl_send_event(uint32_t snode, uint32_t sport, const char *subsys_name, uint32_t event)
++{
++	uint8_t req[64];
++	uint32_t roff = 0u;
++	uint8_t name_buf[16];
++	unsigned nlen = sweet_str_len(subsys_name);
++	if (nlen > 14u) {
++		nlen = 14u;
++	}
++	name_buf[0] = (uint8_t)nlen;
++	memcpy(name_buf + 1, subsys_name, nlen);
++
++	/* TLV 0x01: subsys_name (1 byte len prefix + ASCII chars) */
++	roff = s5b_qmi_put_tlv(req, roff, 0x01u, (uint16_t)(1u + nlen), name_buf);
++
++	/* TLV 0x02: event (uint32 enum) */
++	uint8_t ev_buf[4];
++	s5b_wr_le32(ev_buf, event);
++	roff = s5b_qmi_put_tlv(req, roff, 0x02u, 4u, ev_buf);
++
++	/* TLV 0x10: evt_driven (uint32 enum, forced=0) */
++	uint8_t drv_buf[4];
++	s5b_wr_le32(drv_buf, SSCTL_SSR_EVENT_FORCED);
++	roff = s5b_qmi_put_tlv(req, roff, 0x10u, 4u, drv_buf);
++
++	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (txn == 0u) {
++		txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	s5b.ssctl_event_txn = txn;
++	s5b.ssctl_event_sent = true;
++
++	printf("WIFI PROBE: [5B.3] SSCTL send subsys_event '%s' event=%u (txn=%u -> node=%u port=%u)\n",
++	    subsys_name, event, txn, snode, sport);
++
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, SSCTL_SUBSYS_EVENT_REQ,
++	    QRTR_LOCAL_PORT_SSCTL, snode, sport, req, (uint16_t)roff);
++}
++
++static void
++s5b_handle_ssctl_client(uint32_t src_node, uint32_t src_port,
++    uint8_t qtype, uint16_t txn, uint16_t msg_id, const uint8_t *sdu, uint32_t sdu_len)
++{
++	(void)src_node;
++	(void)src_port;
++	if (qtype == QMI_MSG_RESPONSE) {
++		uint16_t rlen = 0u;
++		const uint8_t *rv = s5b_qmi_find_tlv(sdu, sdu_len, 0x02u, &rlen);
++		uint16_t res = (rv && rlen >= 4u) ? s5b_rd_le16(rv + 0) : 0xffffu;
++		uint16_t err = (rv && rlen >= 4u) ? s5b_rd_le16(rv + 2) : 0xffffu;
++
++		if (msg_id == SSCTL_SUBSYS_EVENT_REQ) {
++			s5b.ssctl_event_acked = (res == 0u);
++			printf("WIFI PROBE: [5B.3] SSCTL SUBSYS_EVENT resp: txn=%u res=%u err=%u (%s)\n",
++			    txn, res, err, (res == 0u && err == 0u) ? "SUCCESS" : "ERROR");
++		} else if (msg_id == SSCTL_GET_FAILURE_REASON_REQ) {
++			s5b.ssctl_sfr_recvd = true;
++			printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON resp: txn=%u res=%u err=%u\n",
++			    txn, res, err);
++			uint16_t mlen = 0u;
++			const uint8_t *mv = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &mlen);
++			if (mv && mlen > 0u) {
++				const char *str_start = (const char *)mv;
++				uint16_t str_len = mlen;
++				if (mlen >= 2u && (mv[0] == 0u || mv[0] == 1u) && (uint16_t)mv[1] <= mlen - 2u) {
++					str_start = (const char *)(mv + 2u);
++					str_len = mv[1];
++				}
++				char sfr[96];
++				uint16_t copylen = (str_len < (uint16_t)(sizeof(sfr) - 1u)) ? str_len : (uint16_t)(sizeof(sfr) - 1u);
++				memcpy(sfr, str_start, copylen);
++				sfr[copylen] = '\0';
++				printf("WIFI PROBE: [5B.3] *** SSCTL Subsystem Failure Reason (SFR): '%s' ***\n", sfr);
++			} else {
++				printf("WIFI PROBE: [5B.3] SSCTL GET_FAILURE_REASON returned no error string\n");
++			}
++		} else {
++			printf("WIFI PROBE: [5B.3] SSCTL unhandled resp msg=0x%04x txn=%u res=%u err=%u\n",
++			    msg_id, txn, res, err);
++		}
++	} else if (qtype == QMI_MSG_INDICATION) {
++		printf("WIFI PROBE: [5B.3] SSCTL IND msg=0x%04x len=%u\n", msg_id, sdu_len);
++		if (msg_id == SSCTL_SUBSYS_EVENT_REQ) {
++			printf("WIFI PROBE: [5B.3] SSCTL SUBSYS_EVENT_READY_IND received\n");
++		}
++	} else {
++		printf("WIFI PROBE: [5B.3] SSCTL unhandled qtype=%u msg=0x%04x txn=%u\n",
++		    qtype, msg_id, txn);
++	}
++}
++
++static void
++s5b_ssctl_query_failure_reason(void)
++{
++	if (!s5b.ssctl_up || s5b.ssctl_sfr_sent) {
++		return;
++	}
++	s5b.ssctl_sfr_sent = true;
++	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (txn == 0u) {
++		txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	s5b.ssctl_sfr_txn = txn;
++
++	printf("WIFI PROBE: [5B.3] SSCTL query failure reason (txn=%u -> node=%u port=%u)\n",
++	    txn, s5b.ssctl_node, s5b.ssctl_port);
++
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, SSCTL_GET_FAILURE_REASON_REQ,
++	    QRTR_LOCAL_PORT_SSCTL, s5b.ssctl_node, s5b.ssctl_port, NULL, 0u);
++}
++
++static void
 +s5b_ipcrtr_rx_packet(const uint8_t *pkt, uint32_t len)
 +{
 +	if (len < 32u) {
@@ -6219,6 +6363,13 @@ new file mode 100644
 +				s5b.wlfw_up   = true;
 +				s5b.wlfw_node = snode;
 +				s5b.wlfw_port = sport;
++			}
++			if (svc == QRTR_SVC_SSCTL) {
++				s5b.ssctl_up   = true;
++				s5b.ssctl_node = snode;
++				s5b.ssctl_port = sport;
++				s5b.ssctl_inst = inst >> 8;
++				s5b_ssctl_send_event(snode, sport, "modem", SSCTL_SSR_EVENT_AFTER_POWERUP);
 +			}
 +		} else if (cmd == QRTR_TYPE_NEW_LOOKUP && size >= 12u) {
 +			uint32_t svc  = s5b_rd_le32(body + 4);
@@ -6286,6 +6437,10 @@ new file mode 100644
 +		s5b_qmi_dump_packet("RX", src_node, src_port, QRTR_NODE_APPS, dst_port,
 +		    qtype, qtxn, qmsg, qsdu, qlen);
 +		s5b_handle_servreg_notif_client(src_node, src_port, qtype, qtxn, qmsg, qsdu, qlen);
++	} else if (dst_port == QRTR_LOCAL_PORT_SSCTL) {
++		s5b_qmi_dump_packet("RX", src_node, src_port, QRTR_NODE_APPS, dst_port,
++		    qtype, qtxn, qmsg, qsdu, qlen);
++		s5b_handle_ssctl_client(src_node, src_port, qtype, qtxn, qmsg, qsdu, qlen);
 +	} else if (dst_port == QRTR_LOCAL_PORT_RMTFS) {
 +		if (qtype == QMI_MSG_REQUEST) {
 +			s5b_handle_rmtfs_qmi(src_node, src_port, qtxn, qmsg, qsdu, qlen);
@@ -6793,13 +6948,14 @@ new file mode 100644
 +			    ms, t_rel, s5b.hello_recvd ? 1 : 0, s5b.servreg_notif_up ? 1 : 0,
 +			    s5b.wlan_pd_started ? 1 : 0, s5b.wlan_pd_state, s5b.wlfw_up ? 1 : 0,
 +			    s5b.rmtfs_read_count, s5b.tftp_req_count);
-+			printf("WIFI PROBE: [5B.3]   SSM(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSR(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u)\n",
++			printf("WIFI PROBE: [5B.3]   SSM(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSR(open=%d adv_int=%u rx_int=%u pkts=%u bytes=%u) SSCTL(up=%d sent=%d ack=%d)\n",
 +			    (s5b.ssm_open_acked && s5b.ssm_rem_open) ? 1 : 0,
 +			    s5b.ssm_rx_intents_advertised, s5b.ssm_tx_intents_received,
 +			    s5b.ssm_rx_packets, s5b.ssm_rx_bytes,
 +			    (s5b.ssr_open_acked && s5b.ssr_rem_open) ? 1 : 0,
 +			    s5b.ssr_rx_intents_advertised, s5b.ssr_tx_intents_received,
-+			    s5b.ssr_rx_packets, s5b.ssr_rx_bytes);
++			    s5b.ssr_rx_packets, s5b.ssr_rx_bytes,
++			    s5b.ssctl_up ? 1 : 0, s5b.ssctl_event_sent ? 1 : 0, s5b.ssctl_event_acked ? 1 : 0);
 +		}
 +		delay(1000);
 +	}

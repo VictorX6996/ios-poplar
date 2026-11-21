@@ -6369,7 +6369,7 @@ new file mode 100644
 +				s5b.ssctl_node = snode;
 +				s5b.ssctl_port = sport;
 +				s5b.ssctl_inst = inst >> 8;
-+				s5b_ssctl_send_event(snode, sport, "modem", SSCTL_SSR_EVENT_AFTER_POWERUP);
++				s5b_ssctl_send_event(snode, sport, "wcnss", SSCTL_SSR_EVENT_AFTER_POWERUP);
 +			}
 +		} else if (cmd == QRTR_TYPE_NEW_LOOKUP && size >= 12u) {
 +			uint32_t svc  = s5b_rd_le32(body + 4);

@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,6581 @@
+@@ -0,0 +1,6625 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3244,7 +3244,7 @@ new file mode 100644
 +			part_h0  = h0;
 +			part_h1  = h1;
 +		}
-+		if (h0 == 0xFFFEu && h1 == 0xFFFEu &&
++		if (((h0 == 0xFFFFu && h1 == 0xFFFFu) || (h0 == 0xFFFEu && h1 == 0xFFFEu)) &&
 +		    sz > 0u && sz <= 0x200000u && off <= 0x200000u - sz && s_smem_comm_pa == 0u) {
 +			s_smem_comm_pa = POPLAR_SMEM_BASE_PA + off;
 +			s_smem_comm_sz = sz;
@@ -3758,6 +3758,9 @@ new file mode 100644
 +	uint32_t    smp2p_in_off;
 +	uint32_t    smp2p_out_off;
 +	uint32_t    smp2p_last_state;
++	bool        smp2p_ipa_in_seen;
++	uint32_t    smp2p_ipa_in_last;
++	uint32_t    smp2p_ipa_out_val;
 +	uint32_t    descs_off;
 +	uint32_t    tx_tail_idx;
 +	uint32_t    tx_head_idx;
@@ -4513,7 +4516,32 @@ new file mode 100644
 +					s5b_dump_mpss_crash_reason();
 +				}
 +			}
-+			break;
++		} else if (strcmp(ename, "ipa") == 0) {
++			uint32_t v = s5b_part_rd32(eoff + 16u);
++			if (!s5b.smp2p_ipa_in_seen || v != s5b.smp2p_ipa_in_last) {
++				bool first = !s5b.smp2p_ipa_in_seen;
++				uint32_t prev = s5b.smp2p_ipa_in_last;
++				s5b.smp2p_ipa_in_seen = true;
++				s5b.smp2p_ipa_in_last = v;
++				printf("WIFI PROBE: [5B.2] SMP2P ipa-in state=0x%x (prev=0x%x)%s\n",
++				    v, prev, (v & 1u) ? " [QUERY_ASSERTED]" : "");
++				if ((v & 1u) && (first || !(prev & 1u))) {
++					if (s5b.smp2p_out_off != 0u) {
++						s5b.smp2p_ipa_out_val = 1u;
++						s5b_part_wr32(s5b.smp2p_out_off + 56u, 1u); /* answer valid, AP IPA power off */
++						__asm__ volatile("dsb sy" ::: "memory");
++						s5b_smp2p_kick();
++						printf("WIFI PROBE: [5B.2] Answered SMP2P IPA query: ipa-in=0x%x -> ipa-out=1 (AP IPA power off)\n", v);
++					}
++				}
++			}
++		} else {
++			static uint32_t s_unknown_seen_mask = 0u;
++			if ((s_unknown_seen_mask & (1u << e)) == 0u) {
++				s_unknown_seen_mask |= (1u << e);
++				uint32_t v = s5b_part_rd32(eoff + 16u);
++				printf("WIFI PROBE: [5B.2] SMP2P inbound entry[%u] '%s' val=0x%x\n", e, ename, v);
++			}
 +		}
 +	}
 +}
@@ -6202,6 +6230,9 @@ new file mode 100644
 +		return false;
 +	}
 +	s5b.smp2p_last_state = 0xffffffffu;
++	s5b.smp2p_ipa_in_seen = false;
++	s5b.smp2p_ipa_in_last = 0xffffffffu;
++	s5b.smp2p_ipa_out_val = 0u;
 +
 +	uint32_t free_unc = s5b_part_rd32(0x0cu);
 +	uint32_t free_cac = s5b_part_rd32(0x10u);
@@ -6242,14 +6273,27 @@ new file mode 100644
 +	if (s5b_smem_alloc_unc(SMEM_SMP2P_OUT_MODEM_ID, 340u, &s5b.smp2p_out_off)) {
 +		if (s5b_part_rd32(s5b.smp2p_out_off + 0u) != 0x504d5324u) {
 +			s5b_part_wr32(s5b.smp2p_out_off + 8u,  (1u << 16) | 0u);  /* local=0, rem=1 */
-+			s5b_part_wr32(s5b.smp2p_out_off + 12u, (1u << 16) | 16u); /* valid=1, total=16 */
++			s5b_part_wr32(s5b.smp2p_out_off + 12u, (2u << 16) | 16u); /* valid=2, total=16 */
 +			s5b_part_wr32(s5b.smp2p_out_off + 16u, 0u);
++			/* Entry 0: master-kernel */
 +			s5b_part_wr_ascii4(s5b.smp2p_out_off + 20u, "master-kernel", 16u);
 +			s5b_part_wr32(s5b.smp2p_out_off + 36u, 0u);
++			/* Entry 1: ipa */
++			s5b_part_wr_ascii4(s5b.smp2p_out_off + 40u, "ipa", 16u);
++			s5b_part_wr32(s5b.smp2p_out_off + 56u, 0u);
 +			s5b_part_wr32(s5b.smp2p_out_off + 0u,  0x504d5324u); /* "$SMP" */
 +			__asm__ volatile("dsb sy" ::: "memory");
 +			s5b_part_wr32(s5b.smp2p_out_off + 4u,  1u | (1u << 8)); /* ver=1, feat=SSR_ACK */
-+			printf("WIFI PROBE: [5B.2] Allocated SMP2P-out(428) @ +0x%04x\n", s5b.smp2p_out_off);
++			printf("WIFI PROBE: [5B.2] Allocated SMP2P-out(428) @ +0x%04x (entries: master-kernel=0, ipa=0)\n", s5b.smp2p_out_off);
++		} else {
++			uint32_t ve = s5b_part_rd32(s5b.smp2p_out_off + 12u) >> 16;
++			if (ve < 2u) {
++				s5b_part_wr_ascii4(s5b.smp2p_out_off + 40u, "ipa", 16u);
++				s5b_part_wr32(s5b.smp2p_out_off + 56u, 0u);
++				__asm__ volatile("dsb sy" ::: "memory");
++				s5b_part_wr32(s5b.smp2p_out_off + 12u, (2u << 16) | 16u);
++				printf("WIFI PROBE: [5B.2] Extended SMP2P-out(428) with entry[1] 'ipa'=0\n");
++			}
 +		}
 +		s5b_smp2p_kick();
 +	}

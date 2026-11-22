@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7133 @@
+@@ -0,0 +1,7138 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4268,6 +4268,17 @@ new file mode 100644
 +#define POPLAR_IMEM_BOOT_STATS_OFF  0x6b0u  /* boot_stats@6b0 */
 +#define POPLAR_IMEM_PIL_INFO_OFF    0x94cu  /* pil@94c */
 +
++static vm_offset_t s_imem_va = 0;
++
++static vm_offset_t
++s5b_get_imem_va(void)
++{
++	if (!s_imem_va) {
++		s_imem_va = ml_io_map(POPLAR_IMEM_BASE_PA, POPLAR_IMEM_SIZE);
++	}
++	return s_imem_va;
++}
++
 +static void
 +s5b_audit_post_fatal_diagnostics(void)
 +{
@@ -4285,7 +4296,6 @@ new file mode 100644
 +		printf("WIFI PROBE: [5B.2] QDSP6SS registers @ 0x%08x:\n", POPLAR_QDSP6SS_PAGE_PA);
 +		printf("WIFI PROBE: [5B.2]   RESET=0x%08x GFMUX=0x%08x PWR=0x%08x XO_CBCR=0x%08x SLP_CBCR=0x%08x BHS=0x%08x\n",
 +		    rst, gfmux, pwr, xo, slp, bhs);
-+		ml_io_unmap(q6, 0x1000u);
 +	}
 +
 +	/* 2. TCSR MSS Halt Status (halt_q6, halt_nc, halt_modem) */
@@ -4301,7 +4311,6 @@ new file mode 100644
 +		    (unsigned long long)TCSR_MSS_HALT_PHYS_BASE);
 +		printf("WIFI PROBE: [5B.2]   halt_q6: req=0x%x ack=0x%x | halt_nc: req=0x%x ack=0x%x | halt_modem: req=0x%x ack=0x%x\n",
 +		    q6_req, q6_ack, nc_req, nc_ack, modem_req, modem_ack);
-+		ml_io_unmap(halt_va, TCSR_MSS_HALT_SIZE);
 +	}
 +
 +	/* 3. GCC MSS Restart Register */
@@ -4310,11 +4319,10 @@ new file mode 100644
 +		uint32_t mss_rst = probe_rd32(rst_va, 0x00u);
 +		printf("WIFI PROBE: [5B.2] GCC MSS Restart Register @ 0x%08llx: val=0x%08x\n",
 +		    (unsigned long long)GCC_MSS_RESTART_PHYS_BASE, mss_rst);
-+		ml_io_unmap(rst_va, GCC_MSS_RESTART_SIZE);
 +	}
 +
 +	/* 4. IMEM Shared Status & Diagnostics (0x146bf000) */
-+	vm_offset_t imem_va = ml_io_map(POPLAR_IMEM_BASE_PA, POPLAR_IMEM_SIZE);
++	vm_offset_t imem_va = s5b_get_imem_va();
 +	if (imem_va) {
 +		uint64_t dump_tbl_pa = (uint64_t)probe_rd32(imem_va, POPLAR_IMEM_MEM_DUMP_OFF) |
 +		    ((uint64_t)probe_rd32(imem_va, POPLAR_IMEM_MEM_DUMP_OFF + 4u) << 32);
@@ -4341,8 +4349,6 @@ new file mode 100644
 +			printf(" %08x", probe_rd32(imem_va, POPLAR_IMEM_BOOT_STATS_OFF + w * 4u));
 +		}
 +		printf("\n");
-+
-+		ml_io_unmap(imem_va, POPLAR_IMEM_SIZE);
 +	} else {
 +		printf("WIFI PROBE: [5B.2] ERROR: ml_io_map failed for IMEM @ 0x%08llx\n",
 +		    (unsigned long long)POPLAR_IMEM_BASE_PA);
@@ -7007,14 +7013,13 @@ new file mode 100644
 +	    s_fw_wlanmdsp.size, s_img_dir_cnt);
 +
 +	/* 5B.0: IMEM baseline read (0x146bf000) */
-+	vm_offset_t imem_base_va = ml_io_map(POPLAR_IMEM_BASE_PA, POPLAR_IMEM_SIZE);
++	vm_offset_t imem_base_va = s5b_get_imem_va();
 +	if (imem_base_va) {
 +		uint32_t b_rst = probe_rd32(imem_base_va, POPLAR_IMEM_RESTART_REASON);
 +		uint32_t b_dld = probe_rd32(imem_base_va, POPLAR_IMEM_DLOAD_TYPE_OFF);
 +		uint32_t b_pil = probe_rd32(imem_base_va, POPLAR_IMEM_PIL_INFO_OFF);
 +		printf("WIFI PROBE: [5B.0] IMEM baseline @ 0x%08llx: restart_reason=0x%08x dload_type=0x%08x pil_info=0x%08x\n",
 +		    (unsigned long long)POPLAR_IMEM_BASE_PA, b_rst, b_dld, b_pil);
-+		ml_io_unmap(imem_base_va, POPLAR_IMEM_SIZE);
 +	}
 +
 +	/* 5B.1: ANOC2 SMMU S1-Bypass + PM8998 WLAN Rails + clk_rf_clk2_pin + RMTFS/MSA prep */

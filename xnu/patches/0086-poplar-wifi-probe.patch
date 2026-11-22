@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7028 @@
+@@ -0,0 +1,7240 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4257,6 +4257,217 @@ new file mode 100644
 +}
 +
 +static void s5b_ssctl_query_failure_reason(const char *tag);
++static void s5b_audit_mpss_ram_post_fatal(void);
++
++static void
++s5b_scan_ram_chunk(uint64_t chunk_pa, uint32_t chunk_sz, const char *region_name)
++{
++	vm_offset_t va = ml_io_map(chunk_pa, chunk_sz);
++	if (!va) {
++		printf("WIFI PROBE: [5B.2]   Failed to map %s chunk @ 0x%08llx\n",
++		    region_name, (unsigned long long)chunk_pa);
++		return;
++	}
++
++	const uint8_t *p = (const uint8_t *)va;
++	uint32_t i = 0u;
++	uint32_t matches_found = 0u;
++
++	while (i + 8u <= chunk_sz && matches_found < 30u) {
++		if (p[i] >= 32 && p[i] <= 126) {
++			uint32_t start = i;
++			while (i < chunk_sz && ((p[i] >= 32 && p[i] <= 126) || p[i] == '\t' || p[i] == '\n' || p[i] == '\r')) {
++				i++;
++			}
++			uint32_t len = i - start;
++			if (len >= 8u) {
++				bool all_same = true;
++				for (uint32_t c = 1u; c < len; c++) {
++					if (p[start + c] != p[start]) {
++						all_same = false;
++						break;
++					}
++				}
++				if (!all_same) {
++					char buf[256];
++					uint32_t copy_n = (len < sizeof(buf) - 1u) ? len : (uint32_t)(sizeof(buf) - 1u);
++					for (uint32_t c = 0u; c < copy_n; c++) {
++						char ch = (char)p[start + c];
++						buf[c] = (ch >= 32 && ch <= 126) ? ch : ' ';
++					}
++					buf[copy_n] = '\0';
++
++					bool interesting = false;
++					static const char * const kw[] = {
++						"ERR", "err", "FATAL", "fatal", "ASSERT", "assert",
++						"CRASH", "crash", "wdog", "watchdog", "TIMEOUT", "timeout",
++						"panic", "PANIC", "ExIPC", "Exception", "badva", "QDSP6_",
++						"tcb.task_name", "MPSS:", "PD_MON:", "/dev/", "wlan",
++						"eloader", "rejuvenate", "qurt", "QURT", "SSR", "ssr",
++						"died", "abort", "ABORT", "fail", "FAIL", "reason"
++					};
++					for (unsigned k = 0u; k < sizeof(kw)/sizeof(kw[0]); k++) {
++						if (strstr(buf, kw[k]) != NULL) {
++							interesting = true;
++							break;
++						}
++					}
++
++					if (interesting) {
++						matches_found++;
++						printf("WIFI PROBE: [5B.2]   [%s +0x%05x | PA 0x%08llx]: '%s'\n",
++						    region_name, start, (unsigned long long)(chunk_pa + start), buf);
++
++						if (strstr(buf, "ERR crash log report") != NULL ||
++						    strstr(buf, "Register values from coredump") != NULL ||
++						    strstr(buf, "Error message:") != NULL) {
++							printf("WIFI PROBE: [5B.2]   --- EXPANDED CRASH REPORT @ PA 0x%08llx ---\n",
++							    (unsigned long long)(chunk_pa + start));
++							uint32_t block_len = (chunk_sz - start < 1024u) ? (chunk_sz - start) : 1024u;
++							char line[128];
++							uint32_t line_pos = 0u;
++							for (uint32_t b = 0u; b < block_len; b++) {
++								char ch = (char)p[start + b];
++								if (ch == '\n' || ch == '\0') {
++									if (line_pos > 0u) {
++										line[line_pos] = '\0';
++										printf("WIFI PROBE: [5B.2]     | %s\n", line);
++										line_pos = 0u;
++									}
++								} else if (ch >= 32 && ch <= 126) {
++									if (line_pos < sizeof(line) - 1u) {
++										line[line_pos++] = ch;
++									}
++								}
++							}
++							if (line_pos > 0u) {
++								line[line_pos] = '\0';
++								printf("WIFI PROBE: [5B.2]     | %s\n", line);
++							}
++							printf("WIFI PROBE: [5B.2]   --- END CRASH REPORT ---\n");
++						}
++					}
++				}
++			}
++		} else {
++			i++;
++		}
++	}
++
++	ml_io_unmap(va, chunk_sz);
++}
++
++static void
++s5b_audit_mpss_ram_post_fatal(void)
++{
++	printf("WIFI PROBE: [5B.2] --- MPSS RAM POST-FATAL AUDIT & CRASH EXTRACTION ---\n");
++
++	/* 1. Reclaim 112 MiB MPSS memory MSS_MSA -> HLOS */
++	printf("WIFI PROBE: [5B.2] Reclaiming MPSS memory (0x%08llx, %llu MiB) MSS_MSA -> HLOS...\n",
++	    (unsigned long long)PIL_MPSS_PHYS_BASE, (unsigned long long)(PIL_MPSS_SIZE >> 20));
++
++	int reclaim_rc = sweet_scm_assign_mem(PIL_MPSS_PHYS_BASE, PIL_MPSS_SIZE,
++	    QCOM_SCM_VMID_MSS_MSA, QCOM_SCM_VMID_HLOS, QCOM_SCM_PERM_RWX);
++	printf("WIFI PROBE: [5B.2] MP_ASSIGN reclaim result: rc=%d\n", reclaim_rc);
++	if (reclaim_rc != 0) {
++		printf("WIFI PROBE: [5B.2] ERROR: MPSS memory reclaim rejected (rc=%d); skipping RAM access.\n",
++		    reclaim_rc);
++		return;
++	}
++
++	/* 2. QDSP6SS Hardware Registers */
++	vm_offset_t q6 = ml_io_map(POPLAR_QDSP6SS_PAGE_PA, 0x1000u);
++	if (q6) {
++		uint32_t rst   = probe_rd32(q6, QDSP6SS_RESET_REG);
++		uint32_t gfmux = probe_rd32(q6, QDSP6SS_GFMUX_CTL_REG);
++		uint32_t pwr   = probe_rd32(q6, QDSP6SS_PWR_CTL_REG);
++		uint32_t xo    = probe_rd32(q6, QDSP6SS_XO_CBCR);
++		uint32_t slp   = probe_rd32(q6, QDSP6SS_SLEEP_CBCR);
++		uint32_t bhs   = probe_rd32(q6, QDSP6SS_BHS_STATUS_REG);
++		printf("WIFI PROBE: [5B.2] QDSP6SS registers @ 0x%08x:\n", POPLAR_QDSP6SS_PAGE_PA);
++		printf("WIFI PROBE: [5B.2]   RESET=0x%08x GFMUX=0x%08x PWR=0x%08x XO_CBCR=0x%08x SLP_CBCR=0x%08x BHS=0x%08x\n",
++		    rst, gfmux, pwr, xo, slp, bhs);
++		ml_io_unmap(q6, 0x1000u);
++	}
++
++	/* 3. QuRT Process Table @ PA 0x8f31fb80 */
++	vm_offset_t pt_page_va = ml_io_map(0x8f31f000ULL, 0x2000u);
++	if (pt_page_va) {
++		vm_offset_t pt_va = pt_page_va + 0xb80u;
++		printf("WIFI PROBE: [5B.2] QuRT Process Table @ PA 0x8f31fb80:\n");
++		for (unsigned p = 0u; p < 4u; p++) {
++			vm_offset_t proc_va = pt_va + p * 0x40u;
++			uint32_t flags  = probe_rd32(proc_va, 0x00u);
++			uint32_t status = probe_rd32(proc_va, 0x04u);
++			char name[33];
++			for (unsigned k = 0u; k < 32u; k++) {
++				uint32_t w = probe_rd32(proc_va, 0x08u + (k & ~3u));
++				char ch = (char)((w >> ((k & 3u) * 8u)) & 0xffu);
++				name[k] = (ch >= 32 && ch <= 126) ? ch : '\0';
++			}
++			name[32] = '\0';
++			uint32_t w10 = probe_rd32(proc_va, 0x28u);
++			uint32_t w11 = probe_rd32(proc_va, 0x2cu);
++			uint32_t w12 = probe_rd32(proc_va, 0x30u);
++			uint32_t w13 = probe_rd32(proc_va, 0x34u);
++			uint32_t w14 = probe_rd32(proc_va, 0x38u);
++			uint32_t w15 = probe_rd32(proc_va, 0x3cu);
++			printf("WIFI PROBE: [5B.2]   Proc[%u]: flags=0x%08x status=0x%08x name='%s'\n",
++			    p, flags, status, name);
++			printf("WIFI PROBE: [5B.2]     desc: [0x%08x 0x%08x 0x%08x 0x%08x 0x%08x 0x%08x]\n",
++			    w10, w11, w12, w13, w14, w15);
++		}
++		ml_io_unmap(pt_page_va, 0x2000u);
++	} else {
++		printf("WIFI PROBE: [5B.2] ERROR: ml_io_map failed for QuRT Process Table @ 0x8f31f000\n");
++	}
++
++	/* 4. User PD Descriptor Block @ PA 0x8ee41d30 */
++	vm_offset_t desc_page_va = ml_io_map(0x8ee41000ULL, 0x1000u);
++	if (desc_page_va) {
++		vm_offset_t d_va = desc_page_va + 0xd00u;
++		printf("WIFI PROBE: [5B.2] User PD Descriptor Block @ PA 0x8ee41d00:\n");
++		for (unsigned row = 0u; row < 16u; row++) {
++			uint32_t roff = row * 16u;
++			uint32_t w0 = probe_rd32(d_va, roff + 0u);
++			uint32_t w1 = probe_rd32(d_va, roff + 4u);
++			uint32_t w2 = probe_rd32(d_va, roff + 8u);
++			uint32_t w3 = probe_rd32(d_va, roff + 12u);
++			char asc[17];
++			for (unsigned b = 0u; b < 16u; b++) {
++				uint32_t bw = probe_rd32(d_va, roff + (b & ~3u));
++				char ch = (char)((bw >> ((b & 3u) * 8u)) & 0xffu);
++				asc[b] = (ch >= 32 && ch <= 126) ? ch : '.';
++			}
++			asc[16] = '\0';
++			printf("WIFI PROBE: [5B.2]   +0x%03x: %08x %08x %08x %08x | %s\n",
++			    roff, w0, w1, w2, w3, asc);
++		}
++		ml_io_unmap(desc_page_va, 0x1000u);
++	} else {
++		printf("WIFI PROBE: [5B.2] ERROR: ml_io_map failed for User PD Descriptor @ 0x8ee41000\n");
++	}
++
++	/* 5. Scan MPSS RAM for crash logs, SFR reason, exception reports, and registers */
++	printf("WIFI PROBE: [5B.2] Scanning Segment 17 BSS (0x8f320000, 2 MiB)...\n");
++	for (uint64_t pa = 0x8f320000ULL; pa < 0x8f520000ULL; pa += 0x40000ULL) {
++		s5b_scan_ram_chunk(pa, 0x40000u, "SEG17-BSS");
++	}
++
++	printf("WIFI PROBE: [5B.2] Scanning Segment 19 Heap (0x9046c000, 1 MiB)...\n");
++	for (uint64_t pa = 0x9046c000ULL; pa < 0x9056c000ULL; pa += 0x40000ULL) {
++		s5b_scan_ram_chunk(pa, 0x40000u, "SEG19-HEAP");
++	}
++
++	printf("WIFI PROBE: [5B.2] Scanning Segment 2 Vectors/Boot (0x8cc00000, 64 KiB)...\n");
++	s5b_scan_ram_chunk(0x8cc00000ULL, 0x10000u, "SEG02-VEC");
++
++	printf("WIFI PROBE: [5B.2] Scanning Segment 29 User-PD BSS (0x92f99000, 512 KiB)...\n");
++	for (uint64_t pa = 0x92f99000ULL; pa < 0x93019000ULL; pa += 0x40000ULL) {
++		s5b_scan_ram_chunk(pa, 0x40000u, "SEG29-UPDBSS");
++	}
++	printf("WIFI PROBE: [5B.2] --- MPSS RAM POST-FATAL AUDIT COMPLETE ---\n");
++}
 +
 +static void
 +s5b_dump_mpss_crash_reason(void)
@@ -4551,6 +4762,7 @@ new file mode 100644
 +	if (s5b.ssctl_up) {
 +		s5b_ssctl_query_failure_reason("post-fatal");
 +	}
++	s5b_audit_mpss_ram_post_fatal();
 +	printf("WIFI PROBE: [5B.2] =======================================================\n");
 +}
 +

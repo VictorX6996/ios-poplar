@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7240 @@
+@@ -0,0 +1,7265 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4259,6 +4259,31 @@ new file mode 100644
 +static void s5b_ssctl_query_failure_reason(const char *tag);
 +static void s5b_audit_mpss_ram_post_fatal(void);
 +
++static const char *
++probe_strstr(const char *h, const char *n)
++{
++	if (!h || !n) {
++		return NULL;
++	}
++	if (*n == '\0') {
++		return h;
++	}
++	for (; *h != '\0'; h++) {
++		if (*h == *n) {
++			const char *hp = h;
++			const char *np = n;
++			while (*hp != '\0' && *np != '\0' && *hp == *np) {
++				hp++;
++				np++;
++			}
++			if (*np == '\0') {
++				return h;
++			}
++		}
++	}
++	return NULL;
++}
++
 +static void
 +s5b_scan_ram_chunk(uint64_t chunk_pa, uint32_t chunk_sz, const char *region_name)
 +{
@@ -4307,7 +4332,7 @@ new file mode 100644
 +						"died", "abort", "ABORT", "fail", "FAIL", "reason"
 +					};
 +					for (unsigned k = 0u; k < sizeof(kw)/sizeof(kw[0]); k++) {
-+						if (strstr(buf, kw[k]) != NULL) {
++						if (probe_strstr(buf, kw[k]) != NULL) {
 +							interesting = true;
 +							break;
 +						}
@@ -4318,9 +4343,9 @@ new file mode 100644
 +						printf("WIFI PROBE: [5B.2]   [%s +0x%05x | PA 0x%08llx]: '%s'\n",
 +						    region_name, start, (unsigned long long)(chunk_pa + start), buf);
 +
-+						if (strstr(buf, "ERR crash log report") != NULL ||
-+						    strstr(buf, "Register values from coredump") != NULL ||
-+						    strstr(buf, "Error message:") != NULL) {
++						if (probe_strstr(buf, "ERR crash log report") != NULL ||
++						    probe_strstr(buf, "Register values from coredump") != NULL ||
++						    probe_strstr(buf, "Error message:") != NULL) {
 +							printf("WIFI PROBE: [5B.2]   --- EXPANDED CRASH REPORT @ PA 0x%08llx ---\n",
 +							    (unsigned long long)(chunk_pa + start));
 +							uint32_t block_len = (chunk_sz - start < 1024u) ? (chunk_sz - start) : 1024u;

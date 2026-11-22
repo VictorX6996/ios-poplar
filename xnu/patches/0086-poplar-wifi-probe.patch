@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7131 @@
+@@ -0,0 +1,7193 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3877,6 +3877,9 @@ new file mode 100644
 +	uint32_t    wlan_pd_state;
 +	uint16_t    servreg_wlan_pd_txn;
 +	uint16_t    servreg_root_pd_txn;
++	bool        root_pd_registered;
++	uint8_t     servreg_restart_stage;
++	uint16_t    servreg_restart_txn;
 +	bool        mpss_err_fatal_dumped;
 +	uint32_t    rmtfs_read_count;
 +	uint32_t    tftp_req_count;
@@ -6108,6 +6111,29 @@ new file mode 100644
 +}
 +
 +static void
++s5b_servreg_restart_pd(uint32_t snode, uint32_t sport, const char *service_name, bool with_null)
++{
++	uint8_t req[128];
++	uint32_t roff = 0u;
++	unsigned slen = sweet_str_len(service_name) + (with_null ? 1u : 0u);
++
++	/* TLV 0x01: service_name */
++	roff = s5b_qmi_put_tlv(req, roff, 0x01u, (uint16_t)slen, service_name);
++
++	uint16_t txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (txn == 0u) {
++		txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	s5b.servreg_restart_txn = txn;
++
++	printf("WIFI PROBE: [5B.3] SERVREG RESTART_PD_REQ (stage=%u): svc='%s' (null=%d, len=%u, txn=%u -> node=%u port=%u)\n",
++	    s5b.servreg_restart_stage, service_name, with_null ? 1 : 0, slen, txn, snode, sport);
++
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, txn, 0x0024u /* SERVREG_RESTART_PD_REQ */,
++	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, req, (uint16_t)roff);
++}
++
++static void
 +s5b_icnss_query_service_location(uint32_t snode, uint32_t sport)
 +{
 +	uint8_t req[128];
@@ -6171,7 +6197,15 @@ new file mode 100644
 +					printf("WIFI PROBE: [5B.3] wlan_pd state is UNINIT (0x7fffffff)\n");
 +				}
 +			} else if (txn == s5b.servreg_root_pd_txn) {
++				s5b.root_pd_registered = true;
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
++			}
++
++			/* Experiment D7: When both are registered and wlan_pd is UNINIT, trigger PD activation */
++			if (s5b.wlan_pd_state == 0x7fffffffu && s5b.root_pd_registered &&
++			    !s5b.wlan_pd_started && s5b.servreg_restart_stage == 0u) {
++				s5b.servreg_restart_stage = 1u;
++				s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd", false);
 +			}
 +		} else if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_RESP */
 +			uint16_t tlen = 0u, rlen2 = 0u, dlen = 0u;
@@ -6227,8 +6261,30 @@ new file mode 100644
 +				}
 +			}
 +		} else if (msg_id == 0x0024u) { /* RESTART_PD_RESP */
-+			printf("WIFI PROBE: [5B.3] SERVREG DIAGNOSTIC RESTART_PD resp: txn=%u res=%u err=%u (%s) - no retry will be performed\n",
-+			    txn, res, err, (err == 9u) ? "QMI_ERR_INVALID_HANDLE" : "OTHER");
++			printf("WIFI PROBE: [5B.3] SERVREG RESTART_PD resp (stage=%u): txn=%u res=%u err=%u (%s)\n",
++			    s5b.servreg_restart_stage, txn, res, err,
++			    (err == 0u) ? "SUCCESS" :
++			    (err == 9u) ? "QMI_ERR_INVALID_HANDLE" :
++			    (err == 69u) ? "QMI_ERR_DISABLED" : "OTHER");
++			if (res == 0u && err == 0u) {
++				printf("WIFI PROBE: [5B.3] *** SERVREG RESTART_PD ACCEPTED! Monitoring wlan_pd state transition... ***\n");
++				s5b.servreg_restart_stage = 5u;
++			} else if (s5b.servreg_restart_stage == 1u) {
++				/* Stage 2: Try service_name = "wlan/fw" */
++				s5b.servreg_restart_stage = 2u;
++				s5b_servreg_restart_pd(src_node, src_port, "wlan/fw", false);
++			} else if (s5b.servreg_restart_stage == 2u) {
++				/* Stage 3: Try service_name = "msm/modem/wlan_pd" with null-terminator */
++				s5b.servreg_restart_stage = 3u;
++				s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd", true);
++			} else if (s5b.servreg_restart_stage == 3u) {
++				/* Stage 4: Try service_name = "wlan/fw" with null-terminator */
++				s5b.servreg_restart_stage = 4u;
++				s5b_servreg_restart_pd(src_node, src_port, "wlan/fw", true);
++			} else {
++				s5b.servreg_restart_stage = 5u;
++				printf("WIFI PROBE: [5B.3] SERVREG RESTART_PD all variants evaluated.\n");
++			}
 +		} else if (msg_id == 0x0023u) { /* SET_ACK_RESP */
 +			printf("WIFI PROBE: [5B.3] SERVREG SET_ACK resp: txn=%u res=%u err=%u\n", txn, res, err);
 +		} else {
@@ -7076,6 +7132,12 @@ new file mode 100644
 +			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
 +			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
 +				s5b_ssctl_query_failure_reason("pre-fatal");
++			}
++			/* Fallback trigger for Experiment D7 if not triggered on listener response */
++			if (s5b.servreg_notif_up && s5b.wlan_pd_state == 0x7fffffffu && s5b.root_pd_registered &&
++			    !s5b.wlan_pd_started && s5b.servreg_restart_stage == 0u) {
++				s5b.servreg_restart_stage = 1u;
++				s5b_servreg_restart_pd(s5b.servreg_notif_node, s5b.servreg_notif_port, "msm/modem/wlan_pd", false);
 +			}
 +		}
 +		delay(1000);

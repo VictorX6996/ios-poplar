@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7138 @@
+@@ -0,0 +1,7131 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4284,19 +4284,12 @@ new file mode 100644
 +{
 +	printf("WIFI PROBE: [5B.2] --- MPSS POST-FATAL HARDWARE & SUBSYSTEM DIAGNOSTICS ---\n");
 +
-+	/* 1. QDSP6SS Hardware Registers */
-+	vm_offset_t q6 = ml_io_map(POPLAR_QDSP6SS_PAGE_PA, 0x1000u);
-+	if (q6) {
-+		uint32_t rst   = probe_rd32(q6, QDSP6SS_RESET_REG);
-+		uint32_t gfmux = probe_rd32(q6, QDSP6SS_GFMUX_CTL_REG);
-+		uint32_t pwr   = probe_rd32(q6, QDSP6SS_PWR_CTL_REG);
-+		uint32_t xo    = probe_rd32(q6, QDSP6SS_XO_CBCR);
-+		uint32_t slp   = probe_rd32(q6, QDSP6SS_SLEEP_CBCR);
-+		uint32_t bhs   = probe_rd32(q6, QDSP6SS_BHS_STATUS_REG);
-+		printf("WIFI PROBE: [5B.2] QDSP6SS registers @ 0x%08x:\n", POPLAR_QDSP6SS_PAGE_PA);
-+		printf("WIFI PROBE: [5B.2]   RESET=0x%08x GFMUX=0x%08x PWR=0x%08x XO_CBCR=0x%08x SLP_CBCR=0x%08x BHS=0x%08x\n",
-+		    rst, gfmux, pwr, xo, slp, bhs);
-+	}
++	/* 1. QDSP6SS Hardware Registers:
++	 * SKIPPED: Once Hexagon core boots, 0x04080000 is XPU-locked to MSS_MSA (0xF).
++	 * Reading it from HLOS triggers an ARM64 SError panic.
++	 */
++	printf("WIFI PROBE: [5B.2] QDSP6SS registers @ 0x%08x: SKIPPED (XPU-locked to MSS_MSA by MBA)\n",
++	    POPLAR_QDSP6SS_PAGE_PA);
 +
 +	/* 2. TCSR MSS Halt Status (halt_q6, halt_nc, halt_modem) */
 +	vm_offset_t halt_va = ml_io_map(TCSR_MSS_HALT_PHYS_BASE, TCSR_MSS_HALT_SIZE);

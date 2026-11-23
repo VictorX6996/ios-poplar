@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7193 @@
+@@ -0,0 +1,7217 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3884,6 +3884,16 @@ new file mode 100644
 +	uint32_t    rmtfs_read_count;
 +	uint32_t    tftp_req_count;
 +
++	/* QRTR telemetry counters for Experiment D8-B */
++	uint32_t    qrtr_ctrl_rx_count;
++	uint32_t    qrtr_ctrl_tx_count;
++	uint32_t    qrtr_hello_count;
++	uint32_t    qrtr_lookup_count;
++	uint32_t    qrtr_lookup_tftp_count;
++	uint32_t    qrtr_lookup_other_count;
++	uint32_t    qrtr_new_server_rx_count;
++	uint32_t    qrtr_del_client_count;
++
 +	/* RMTFS open client handles */
 +	uint32_t    rmtfs_caller_id[8];
 +	struct tftp_session tftp[TFTP_MAX_SESS];
@@ -5357,6 +5367,13 @@ new file mode 100644
 +	s5b_wr_le32(ctrl + 8,  a1);
 +	s5b_wr_le32(ctrl + 12, a2);
 +	s5b_wr_le32(ctrl + 16, a3);
++	s5b.qrtr_ctrl_tx_count++;
++	if (cmd == QRTR_TYPE_NEW_SERVER) {
++		printf("WIFI PROBE: [5B.3]   TX NEW_SERVER: svc=0x%04x ver=%u inst=%u node=%u port=%u -> dst=%u\n",
++		    a0, a1 & 0xffu, a1 >> 8, a2, a3, dst_node);
++	} else if (cmd == QRTR_TYPE_HELLO) {
++		printf("WIFI PROBE: [5B.3]   TX HELLO -> dst=%u\n", dst_node);
++	}
 +	(void)s5b_ipcrtr_send(cmd, QRTR_PORT_CTRL, dst_node, QRTR_PORT_CTRL, ctrl, sizeof(ctrl));
 +}
 +
@@ -5841,6 +5858,8 @@ new file mode 100644
 +	}
 +	s5b.tftp_req_count++;
 +	uint16_t op = s5b_rd_be16(pkt);
++	printf("WIFI PROBE: [5B.3] TFTP PKT: op=%u len=%u from %u:%u on local_port=%u\n",
++	    op, len, src_node, src_port, local_port);
 +
 +	if (local_port == QRTR_LOCAL_PORT_TFTP && (op == TFTP_OP_RRQ || op == TFTP_OP_WRQ)) {
 +		int free_idx = -1;
@@ -6201,12 +6220,9 @@ new file mode 100644
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
 +			}
 +
-+			/* Experiment D7: When both are registered and wlan_pd is UNINIT, trigger PD activation */
-+			if (s5b.wlan_pd_state == 0x7fffffffu && s5b.root_pd_registered &&
-+			    !s5b.wlan_pd_started && s5b.servreg_restart_stage == 0u) {
-+				s5b.servreg_restart_stage = 1u;
-+				s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd", false);
-+			}
++			/* Experiment D7 concluded: wlan_pd cannot be cold-booted via restart_pd; dormant for D8 */
++			(void)src_node;
++			(void)src_port;
 +		} else if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_RESP */
 +			uint16_t tlen = 0u, rlen2 = 0u, dlen = 0u;
 +			const uint8_t *tv = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &tlen);
@@ -6488,8 +6504,10 @@ new file mode 100644
 +	}
 +
 +	if (dst_port == QRTR_PORT_CTRL || type != QRTR_TYPE_DATA) {
++		s5b.qrtr_ctrl_rx_count++;
 +		uint32_t cmd = (size >= 4u) ? s5b_rd_le32(body + 0) : type;
 +		if (cmd == QRTR_TYPE_HELLO) {
++			s5b.qrtr_hello_count++;
 +			if (!s5b.hello_recvd || s5b.mpss_node_id != src_node) {
 +				printf("WIFI PROBE: [5B.3] IPCRTR HELLO from node=%u port=0x%x size=%u\n",
 +				    src_node, src_port, size);
@@ -6502,6 +6520,7 @@ new file mode 100644
 +				s5b_advertise_apps_servers(src_node);
 +			}
 +		} else if (cmd == QRTR_TYPE_NEW_SERVER && size >= 20u) {
++			s5b.qrtr_new_server_rx_count++;
 +			uint32_t svc  = s5b_rd_le32(body + 4);
 +			uint32_t inst = s5b_rd_le32(body + 8);
 +			uint32_t snode = s5b_rd_le32(body + 12);
@@ -6534,10 +6553,15 @@ new file mode 100644
 +				s5b_ssctl_send_event(snode, sport, "modem", SSCTL_SSR_EVENT_AFTER_POWERUP);
 +			}
 +		} else if (cmd == QRTR_TYPE_NEW_LOOKUP && size >= 12u) {
++			s5b.qrtr_lookup_count++;
 +			uint32_t svc  = s5b_rd_le32(body + 4);
 +			uint32_t inst = s5b_rd_le32(body + 8);
++			printf("WIFI PROBE: [5B.3] *** RX NEW_LOOKUP: svc=0x%04x ver=%u inst=%u from node=%u port=%u ***\n",
++			    svc, inst & 0xffu, inst >> 8, src_node, src_port);
 +			uint32_t resp_inst = (inst != 0u) ? inst : 1u;
 +			if (svc == QRTR_SVC_TFTP) {
++				s5b.qrtr_lookup_tftp_count++;
++				printf("WIFI PROBE: [5B.3]   -> Answering TFTP LOOKUP with inst=%u (resp_inst=%u)\n", inst, resp_inst);
 +				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,
 +				    resp_inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
 +			} else if (svc == QRTR_SVC_SERVREG_LOC) {
@@ -6549,10 +6573,12 @@ new file mode 100644
 +				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_RMTFS,
 +				    resp_inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_RMTFS);
 +			} else {
-+				printf("WIFI PROBE: [5B.3] IPCRTR unhandled LOOKUP: svc=0x%04x inst=%u from %u:%u\n",
++				s5b.qrtr_lookup_other_count++;
++				printf("WIFI PROBE: [5B.3]   -> Unhandled LOOKUP: svc=0x%04x inst=%u from %u:%u\n",
 +				    svc, inst, src_node, src_port);
 +			}
 +		} else if (cmd == QRTR_TYPE_DEL_CLIENT && size >= 12u) {
++			s5b.qrtr_del_client_count++;
 +			uint32_t cnode = s5b_rd_le32(body + 4);
 +			uint32_t cport = s5b_rd_le32(body + 8);
 +			if (cnode != QRTR_NODE_APPS) {
@@ -7129,15 +7155,13 @@ new file mode 100644
 +			    s5b.ssr_rx_packets, s5b.ssr_rx_bytes,
 +			    s5b.ssctl_up ? 1 : 0, s5b.ssctl_event_sent ? 1 : 0, s5b.ssctl_event_acked ? 1 : 0,
 +			    s5b.ssctl_wcnss_sent ? 1 : 0, s5b.ssctl_wcnss_acked ? 1 : 0);
++			printf("WIFI PROBE: [5B.3]   QRTR(ctrl_rx=%u ctrl_tx=%u hello=%u lookup=%u [tftp_lkup=%u other=%u] srv_rx=%u del_clnt=%u)\n",
++			    s5b.qrtr_ctrl_rx_count, s5b.qrtr_ctrl_tx_count, s5b.qrtr_hello_count,
++			    s5b.qrtr_lookup_count, s5b.qrtr_lookup_tftp_count, s5b.qrtr_lookup_other_count,
++			    s5b.qrtr_new_server_rx_count, s5b.qrtr_del_client_count);
 +			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
 +			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
 +				s5b_ssctl_query_failure_reason("pre-fatal");
-+			}
-+			/* Fallback trigger for Experiment D7 if not triggered on listener response */
-+			if (s5b.servreg_notif_up && s5b.wlan_pd_state == 0x7fffffffu && s5b.root_pd_registered &&
-+			    !s5b.wlan_pd_started && s5b.servreg_restart_stage == 0u) {
-+				s5b.servreg_restart_stage = 1u;
-+				s5b_servreg_restart_pd(s5b.servreg_notif_node, s5b.servreg_notif_port, "msm/modem/wlan_pd", false);
 +			}
 +		}
 +		delay(1000);

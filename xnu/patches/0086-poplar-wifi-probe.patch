@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7234 @@
+@@ -0,0 +1,7357 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -4351,10 +4351,24 @@ new file mode 100644
 +		}
 +		printf("\n");
 +
++		/* Dump IMEM restart reason region */
++		printf("WIFI PROBE: [5B.2]   IMEM restart[0x650..0x66f]:");
++		for (unsigned w = 0u; w < 8u; w++) {
++			printf(" %08x", probe_rd32(imem_va, 0x650u + w * 4u));
++		}
++		printf("\n");
++
 +		/* Dump IMEM boot_stats */
 +		printf("WIFI PROBE: [5B.2]   IMEM boot_stats[0x6b0..0x6cf]:");
 +		for (unsigned w = 0u; w < 8u; w++) {
 +			printf(" %08x", probe_rd32(imem_va, POPLAR_IMEM_BOOT_STATS_OFF + w * 4u));
++		}
++		printf("\n");
++
++		/* Dump IMEM pil_info area */
++		printf("WIFI PROBE: [5B.2]   IMEM pil_info[0x940..0x97f]:");
++		for (unsigned w = 0u; w < 16u; w++) {
++			printf(" %08x", probe_rd32(imem_va, 0x940u + w * 4u));
 +		}
 +		printf("\n");
 +	} else {
@@ -4424,6 +4438,54 @@ new file mode 100644
 +
 +			off = poff + sz;
 +			item_idx++;
++		}
++
++		/* 1b. Walk cached items in p[07] (allocated downwards from top of partition) */
++		uint32_t p07_cl = (s_smem_p07_cacheline >= 16u) ? s_smem_p07_cacheline : 32u;
++		uint32_t p07_hdr_stride = (16u + p07_cl - 1u) & ~(p07_cl - 1u);
++		if (s_smem_p07_sz >= p07_hdr_stride) {
++			uint32_t ce = s_smem_p07_sz - p07_hdr_stride;
++			uint32_t c_idx = 0u;
++			while (ce > free_cac && ce + p07_hdr_stride <= s_smem_p07_sz && c_idx < 32u) {
++				uint32_t cw0 = s5b_part_rd32(ce);
++				if ((uint16_t)cw0 != SMEM_PRIVATE_CANARY) {
++					break;
++				}
++				uint16_t it   = (uint16_t)(cw0 >> 16);
++				uint32_t sz   = s5b_part_rd32(ce + 4u);
++				uint32_t cw2  = s5b_part_rd32(ce + 8u);
++				uint16_t pdat = (uint16_t)cw2;
++				uint16_t phdr = (uint16_t)(cw2 >> 16);
++				if (sz == 0u || sz > ce) break;
++				uint32_t doff = ce - sz;
++				uint32_t usz  = (pdat < sz) ? (sz - pdat) : sz;
++
++				printf("WIFI PROBE: [5B.2]   p[07] cached item[%u]: id=%u off=0x%x sz=%u (usable=%u)\n",
++				    c_idx, it, doff, sz, usz);
++
++				/* Dump ASCII string preview */
++				char cstr[128];
++				for (unsigned i = 0u; i < sizeof(cstr); i++) cstr[i] = '\0';
++				uint32_t max_c = (usz < sizeof(cstr) - 1u) ? usz : (uint32_t)(sizeof(cstr) - 1u);
++				for (uint32_t k = 0u; k < max_c; k++) {
++					uint32_t cw = s5b_part_rd32(doff + (k & ~3u));
++					char ch = (char)((cw >> ((k & 3u) * 8u)) & 0xffu);
++					cstr[k] = (ch >= 32 && ch <= 126) ? ch : '.';
++				}
++				cstr[max_c] = '\0';
++				printf("WIFI PROBE: [5B.2]     id=%u data: '%s'\n", it, cstr);
++
++				/* Dump first 32 bytes in hex */
++				printf("WIFI PROBE: [5B.2]     id=%u hex:", it);
++				for (uint32_t w = 0u; w < 8u && w * 4u < sz; w++) {
++					printf(" %08x", s5b_part_rd32(doff + w * 4u));
++				}
++				printf("\n");
++
++				if (doff < p07_hdr_stride) break;
++				ce = doff - p07_hdr_stride;
++				c_idx++;
++			}
 +		}
 +
 +		/* 2. Check crash items explicitly via s5b_smem_get_item (including cached region) */
@@ -4624,11 +4686,72 @@ new file mode 100644
 +					uint32_t w1 = (item_off + 8u <= 0xc1000u) ? probe_rd32(p11_va, item_off + 4u) : 0u;
 +					printf("WIFI PROBE: [5B.2]   Global SMEM item[%u]: sz=%u off=0x%x [w0=0x%08x w1=0x%08x] '%s'\n",
 +					    it, item_sz, item_off, w0, w1, cstr);
-+					if (it == 421u || it == 408u || it == 402u) {
++					if (it == 402u) {
++						/* SMEM_USABLE_RAM_PARTITION_TABLE (Item 402) */
++						if (item_off + 24u <= 0xc1000u) {
++							uint32_t m0  = probe_rd32(p11_va, item_off + 0x00u);
++							uint32_t m1  = probe_rd32(p11_va, item_off + 0x04u);
++							uint32_t ver = probe_rd32(p11_va, item_off + 0x08u);
++							uint32_t rsv = probe_rd32(p11_va, item_off + 0x0cu);
++							uint32_t len = probe_rd32(p11_va, item_off + 0x10u);
++							uint32_t buf = probe_rd32(p11_va, item_off + 0x14u);
++							printf("WIFI PROBE: [5B.2] RAM Partition Table: magic=0x%08x:0x%08x ver=%u len=%u (buf=0x%x rsv=0x%x)\n",
++							    m0, m1, ver, len, buf, rsv);
++							if (m0 == 0x9da5e0a8u && m1 == 0xaf9ec4e2u) {
++								uint32_t max_p = (len < 32u) ? len : 32u;
++								/* 72 bytes per entry (24 header + 32 * 72 = 2328 bytes) */
++								for (uint32_t pi = 0u; pi < max_p; pi++) {
++									uint32_t poff = item_off + 24u + pi * 72u;
++									if (poff + 72u > 0xc1000u) break;
++									char pname[17];
++									for (uint32_t k = 0u; k < 4u; k++) {
++										uint32_t pw = probe_rd32(p11_va, poff + k * 4u);
++										pname[k * 4u + 0u] = (char)(pw & 0xffu);
++										pname[k * 4u + 1u] = (char)((pw >> 8) & 0xffu);
++										pname[k * 4u + 2u] = (char)((pw >> 16) & 0xffu);
++										pname[k * 4u + 3u] = (char)((pw >> 24) & 0xffu);
++									}
++									pname[16] = '\0';
++									uint64_t start_addr = (uint64_t)probe_rd32(p11_va, poff + 16u) |
++									    ((uint64_t)probe_rd32(p11_va, poff + 20u) << 32);
++									uint64_t part_size  = (uint64_t)probe_rd32(p11_va, poff + 24u) |
++									    ((uint64_t)probe_rd32(p11_va, poff + 28u) << 32);
++									uint32_t attr = probe_rd32(p11_va, poff + 32u);
++									uint32_t cat  = probe_rd32(p11_va, poff + 36u);
++									uint32_t dom  = probe_rd32(p11_va, poff + 40u);
++									uint32_t typ  = probe_rd32(p11_va, poff + 44u);
++
++									printf("WIFI PROBE: [5B.2]   RAM Part[%u]: '%-16s' start=0x%016llx sz=0x%016llx (%llu MB) attr=0x%x cat=0x%x dom=0x%x typ=0x%x\n",
++									    pi, pname,
++									    (unsigned long long)start_addr,
++									    (unsigned long long)part_size,
++									    (unsigned long long)(part_size / (1024ULL * 1024ULL)),
++									    attr, cat, dom, typ);
++								}
++							}
++						}
++					}
++					if (it == 79u) {
++						/* SMEM_LOG (Item 79, 40 KB circular buffer) */
++						printf("WIFI PROBE: [5B.2]   SMEM_LOG (item 79) header:");
++						for (unsigned w = 0u; w < 8u; w++) {
++							printf(" %08x", probe_rd32(p11_va, item_off + w * 4u));
++						}
++						printf("\n");
++					}
++					if (it == 404u) {
++						/* SMEM_RLOCK_AREA (Item 404, 8 KB) */
++						printf("WIFI PROBE: [5B.2]   SMEM_RLOCK_AREA (item 404) header:");
++						for (unsigned w = 0u; w < 8u; w++) {
++							printf(" %08x", probe_rd32(p11_va, item_off + w * 4u));
++						}
++						printf("\n");
++					}
++					if (it == 421u || it == 408u || it == 404u || it == 79u || it == 135u || it == 473u || it == 474u) {
 +						if (item_off < 0xc1000u && item_sz > 0u) {
 +							char sbuf[128];
 +							unsigned s_len = 0u;
-+							uint32_t scan_n = (item_sz < 512u) ? item_sz : 512u;
++							uint32_t scan_n = (item_sz < 16384u) ? item_sz : 16384u;
 +							if (item_off + scan_n > 0xc1000u) scan_n = 0xc1000u - item_off;
 +							for (uint32_t si = 0u; si < scan_n; si++) {
 +								uint32_t cw = probe_rd32(p11_va, item_off + (si & ~3u));

@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7217 @@
+@@ -0,0 +1,7234 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3680,6 +3680,8 @@ new file mode 100644
 +#define QRTR_LOCAL_PORT_SERVREG_0   4u
 +#define QRTR_LOCAL_PORT_SERVREG_CLNT 5u
 +#define QRTR_LOCAL_PORT_SSCTL       6u
++#define QRTR_LOCAL_PORT_TFTP_180    7u
++#define QRTR_LOCAL_PORT_TFTP_1      8u
 +#define QRTR_LOCAL_PORT_TFTP_SESS0  16u
 +#define QRTR_LOCAL_PORT_WLFW_CLNT   32u
 +
@@ -5384,7 +5386,10 @@ new file mode 100644
 +	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC, (1u << 8) | 1u, QRTR_NODE_APPS, QRTR_LOCAL_PORT_SERVREG_1);
 +	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC, 1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_SERVREG_0);
 +	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_RMTFS,       1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_RMTFS);
-+	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,        1u,              QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
++	/* Advertise TFTP across candidate instance scopes: 180 (Modem PD), 1 (subsystem), and 0 (global) */
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,        (180u << 8) | 1u, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP_180);
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,        (1u << 8) | 1u,   QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP_1);
++	s5b_ipcrtr_send_ctrl(dst_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,        1u,               QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
 +}
 +
 +static uint32_t
@@ -5861,7 +5866,9 @@ new file mode 100644
 +	printf("WIFI PROBE: [5B.3] TFTP PKT: op=%u len=%u from %u:%u on local_port=%u\n",
 +	    op, len, src_node, src_port, local_port);
 +
-+	if (local_port == QRTR_LOCAL_PORT_TFTP && (op == TFTP_OP_RRQ || op == TFTP_OP_WRQ)) {
++	if ((local_port == QRTR_LOCAL_PORT_TFTP ||
++	     local_port == QRTR_LOCAL_PORT_TFTP_180 ||
++	     local_port == QRTR_LOCAL_PORT_TFTP_1) && (op == TFTP_OP_RRQ || op == TFTP_OP_WRQ)) {
 +		int free_idx = -1;
 +		for (unsigned i = 0u; i < TFTP_MAX_SESS; i++) {
 +			if (!s5b.tftp[i].active) {
@@ -6563,6 +6570,10 @@ new file mode 100644
 +				s5b.qrtr_lookup_tftp_count++;
 +				printf("WIFI PROBE: [5B.3]   -> Answering TFTP LOOKUP with inst=%u (resp_inst=%u)\n", inst, resp_inst);
 +				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,
++				    (180u << 8) | 1u, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP_180);
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,
++				    (1u << 8) | 1u, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP_1);
++				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_TFTP,
 +				    resp_inst, QRTR_NODE_APPS, QRTR_LOCAL_PORT_TFTP);
 +			} else if (svc == QRTR_SVC_SERVREG_LOC) {
 +				s5b_ipcrtr_send_ctrl(src_node, QRTR_TYPE_NEW_SERVER, QRTR_SVC_SERVREG_LOC,
@@ -6592,6 +6603,8 @@ new file mode 100644
 +	}
 +
 +	if (dst_port == QRTR_LOCAL_PORT_TFTP ||
++	    dst_port == QRTR_LOCAL_PORT_TFTP_180 ||
++	    dst_port == QRTR_LOCAL_PORT_TFTP_1 ||
 +	    (dst_port >= QRTR_LOCAL_PORT_TFTP_SESS0 && dst_port < QRTR_LOCAL_PORT_TFTP_SESS0 + TFTP_MAX_SESS)) {
 +		s5b_handle_tftp_pkt(dst_port, src_node, src_port, body, size);
 +		return;
@@ -7162,6 +7175,10 @@ new file mode 100644
 +			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
 +			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
 +				s5b_ssctl_query_failure_reason("pre-fatal");
++			}
++			/* Experiment D8-C: Re-advertise TFTP & core servers during early boot (2s, 4s) */
++			if (s5b.hello_recvd && (ms == 2000u || ms == 4000u)) {
++				s5b_advertise_apps_servers(s5b.mpss_node_id);
 +			}
 +		}
 +		delay(1000);

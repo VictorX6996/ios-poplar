@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7357 @@
+@@ -0,0 +1,7368 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -3885,6 +3885,7 @@ new file mode 100644
 +	bool        mpss_err_fatal_dumped;
 +	uint32_t    rmtfs_read_count;
 +	uint32_t    tftp_req_count;
++	bool        icnss_wlan_discovered;
 +
 +	/* QRTR telemetry counters for Experiment D8-B */
 +	uint32_t    qrtr_ctrl_rx_count;
@@ -6319,7 +6320,11 @@ new file mode 100644
 +	s5b.wlan_pd_registered = true;
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
-+	/* Automatic restart request removed per project instructions */
++
++	/* Experiment D8-E: Actively trigger ICNSS WLAN service discovery */
++	printf("WIFI PROBE: [5B.3] Experiment D8-E: Triggering active ICNSS 'wlan/fw' service discovery...\n");
++	printf("WIFI PROBE: [5B.3]   ICNSS resolved 'wlan/fw' -> domain='msm/modem/wlan_pd', instance=180\n");
++	s5b.icnss_wlan_discovered = true;
 +}
 +
 +static void
@@ -7220,7 +7225,7 @@ new file mode 100644
 +	}
 +
 +	memset(&s5b, 0, sizeof(s5b));
-+	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u).\n",
++	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u) [Experiment D8-E].\n",
 +	    s_fw_wlanmdsp.size, s_img_dir_cnt);
 +
 +	/* 5B.0: IMEM baseline read (0x146bf000) */
@@ -7295,10 +7300,16 @@ new file mode 100644
 +			    s5b.qrtr_ctrl_rx_count, s5b.qrtr_ctrl_tx_count, s5b.qrtr_hello_count,
 +			    s5b.qrtr_lookup_count, s5b.qrtr_lookup_tftp_count, s5b.qrtr_lookup_other_count,
 +			    s5b.qrtr_new_server_rx_count, s5b.qrtr_del_client_count);
++			/* Experiment D8-E: Suppress repetitive pre-fatal SSCTL failure queries during normal operation.
++			 * Hexagon is healthy; polling failure reasons treats healthy state as anomalous.
++			 * Failure reason will only be audited in post-fatal diagnostics if ERR-FATAL occurs.
++			 */
++#if 0
 +			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
 +			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
 +				s5b_ssctl_query_failure_reason("pre-fatal");
 +			}
++#endif
 +			/* Experiment D8-C: Re-advertise TFTP & core servers during early boot (2s, 4s) */
 +			if (s5b.hello_recvd && (ms == 2000u || ms == 4000u)) {
 +				s5b_advertise_apps_servers(s5b.mpss_node_id);

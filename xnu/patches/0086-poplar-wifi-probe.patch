@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7377 @@
+@@ -0,0 +1,7383 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -6346,8 +6346,8 @@ new file mode 100644
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
 +
-+	/* Experiment D8-F: Actively trigger ICNSS WLAN service discovery */
-+	printf("WIFI PROBE: [5B.3] Experiment D8-F: Triggering active ICNSS 'wlan/fw' service discovery...\n");
++	/* Experiment D8-G: Actively trigger ICNSS WLAN service discovery & UserPD restart */
++	printf("WIFI PROBE: [5B.3] Experiment D8-G: Triggering active ICNSS 'wlan/fw' service discovery & UserPD restart...\n");
 +	printf("WIFI PROBE: [5B.3]   ICNSS resolved 'wlan/fw' -> domain='msm/modem/wlan_pd', instance=180\n");
 +	s5b.icnss_wlan_discovered = true;
 +}
@@ -6375,14 +6375,15 @@ new file mode 100644
 +					printf("WIFI PROBE: [5B.3] *** wlan_pd state is ONLINE (0x1fffffff)! ***\n");
 +				} else if (curr_st == 0x7fffffffu) {
 +					printf("WIFI PROBE: [5B.3] wlan_pd state is UNINIT (0x7fffffff)\n");
++					if (s5b.servreg_restart_stage == 0u) {
++						s5b.servreg_restart_stage = 1u;
++						printf("WIFI PROBE: [5B.3] [Experiment D8-G] Triggering SERVREG RESTART_PD stage 1 for 'msm/modem/wlan_pd'...\n");
++						s5b_servreg_restart_pd(src_node, src_port, "msm/modem/wlan_pd", false);
++					}
 +				}
-+				/* Acknowledge state to clear pending state on notifier */
-+				s5b_servreg_send_ack(src_node, src_port, "msm/modem/wlan_pd", txn);
 +			} else if (txn == s5b.servreg_root_pd_txn) {
 +				s5b.root_pd_registered = true;
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
-+				/* Acknowledge state to clear pending state on notifier */
-+				s5b_servreg_send_ack(src_node, src_port, "msm/modem/root_pd", txn);
 +			}
 +		} else if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_RESP */
 +			uint16_t tlen = 0u, rlen2 = 0u, dlen = 0u;
@@ -7237,7 +7238,7 @@ new file mode 100644
 +	}
 +
 +	memset(&s5b, 0, sizeof(s5b));
-+	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u) [Experiment D8-F].\n",
++	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u) [Experiment D8-G].\n",
 +	    s_fw_wlanmdsp.size, s_img_dir_cnt);
 +
 +	/* 5B.0: IMEM baseline read (0x146bf000) */
@@ -7312,11 +7313,16 @@ new file mode 100644
 +			    s5b.qrtr_ctrl_rx_count, s5b.qrtr_ctrl_tx_count, s5b.qrtr_hello_count,
 +			    s5b.qrtr_lookup_count, s5b.qrtr_lookup_tftp_count, s5b.qrtr_lookup_other_count,
 +			    s5b.qrtr_new_server_rx_count, s5b.qrtr_del_client_count);
-+			/* Experiment D8-F: Poll wlan_pd state via REGISTER_LISTENER if UNINIT */
++			/* Experiment D8-G: Poll wlan_pd state via REGISTER_LISTENER if UNINIT & ensure RESTART_PD sent */
 +			if (s5b.servreg_notif_up && s5b.wlan_pd_state == 0x7fffffffu &&
 +			    (ms % 2000u) == 0u) {
 +				s5b_servreg_register_listener(s5b.servreg_notif_node, s5b.servreg_notif_port,
 +				    "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
++				if (s5b.servreg_restart_stage == 0u) {
++					s5b.servreg_restart_stage = 1u;
++					printf("WIFI PROBE: [5B.3] [Experiment D8-G] Heartbeat triggering SERVREG RESTART_PD stage 1 for 'msm/modem/wlan_pd'...\n");
++					s5b_servreg_restart_pd(s5b.servreg_notif_node, s5b.servreg_notif_port, "msm/modem/wlan_pd", false);
++				}
 +			}
 +
 +			/* Experiment D8-C: Re-advertise TFTP & core servers during early boot (2s, 4s) */

@@ -140,7 +140,7 @@ diff --git a/bsd/dev/sweet_poplar_wifi_probe.c b/bsd/dev/sweet_poplar_wifi_probe
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_poplar_wifi_probe.c
-@@ -0,0 +1,7368 @@
+@@ -0,0 +1,7377 @@
 +/*
 + * sweet_poplar_wifi_probe.c - Step 8 Stage 1B Poplar Wi-Fi Read-Only Diagnostic Probe
 + *
@@ -5685,6 +5685,8 @@ new file mode 100644
 +			{ "tms/pddump_disabled",  "msm/modem/root_pd", 180u },
 +			{ "kernel/elf_loader",    "msm/modem/wlan_pd", 180u },
 +			{ "tms/servreg",          "msm/modem/wlan_pd", 180u },
++			{ "tms/pdr_enabled",      "msm/modem/wlan_pd", 180u },
++			{ "gps/gps_service",      "msm/modem/root_pd", 180u },
 +			{ "wlan/fw",              "msm/modem/wlan_pd", 180u },
 +			{ "msm/modem/root_pd",    "msm/modem/root_pd", 180u },
 +			{ "msm/modem/wlan_pd",    "msm/modem/wlan_pd", 180u },
@@ -6232,6 +6234,29 @@ new file mode 100644
 +}
 +
 +static void
++s5b_servreg_send_ack(uint32_t snode, uint32_t sport, const char *service_name, uint16_t txn_id)
++{
++	uint8_t ack_req[128];
++	uint32_t aoff = 0u;
++	/* TLV 0x01: service_name */
++	aoff = s5b_qmi_put_tlv(ack_req, aoff, 0x01u, (uint16_t)sweet_str_len(service_name), service_name);
++	/* TLV 0x02: transaction_id */
++	uint8_t tbuf[2];
++	s5b_wr_le16(tbuf, txn_id);
++	aoff = s5b_qmi_put_tlv(ack_req, aoff, 0x02u, 2u, tbuf);
++
++	uint16_t my_txn = (uint16_t)(++s5b.next_qmi_txn);
++	if (my_txn == 0u) {
++		my_txn = (uint16_t)(++s5b.next_qmi_txn);
++	}
++	printf("WIFI PROBE: [5B.3] SERVREG SET_ACK_REQ for '%s' txn_id=%u (req_txn=%u -> node=%u port=%u)\n",
++	    service_name, txn_id, my_txn, snode, sport);
++
++	s5b_qmi_send_sdu(QMI_MSG_REQUEST, my_txn, 0x0023u /* SERVREG_NOTIF_SET_ACK_REQ */,
++	    QRTR_LOCAL_PORT_SERVREG_CLNT, snode, sport, ack_req, (uint16_t)aoff);
++}
++
++static void
 +s5b_servreg_register_listener(uint32_t snode, uint32_t sport, const char *domain, uint16_t *out_txn)
 +{
 +	uint8_t req[128];
@@ -6321,8 +6346,8 @@ new file mode 100644
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +	s5b_servreg_register_listener(snode, sport, "msm/modem/root_pd", &s5b.servreg_root_pd_txn);
 +
-+	/* Experiment D8-E: Actively trigger ICNSS WLAN service discovery */
-+	printf("WIFI PROBE: [5B.3] Experiment D8-E: Triggering active ICNSS 'wlan/fw' service discovery...\n");
++	/* Experiment D8-F: Actively trigger ICNSS WLAN service discovery */
++	printf("WIFI PROBE: [5B.3] Experiment D8-F: Triggering active ICNSS 'wlan/fw' service discovery...\n");
 +	printf("WIFI PROBE: [5B.3]   ICNSS resolved 'wlan/fw' -> domain='msm/modem/wlan_pd', instance=180\n");
 +	s5b.icnss_wlan_discovered = true;
 +}
@@ -6347,17 +6372,18 @@ new file mode 100644
 +				s5b.wlan_pd_state = curr_st;
 +				if (curr_st == 0x1fffffffu) {
 +					s5b.wlan_pd_started = true;
++					printf("WIFI PROBE: [5B.3] *** wlan_pd state is ONLINE (0x1fffffff)! ***\n");
 +				} else if (curr_st == 0x7fffffffu) {
 +					printf("WIFI PROBE: [5B.3] wlan_pd state is UNINIT (0x7fffffff)\n");
 +				}
++				/* Acknowledge state to clear pending state on notifier */
++				s5b_servreg_send_ack(src_node, src_port, "msm/modem/wlan_pd", txn);
 +			} else if (txn == s5b.servreg_root_pd_txn) {
 +				s5b.root_pd_registered = true;
 +				printf("WIFI PROBE: [5B.3] root_pd registered, state=0x%08x\n", curr_st);
++				/* Acknowledge state to clear pending state on notifier */
++				s5b_servreg_send_ack(src_node, src_port, "msm/modem/root_pd", txn);
 +			}
-+
-+			/* Experiment D7 concluded: wlan_pd cannot be cold-booted via restart_pd; dormant for D8 */
-+			(void)src_node;
-+			(void)src_port;
 +		} else if (msg_id == 0x0021u) { /* QMI_SERVREG_LOC_GET_DOMAIN_LIST_RESP */
 +			uint16_t tlen = 0u, rlen2 = 0u, dlen = 0u;
 +			const uint8_t *tv = s5b_qmi_find_tlv(sdu, sdu_len, 0x10u, &tlen);
@@ -6469,21 +6495,7 @@ new file mode 100644
 +			}
 +
 +			/* Reply with SERVREG_SET_ACK_REQ (msg_id 0x0023) */
-+			uint8_t ack_req[128];
-+			uint32_t aoff = 0u;
-+			/* TLV 0x01: service_path */
-+			aoff = s5b_qmi_put_tlv(ack_req, aoff, 0x01u, (uint16_t)sweet_str_len(svc_path), svc_path);
-+			/* TLV 0x02: transaction_id */
-+			uint8_t tbuf[2];
-+			s5b_wr_le16(tbuf, ind_txn);
-+			aoff = s5b_qmi_put_tlv(ack_req, aoff, 0x02u, 2u, tbuf);
-+
-+			uint16_t my_txn = (uint16_t)(++s5b.next_qmi_txn);
-+			if (my_txn == 0u) {
-+				my_txn = (uint16_t)(++s5b.next_qmi_txn);
-+			}
-+			s5b_qmi_send_sdu(QMI_MSG_REQUEST, my_txn, 0x0023u /* SERVREG_SET_ACK_REQ */,
-+			    QRTR_LOCAL_PORT_SERVREG_CLNT, src_node, src_port, ack_req, (uint16_t)aoff);
++			s5b_servreg_send_ack(src_node, src_port, svc_path, ind_txn);
 +		} else {
 +			printf("WIFI PROBE: [5B.3] SERVREG notif client unhandled ind msg=0x%04x sdu_len=%u\n",
 +			    msg_id, sdu_len);
@@ -7225,7 +7237,7 @@ new file mode 100644
 +	}
 +
 +	memset(&s5b, 0, sizeof(s5b));
-+	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u) [Experiment D8-E].\n",
++	printf("WIFI PROBE: [5B] Gate: wlan_stage5b_wlfw=1 ACTIVE (wlanmdsp=%u B, /IMAGE/ entries=%u) [Experiment D8-F].\n",
 +	    s_fw_wlanmdsp.size, s_img_dir_cnt);
 +
 +	/* 5B.0: IMEM baseline read (0x146bf000) */
@@ -7300,16 +7312,13 @@ new file mode 100644
 +			    s5b.qrtr_ctrl_rx_count, s5b.qrtr_ctrl_tx_count, s5b.qrtr_hello_count,
 +			    s5b.qrtr_lookup_count, s5b.qrtr_lookup_tftp_count, s5b.qrtr_lookup_other_count,
 +			    s5b.qrtr_new_server_rx_count, s5b.qrtr_del_client_count);
-+			/* Experiment D8-E: Suppress repetitive pre-fatal SSCTL failure queries during normal operation.
-+			 * Hexagon is healthy; polling failure reasons treats healthy state as anomalous.
-+			 * Failure reason will only be audited in post-fatal diagnostics if ERR-FATAL occurs.
-+			 */
-+#if 0
-+			if (s5b.ssctl_up && !s5b.mpss_err_fatal_dumped &&
-+			    (ms == 2000u || ms == 6000u || ms == 10000u || ms == 14000u)) {
-+				s5b_ssctl_query_failure_reason("pre-fatal");
++			/* Experiment D8-F: Poll wlan_pd state via REGISTER_LISTENER if UNINIT */
++			if (s5b.servreg_notif_up && s5b.wlan_pd_state == 0x7fffffffu &&
++			    (ms % 2000u) == 0u) {
++				s5b_servreg_register_listener(s5b.servreg_notif_node, s5b.servreg_notif_port,
++				    "msm/modem/wlan_pd", &s5b.servreg_wlan_pd_txn);
 +			}
-+#endif
++
 +			/* Experiment D8-C: Re-advertise TFTP & core servers during early boot (2s, 4s) */
 +			if (s5b.hello_recvd && (ms == 2000u || ms == 4000u)) {
 +				s5b_advertise_apps_servers(s5b.mpss_node_id);
